@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script>
+    (() => {
+      const key = 'chat_dynamics_ui';
+      const valid = v => v === 'day' || v === 'night';
+      let saved = null;
+      try { saved = localStorage.getItem(key); } catch {}
+      const query = new URLSearchParams(location.search).get('ui');
+      document.documentElement.dataset.uiTheme = valid(query) ? query : valid(saved) ? saved : 'day';
+    })();
+  </script>
+  <title data-series-text="群间见闻 · Dynamics Horizons">群间见闻 · Dynamics Horizons</title>
+  <link rel="stylesheet" href="./series-ui.css?v=round2.1">
+  <link rel="stylesheet" href="./styles.css?v=0.1.0">
+  <script type="module" src="./series-panels.js?v=round2.1"></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace" data-series-text="跳到工作区">跳到工作区</a>
+
+  <div class="app-shell series-workspace">
+    <header class="series-nav">
+      <a class="series-brand" href="#workspace"><span class="series-mark" aria-hidden="true">DH</span><span data-series-text="群间见闻">群间见闻</span></a>
+      <nav class="side-nav series-tabs" role="tablist" aria-label="见闻工作区导航" data-series-aria-label="见闻工作区导航">
+        <button id="tab-overview" type="button" role="tab" data-tab="overview" aria-controls="panel-overview" aria-selected="true" class="selected">
+          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true">◈</span><span data-series-text="总览与兴趣池">总览与兴趣池</span></span>
+          <span id="badge-overview" class="nav-count" hidden>0</span>
+        </button>
+        <button id="tab-sources" type="button" role="tab" data-tab="sources" aria-controls="panel-sources" aria-selected="false">
+          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true">▤</span><span data-series-text="信息源与书架">信息源与书架</span></span>
+          <span id="badge-sources" class="nav-count" hidden>0</span>
+        </button>
+        <button id="tab-logs" type="button" role="tab" data-tab="logs" aria-controls="panel-logs" aria-selected="false">
+          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true">✎</span><span data-series-text="阅读手账">阅读手账</span></span>
+          <span id="badge-logs" class="nav-count" hidden>0</span>
+        </button>
+        <button id="tab-reviews" type="button" role="tab" data-tab="reviews" aria-controls="panel-reviews" aria-selected="false">
+          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true">✓</span><span data-series-text="审查与黑名单">审查与黑名单</span></span>
+          <span id="badge-reviews" class="nav-count" hidden>0</span>
+        </button>
+      </nav>
+      <div class="series-nav-tools">
+        <button id="theme-toggle" type="button" aria-pressed="false" aria-label="切换到夜间模式" data-series-aria-label="切换到夜间模式">
+          <span id="theme-label" class="ui-theme-label" data-series-text="日间模式">日间模式</span>
+          <span class="theme-switch" aria-hidden="true"></span>
+        </button>
+      </div>
+    </header>
+
+    <div class="workspace-shell">
+      <main id="workspace" tabindex="-1">
+        <header class="topbar series-heading">
+          <div>
+            <span class="eyebrow">CHAT DYNAMICS / HORIZONS</span>
+            <h1 data-series-text="群间见闻">群间见闻</h1>
+            <p data-series-text="按角色隔离外部信息输入与连载书架，经双模型审查沉淀暂存兴趣与待聊话题。">按角色隔离外部信息输入与连载书架，经双模型审查沉淀暂存兴趣与待聊话题。</p>
+          </div>
+          <div class="topbar-tools">
+            <span class="identity-note" data-series-text="核心性格固定 · 外部媒介只读沙箱">核心性格固定 · 外部媒介只读沙箱</span>
+            <button id="btn-refresh" type="button" class="wb-button" data-series-text="刷新数据">刷新数据</button>
+          </div>
+        </header>
+
+        <section id="dynamics-series-panel" aria-label="互通插件状态" data-series-aria-label="互通插件状态">
+          <p class="sp-feedback" role="status" data-series-text="正在读取互通插件…">正在读取互通插件…</p>
+        </section>
+
+        <section class="persona-bar series-context" aria-label="当前角色与世界状态" data-series-aria-label="当前角色与世界状态">
+          <label class="persona-picker" for="persona-select">
+            <span data-series-text="当前角色实例">当前角色实例</span>
+            <select id="persona-select" aria-label="选择角色实例" data-series-aria-label="选择角色实例"></select>
+          </label>
+          <div class="world-sync-wrap">
+            <span id="world-link-badge" class="world-badge" role="status" data-series-text="群间世界：检测中…">群间世界：检测中…</span>
+            <span id="world-link-summary" class="world-summary-note"></span>
+          </div>
+        </section>
+
+        <div id="notice" data-ui-state="info" role="status" aria-live="polite" data-series-text="正在连接群间见闻工作台…">正在连接群间见闻工作台…</div>
+
+        <!-- Tab 1: Overview & Interests -->
+        <section id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
+          <div class="view-header">
+            <div>
+              <h2 data-series-text="总览与兴趣池">总览与兴趣池</h2>
+              <p data-series-text="空闲清醒时段自动挑拣精读；暂存兴趣带自然半衰期，待聊问题按群独立核销。">空闲清醒时段自动挑拣精读；暂存兴趣带自然半衰期，待聊问题按群独立核销。</p>
+            </div>
+            <div class="view-actions">
+              <button id="btn-trigger-digest" type="button" class="wb-button primary" data-series-text="立即触发一次挑拣阅读">立即触发一次挑拣阅读</button>
+            </div>
+          </div>
+
+          <div id="kpi-grid" class="kpi-grid" aria-label="见闻运行指标" data-series-aria-label="见闻运行指标"></div>
+
+          <section id="health-panel" class="panel-card" aria-label="运行状态与恢复" data-series-aria-label="运行状态与恢复"></section>
+          <section id="archive-panel" class="panel-card" aria-label="候选与归档" data-series-aria-label="候选与归档"></section>
+          <div class="overview-columns">
+            <section class="panel-card" aria-labelledby="heading-interests">
+              <div class="panel-card-head">
+                <h3 id="heading-interests" data-series-text="活跃暂存兴趣">活跃暂存兴趣</h3>
+                <span id="interests-count-pill" class="pill accent">0</span>
+              </div>
+              <div id="interests-list" class="stack-list"></div>
+            </section>
+
+            <section class="panel-card" aria-labelledby="heading-questions">
+              <div class="panel-card-head">
+                <h3 id="heading-questions" data-series-text="待讨论问题">待讨论问题</h3>
+                <span id="questions-count-pill" class="pill info">0</span>
+              </div>
+              <div id="questions-list" class="stack-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <!-- Tab 2: Sources & Bookshelf -->
+        <section id="panel-sources" role="tabpanel" aria-labelledby="tab-sources" hidden>
+          <div class="view-header">
+            <div>
+              <h2 data-series-text="信息源与书架">信息源与书架</h2>
+              <p data-series-text="每个信息源严格绑定当前角色实例，防止跨设定串台；外部凭据掩码保存。">每个信息源严格绑定当前角色实例，防止跨设定串台；外部凭据掩码保存。</p>
+            </div>
+            <div class="view-actions">
+              <button id="btn-open-source-drawer" type="button" class="wb-button primary" data-series-text="＋ 添加信息源">＋ 添加信息源</button>
+              <button id="btn-open-manual-drawer" type="button" class="wb-button" data-series-text="剪报投喂">剪报投喂</button>
+              <button id="btn-open-book-modal" type="button" class="wb-button" data-series-text="公版书检索与本地上传">公版书检索与本地上传</button>
+            </div>
+          </div>
+
+          <section class="panel-card" aria-labelledby="heading-sources-list">
+            <div class="panel-card-head">
+              <h3 id="heading-sources-list" data-series-text="角色订阅信息源">角色订阅信息源</h3>
+              <span id="sources-count-pill" class="pill">0</span>
+            </div>
+            <div id="sources-list" class="stack-list"></div>
+          </section>
+
+          <section class="panel-card" aria-labelledby="heading-bookshelf">
+            <div class="panel-card-head">
+              <h3 id="heading-bookshelf" data-series-text="角色连载书架">角色连载书架</h3>
+              <span id="books-count-pill" class="pill accent">0</span>
+            </div>
+            <div id="bookshelf-list" class="bookshelf-grid"></div>
+          </section>
+        </section>
+
+        <!-- Tab 3: Reading Journal (Logs) -->
+        <section id="panel-logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
+          <div class="view-header">
+            <div>
+              <h2 data-series-text="阅读手账">阅读手账</h2>
+              <p data-series-text="区分客观核对摘要与角色第一人称随感；原始外链仅管理台留档，绝不发往群聊。">区分客观核对摘要与角色第一人称随感；原始外链仅管理台留档，绝不发往群聊。</p>
+            </div>
+            <div id="logs-filter-group" class="segmented-group" role="group" aria-label="阅读手账来源筛选" data-series-aria-label="阅读手账来源筛选">
+              <button type="button" data-log-kind="" aria-pressed="true" data-series-text="全部">全部</button>
+              <button type="button" data-log-kind="bilibili" aria-pressed="false" data-series-text="B站">B站</button>
+              <button type="button" data-log-kind="ebook" aria-pressed="false" data-series-text="电子书">电子书</button>
+              <button type="button" data-log-kind="feed" aria-pressed="false" data-series-text="订阅">订阅</button>
+              <button type="button" data-log-kind="manual" aria-pressed="false" data-series-text="投喂">投喂</button>
+            </div>
+          </div>
+
+          <div id="logs-list" class="stack-list"></div>
+
+          <div id="logs-pagination" class="pagination-bar">
+            <span id="logs-page-info" class="page-info"></span>
+            <button id="logs-prev" type="button" class="wb-button" data-series-text="上一页">上一页</button>
+            <button id="logs-next" type="button" class="wb-button" data-series-text="下一页">下一页</button>
+          </div>
+        </section>
+
+        <!-- Tab 4: Reviews & Topic Blocklist -->
+        <section id="panel-reviews" role="tabpanel" aria-labelledby="tab-reviews" hidden>
+          <div class="view-header">
+            <div>
+              <h2 data-series-text="审查与黑名单">审查与黑名单</h2>
+              <p data-series-text="双模型独立核验人格一致性、防注入与外部媒介事实边界；支持人工裁决与话题屏蔽。">双模型独立核验人格一致性、防注入与外部媒介事实边界；支持人工裁决与话题屏蔽。</p>
+            </div>
+            <div id="reviews-filter-group" class="segmented-group" role="group" aria-label="审查状态筛选" data-series-aria-label="审查状态筛选">
+              <button type="button" data-review-state="pending_review" aria-pressed="true" data-series-text="待审">待审</button>
+              <button type="button" data-review-state="approved" aria-pressed="false" data-series-text="已通过">已通过</button>
+              <button type="button" data-review-state="rejected" aria-pressed="false" data-series-text="已拒绝">已拒绝</button>
+              <button type="button" data-review-state="" aria-pressed="false" data-series-text="全部">全部</button>
+            </div>
+          </div>
+
+          <section class="panel-card" aria-labelledby="heading-review-queue">
+            <div class="panel-card-head">
+              <h3 id="heading-review-queue" data-series-text="提案审查队列">提案审查队列</h3>
+              <span id="reviews-count-pill" class="pill">0</span>
+            </div>
+            <div id="reviews-list" class="stack-list"></div>
+            <div id="reviews-pagination" class="pagination-bar">
+              <span id="reviews-page-info" class="page-info"></span>
+              <button id="reviews-prev" type="button" class="wb-button" data-series-text="上一页">上一页</button>
+              <button id="reviews-next" type="button" class="wb-button" data-series-text="下一页">下一页</button>
+            </div>
+          </section>
+
+          <section id="blocklist-card" class="panel-card" aria-labelledby="heading-blocklist">
+            <div class="panel-card-head">
+              <h3 id="heading-blocklist" data-series-text="话题黑名单管理">话题黑名单管理</h3>
+              <span id="blocked-count-pill" class="pill warn">0</span>
+            </div>
+            <div class="blocklist-bar">
+              <input id="block-topic-input" type="text" maxlength="80" aria-label="输入屏蔽话题词" placeholder="输入不想让角色接触或讨论的话题词…" data-series-aria-label="输入屏蔽话题词" data-series-placeholder="输入不想让角色接触或讨论的话题词…">
+              <button id="btn-add-block-topic" type="button" class="wb-button primary" data-series-text="添加屏蔽词">添加屏蔽词</button>
+            </div>
+            <div id="blocked-topics-list" class="blocked-tags"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Add / Edit Source & Manual Clipping Drawer -->
+  <dialog id="source-drawer" class="workbench-dialog" aria-labelledby="source-drawer-title">
+    <form id="source-form" method="dialog">
+      <div class="dialog-head">
+        <h2 id="source-drawer-title" data-series-text="添加信息源">添加信息源</h2>
+        <button id="btn-close-source-drawer" type="button" class="wb-button" data-series-text="关闭">关闭</button>
+      </div>
+
+      <div id="source-kind-tabs" class="segmented-group" role="group" aria-label="信息源类型" style="margin-bottom:14px;width:100%" data-series-aria-label="信息源类型">
+        <button type="button" data-src-kind="bilibili" aria-pressed="true" data-series-text="B站只读源">B站只读源</button>
+        <button type="button" data-src-kind="ebook" aria-pressed="false" data-series-text="电子书源">电子书源</button>
+        <button type="button" data-src-kind="feed" aria-pressed="false" data-series-text="RSS·JSON Feed">RSS·JSON Feed</button>
+        <button type="button" data-src-kind="manual" aria-pressed="false" data-series-text="手动剪报投喂">手动剪报投喂</button>
+      </div>
+
+      <div id="fields-common">
+        <label class="form-field">
+          <span data-series-text="信息源名称">信息源名称</span>
+          <input id="src-name" type="text" maxlength="100" placeholder="例如：科普 UP 关注、古腾堡短篇集、科技周刊 RSS" data-series-placeholder="例如：科普 UP 关注、古腾堡短篇集、科技周刊 RSS">
+        </label>
+        <label id="src-enabled-wrap" class="checkbox-field">
+          <input id="src-enabled" type="checkbox" checked>
+          <span data-series-text="启用后台定时轮询">启用后台定时轮询</span>
+        </label>
+      </div>
+
+      <!-- Bilibili Fields -->
+      <div id="fields-bilibili" class="kind-fields">
+        <div class="form-grid">
+          <label class="form-field">
+            <span data-series-text="采集模式">采集模式</span>
+            <select id="bili-mode" aria-label="B站采集模式" data-series-aria-label="B站采集模式">
+              <option value="up" data-series-text="指定关注 UP 主投稿/动态">指定关注 UP 主投稿/动态</option>
+              <option value="popular" data-series-text="免登录综合热门 / 榜单">免登录综合热门 / 榜单</option>
+              <option value="recommend" data-series-text="首页推荐流（需只读 Cookie）">首页推荐流（需只读 Cookie）</option>
+            </select>
+          </label>
+          <label id="bili-uid-wrap" class="form-field">
+            <span data-series-text="UP 主 UID">UP 主 UID</span>
+            <input id="bili-uid" type="text" inputmode="numeric" maxlength="32" placeholder="例如：946974" data-series-placeholder="例如：946974">
+          </label>
+          <label id="bili-popular-wrap" class="form-field" hidden>
+            <span data-series-text="热门分类">热门分类</span>
+            <select id="bili-popular-kind" aria-label="B站热门分类" data-series-aria-label="B站热门分类">
+              <option value="hot" data-series-text="综合热门">综合热门</option>
+              <option value="weekly" data-series-text="每周必看">每周必看</option>
+              <option value="rank" data-series-text="全站排行榜">全站排行榜</option>
+            </select>
+          </label>
+        </div>
+        <label class="form-field">
+          <span data-series-text="可选只读 Cookie / SESSDATA（掩码存储）">可选只读 Cookie / SESSDATA（掩码存储）</span>
+          <input id="bili-cookie" type="password" autocomplete="off" maxlength="2048" placeholder="仅刷推荐流或读取 AI 总结时需要，留空免登录运行" data-series-placeholder="仅刷推荐流或读取 AI 总结时需要，留空免登录运行">
+          <span id="bili-cookie-hint" class="field-hint" data-series-text="严格只读：绝不执行点赞、投币、评论或关注，遇风控自动退避冷却。">严格只读：绝不执行点赞、投币、评论或关注，遇风控自动退避冷却。</span>
+        </label>
+      </div>
+
+      <!-- Ebook Fields -->
+      <div id="fields-ebook" class="kind-fields" hidden>
+        <div class="form-grid">
+          <label class="form-field">
+            <span data-series-text="电子书协议 / 来源">电子书协议 / 来源</span>
+            <select id="ebook-provider" aria-label="电子书来源协议" data-series-aria-label="电子书来源协议">
+              <option value="wikisource" data-series-text="中文维基文库 (Wikisource)">中文维基文库 (Wikisource)</option>
+              <option value="gutendex" data-series-text="古腾堡公版书 (Gutendex)">古腾堡公版书 (Gutendex)</option>
+              <option value="opds" data-series-text="OPDS 书库目录 (Calibre-Web / Talebook)">OPDS 书库目录 (Calibre-Web / Talebook)</option>
+            </select>
+          </label>
+          <label id="ebook-page-wrap" class="form-field">
+            <span data-series-text="维基文库页面标题">维基文库页面标题</span>
+            <input id="ebook-page" type="text" maxlength="160" placeholder="例如：呐喊 或 桃花源记" data-series-placeholder="例如：呐喊 或 桃花源记">
+          </label>
+          <label id="ebook-gutendex-wrap" class="form-field" hidden>
+            <span data-series-text="Gutendex 书籍 ID 或公网文本链接">Gutendex 书籍 ID 或公网文本链接</span>
+            <input id="ebook-book-id" type="text" maxlength="512" placeholder="例如：84、1342（按书名找书请用「公版书检索」）" data-series-placeholder="例如：84、1342（按书名找书请用「公版书检索」）">
+          </label>
+        </div>
+        <div id="ebook-opds-wrap" hidden>
+          <label class="form-field"><span data-series-text="额外允许携带凭据的 HTTPS 来源（每行一个，默认留空）">额外允许携带凭据的 HTTPS 来源（每行一个，默认留空）</span><textarea id="ebook-credential-origins" rows="2" placeholder="https://downloads.example.com"></textarea></label>
+          <label class="form-field">
+            <span data-series-text="OPDS Atom 目录或书籍链接">OPDS Atom 目录或书籍链接</span>
+            <input id="ebook-opds-url" type="url" maxlength="512" placeholder="https://books.example.com/opds">
+          </label>
+          <label class="checkbox-field">
+            <input id="ebook-allow-private" type="checkbox">
+            <span data-series-text="允许访问内网/自建局域网 OPDS 服务 (allow_private_opds)">允许访问内网/自建局域网 OPDS 服务 (allow_private_opds)</span>
+          </label>
+          <div class="form-grid">
+            <label class="form-field">
+              <span data-series-text="Basic Auth 用户名（可选）">Basic Auth 用户名（可选）</span>
+              <input id="ebook-opds-user" type="text" autocomplete="off" maxlength="120">
+            </label>
+            <label class="form-field">
+              <span data-series-text="Basic Auth 密码 / 令牌（掩码存储）">Basic Auth 密码 / 令牌（掩码存储）</span>
+              <input id="ebook-opds-pass" type="password" autocomplete="off" maxlength="256" placeholder="留空不修改" data-series-placeholder="留空不修改">
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- RSS / Atom / JSON Feed Fields -->
+      <div id="fields-feed" class="kind-fields" hidden>
+        <label class="form-field">
+          <span data-series-text="订阅源 URL（支持 RSS 2.0 / Atom 1.0 / JSON Feed）">订阅源 URL（支持 RSS 2.0 / Atom 1.0 / JSON Feed）</span>
+          <input id="feed-url" type="url" maxlength="512" placeholder="https://example.com/feed.xml">
+          <span class="field-hint" data-series-text="自动携带 ETag / If-Modified-Since 条件缓存，默认拦截本地与私网重定向以防 SSRF。">自动携带 ETag / If-Modified-Since 条件缓存，默认拦截本地与私网重定向以防 SSRF。</span>
+        </label>
+      </div>
+
+      <!-- Manual Clipping Feed Fields -->
+      <div id="fields-manual" class="kind-fields" hidden>
+        <div class="form-grid">
+          <label class="form-field">
+            <span data-series-text="读物标题">读物标题</span>
+            <input id="manual-title" type="text" maxlength="160" placeholder="剪报或文章标题" data-series-placeholder="剪报或文章标题">
+          </label>
+          <label class="form-field">
+            <span data-series-text="作者 / 来源署名（可选）">作者 / 来源署名（可选）</span>
+            <input id="manual-creator" type="text" maxlength="80" placeholder="例如：博物杂志" data-series-placeholder="例如：博物杂志">
+          </label>
+        </div>
+        <label class="form-field">
+          <span data-series-text="公开文章 URL（可选，支持自动提取正文）">公开文章 URL（可选，支持自动提取正文）</span>
+          <input id="manual-url" type="url" maxlength="512" placeholder="https://example.com/article">
+        </label>
+        <label class="form-field">
+          <span data-series-text="剪报正文内容（直接投喂给当前角色案头）">剪报正文内容（直接投喂给当前角色案头）</span>
+          <textarea id="manual-text" rows="5" maxlength="12000" placeholder="粘贴文章节选或读物正文，将同样经过防注入清洗与双模型审查…" data-series-placeholder="粘贴文章节选或读物正文，将同样经过防注入清洗与双模型审查…"></textarea>
+        </label>
+      </div>
+
+      <p id="source-drawer-error" data-ui-state="error" role="alert"></p>
+
+      <footer class="dialog-footer">
+        <button id="btn-cancel-source" type="button" class="wb-button" data-series-text="取消">取消</button>
+        <button id="btn-submit-source" type="submit" class="wb-button primary" data-series-text="保存">保存</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- Public Ebook Search & Local Upload Modal -->
+  <dialog id="book-modal" class="workbench-dialog" aria-labelledby="book-modal-title">
+    <div class="dialog-head">
+      <h2 id="book-modal-title" data-series-text="公版书检索与本地上传">公版书检索与本地上传</h2>
+      <button id="btn-close-book-modal" type="button" class="wb-button" data-series-text="关闭">关闭</button>
+    </div>
+
+    <section aria-labelledby="pub-search-heading">
+      <h3 id="pub-search-heading" data-series-text="检索维基文库与 Gutendex 公版书">检索维基文库与 Gutendex 公版书</h3>
+      <div class="form-grid" style="margin-top:10px">
+        <label class="form-field">
+          <span data-series-text="书库来源">书库来源</span>
+          <select id="pub-book-provider" aria-label="公版书库来源" data-series-aria-label="公版书库来源">
+            <option value="wikisource" data-series-text="中文维基文库 (Wikisource)">中文维基文库 (Wikisource)</option>
+            <option value="gutendex" data-series-text="古腾堡计划 (Gutendex)">古腾堡计划 (Gutendex)</option>
+          </select>
+        </label>
+        <label class="form-field">
+          <span data-series-text="语种筛选">语种筛选</span>
+          <select id="pub-book-lang" aria-label="语种筛选" data-series-aria-label="语种筛选">
+            <option value="zh" data-series-text="中文 (zh)">中文 (zh)</option>
+            <option value="en">English (en)</option>
+            <option value="ja" data-series-text="日本語 (ja)">日本語 (ja)</option>
+            <option value="ru">Русский (ru)</option>
+          </select>
+        </label>
+      </div>
+      <div class="blocklist-bar">
+        <input id="pub-book-query" type="search" maxlength="120" aria-label="公版书搜索关键词" placeholder="输入书名或作者，如：鲁迅 / Natsume / Holmes" data-series-aria-label="公版书搜索关键词" data-series-placeholder="输入书名或作者，如：鲁迅 / Natsume / Holmes">
+        <button id="btn-search-books" type="button" class="wb-button primary" data-series-text="搜索公版书">搜索公版书</button>
+      </div>
+      <div id="pub-book-results" class="stack-list"></div>
+    </section>
+
+    <hr class="dialog-divider">
+
+    <section aria-labelledby="local-upload-heading">
+      <h3 id="local-upload-heading" data-series-text="上传本地电子书连载（.epub / .txt）">上传本地电子书连载（.epub / .txt）</h3>
+      <p class="field-hint" style="margin:4px 0 10px" data-series-text="按章节/字数切片自动建立角色阅读游标，支持随时在书架切换「在读 / 弃书 / 读完」。">按章节/字数切片自动建立角色阅读游标，支持随时在书架切换「在读 / 弃书 / 读完」。</p>
+      <div class="blocklist-bar">
+        <input id="ebook-file-input" type="file" accept=".epub,.txt" aria-label="选择本地电子书文件" data-series-aria-label="选择本地电子书文件">
+        <button id="btn-upload-ebook" type="button" class="wb-button primary" data-series-text="上传并加入书架">上传并加入书架</button>
+      </div>
+    </section>
+
+    <p id="book-modal-feedback" data-ui-state="info" role="status"></p>
+  </dialog>
+
+  <script type="module" src="./app.js?v=round2.3"></script>
+</body>
+</html>

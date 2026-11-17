@@ -1,0 +1,123 @@
+{
+  "enabled": {
+    "description": "启用群间见闻",
+    "type": "bool",
+    "default": true
+  },
+  "sessions": {
+    "description": "生效会话",
+    "type": "list",
+    "default": [],
+    "hint": "填写完整 UMO（含平台实例和群聊/私聊类型）。留空则对所有已接入群间会话开放话题匹配投影；填写后仅对白名单会话生效。"
+  },
+  "analysis_provider": {
+    "description": "阅读与分析模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "普通聊天模型，用于候选挑拣与精读内化；不要选择 Jev 抉择模型。"
+  },
+  "review_provider": {
+    "description": "独立审查模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于独立复核阅读提案（核查固定性格、防注入、非亲历事实与自然问题）；未配置时等待审查，不自动放行。"
+  },
+  "review_mode": {
+    "description": "审查生效模式",
+    "type": "string",
+    "default": "llm",
+    "options": [
+      "llm",
+      "llm_then_human",
+      "human"
+    ],
+    "hint": "llm：独立审查模型通过后自动生效；llm_then_human：模型初审后需人工确认；human：纯人工确认。"
+  },
+  "poll_interval_seconds": {
+    "description": "信息源后台轮询间隔（秒）",
+    "type": "int",
+    "default": 900
+  },
+  "digest_interval_seconds": {
+    "description": "自主挑拣阅读检查间隔（秒）",
+    "type": "int",
+    "default": 3600
+  },
+  "daily_digest_quota": {
+    "description": "每日精读上限（篇/章）",
+    "type": "int",
+    "default": 5
+  },
+  "interest_half_life_days": {
+    "description": "暂存兴趣热度半衰期（天）",
+    "type": "int",
+    "default": 6
+  },
+  "question_ttl_hours": {
+    "description": "待讨论问题保鲜期（小时）",
+    "type": "int",
+    "default": 72
+  },
+  "quiet_hours": {
+    "description": "静默免读与免打扰时段（Asia/Shanghai）",
+    "type": "string",
+    "default": "00:00-08:00",
+    "hint": "格式 HH:MM-HH:MM，北京时间。未接入群间世界作息时在此区间暂停阅读，主动分享候选在此区间亦不触发。"
+  },
+  "proactive_enabled": {
+    "description": "启用见闻主动分享",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，见闻可为已有共同话题证据且未退订的成员提交低频分享候选。"
+  },
+  "proactive_sessions": {
+    "description": "见闻主动分享白名单",
+    "type": "list",
+    "default": [],
+    "hint": "开启主动分享后，留空覆盖所有已接管的群聊和私聊。填写完整 UMO 后，仅向名单内的接管会话提交候选。"
+  },
+  "model_timeout": {
+    "description": "单次模型调用超时（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "proactive_scope": {
+    "type": "string",
+    "description": "主动分享范围（兼容旧配置）",
+    "default": "all_managed_chats",
+    "options": [
+      "explicit",
+      "all_managed_groups",
+      "all_managed_chats"
+    ],
+    "hint": "旧版兼容字段。当前由主动分享开关和白名单决定生效范围。"
+  },
+  "daily_model_call_quota": {
+    "type": "int",
+    "description": "每角色每日模型调用上限（含失败与核验）",
+    "default": 50
+  },
+  "archive_after_days": {
+    "type": "int",
+    "description": "无引用候选归档天数（不物理删除）",
+    "default": 90
+  },
+  "active_candidate_limit": {
+    "type": "int",
+    "description": "每角色活跃候选上限",
+    "default": 5000
+  },
+  "storage_warning_mb": {
+    "type": "int",
+    "description": "数据库容量告警阈值 MB",
+    "default": 512
+  },
+  "allow_same_provider_for_review": {
+    "type": "bool",
+    "description": "允许同一模型独立复核",
+    "default": false,
+    "hint": "开启后分析与审查可以选择同一 Provider；审查仍单独调用，使用空历史上下文和独立审查指令。"
+  }
+}
