@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 
-from .contract import chat_umo_kind, encode_json, make_identity, normalize_identity
+from .contract import chat_umo_kind, encode_json, make_identity, normalize_identity, shanghai_day_bounds
 from .sanitize import sanitize_untrusted_text
 from .discussion_feedback import (
     opening_contexts, process_received, queue_received, recent_correction_logs,
@@ -74,15 +74,17 @@ def enqueue(engine, event):
     ).hexdigest()
     now = engine.clock()
     store = engine.store
+    projection_dirty = False
     # Only adapter-provided current managed scope may register a proactive destination.
     if (
         event.get("managed") is True
         and scope.get("persona_id")
         and chat_umo_kind(umo)
     ):
-        store.bind_scope(umo, ident, True, now)
+        if store.bind_scope(umo, ident, True, now):
+            projection_dirty = True
         engine.projection.bind_umo_identity(umo, ident)
-    store.record_turn_feedback(
+    turn_res = store.record_turn_feedback(
         identity=ident,
         umo=umo,
         member_id=member,
@@ -91,6 +93,8 @@ def enqueue(engine, event):
         event_id="preference:" + eid,
         now=now,
     )
+    if turn_res.get("prefs_changed"):
+        projection_dirty = True
     with store.lock, store.db:
         # Unquoted explicit requests apply only to this member in this UMO.
         direct = user.strip()
@@ -108,6 +112,7 @@ def enqueue(engine, event):
                 "UPDATE horizon_intents SET status='cancelled',updated_at=? WHERE identity=? AND umo=? AND recipient_user_id=? AND topic=? AND status IN ('pending','claimed')",
                 (now, ident, umo, member, topic),
             )
+            projection_dirty = True
         restore = re.fullmatch(
             r"(?:恢复|可以继续)(?:向我|给我)?(?:分享|推荐|聊)(.{2,40}?)[。！!]?$",
             direct,
@@ -117,6 +122,7 @@ def enqueue(engine, event):
                 "UPDATE member_topic_prefs SET blocked=0,updated_at=? WHERE identity=? AND umo=? AND member_id=? AND topic=?",
                 (now, ident, umo, member, restore.group(1).strip()),
             )
+            projection_dirty = True
         if any(
             c in direct
             for c in ("这条信息有误", "这个说法不对", "这条见闻不对", "纠正一下")
@@ -130,7 +136,7 @@ def enqueue(engine, event):
                     (log_id, ident),
                 ).fetchone():
                     correction_id = hashlib.sha256((eid + log_id).encode()).hexdigest()
-                    store.db.execute(
+                    inserted = store.db.execute(
                         "INSERT OR IGNORE INTO corrections(correction_id,identity,umo,member_id,log_id,statement,created_at) VALUES(?,?,?,?,?,?,?)",
                         (
                             correction_id,
@@ -141,26 +147,19 @@ def enqueue(engine, event):
                             sanitize_untrusted_text(direct, max_chars=500)["text"],
                             now,
                         ),
-                    )
+                    ).rowcount
+                    if inserted:
+                        projection_dirty = True
         if not delivered or not reply:
             queued = queue_received(
                 engine, event, identity=ident, umo=umo, member=member,
                 user=user, now=now,
             )
-            return {"accepted": True, "queued": queued}
+            return {"accepted": True, "queued": queued, "projection_dirty": projection_dirty}
         qids = list(event.get("question_ids") or [])[:8]
-        topics = list(event.get("topics") or [])[:12]
-        interests = store.db.execute(
-            "SELECT topic FROM staged_interests WHERE identity=? AND status='active'",
-            (ident,),
-        ).fetchall()
-        topics = list(
-            dict.fromkeys(
-                [*topics, *[r[0] for r in interests if r[0] in user or r[0] in reply]]
-            )
-        )[:12]
+        topics = list(dict.fromkeys(str(t) for t in (event.get("topics") or []) if t))[:12]
         if not qids and not topics and not event.get("log_ids") and not event.get("intent_id"):
-            return {"accepted": True, "queued": False}
+            return {"accepted": True, "queued": False, "projection_dirty": projection_dirty}
         payload = {
             "kind": "delivery",
             "user_text": user,
@@ -180,7 +179,7 @@ def enqueue(engine, event):
             "INSERT OR IGNORE INTO feedback_jobs(event_id,identity,umo,member_id,payload_json,created_at) VALUES(?,?,?,?,?,?)",
             (eid, ident, umo, member, encode_json(payload), now),
         )
-    return {"accepted": True, "queued": True}
+    return {"accepted": True, "queued": True, "projection_dirty": projection_dirty}
 
 
 async def process_jobs(engine):
@@ -198,8 +197,8 @@ async def process_jobs(engine):
         if data.get("kind") == "discussion_reply":
             try:
                 await process_received(engine, row, data)
-            except Exception:
-                _retry_job(engine, row)
+            except Exception as exc:
+                _retry_job(engine, row, exc)
             continue
         with store.lock:
             questions = [
@@ -223,6 +222,7 @@ async def process_jobs(engine):
                     "reading_openings": contexts,
                 },
                 identity=row["identity"],
+                lane="feedback",
             )
             qids = []
             topics = []
@@ -272,15 +272,24 @@ async def process_jobs(engine):
                     "UPDATE feedback_jobs SET status='done',payload_json=? WHERE event_id=?",
                     (encode_json(data), row["event_id"]),
                 )
-        except Exception:
-            _retry_job(engine, row)
+        except Exception as exc:
+            _retry_job(engine, row, exc)
 
 
-def _retry_job(engine, row):
+def _retry_job(engine, row, exc=None):
+    now = engine.clock()
+    msg = str(exc or "")
     with engine.store.lock, engine.store.db:
+        if "daily_model_call_quota_reached" in msg or "feedback_model_call_quota_reached" in msg:
+            _, next_day = shanghai_day_bounds(now)
+            engine.store.db.execute(
+                "UPDATE feedback_jobs SET status='pending',next_at=? WHERE event_id=?",
+                (next_day + 60.0, row["event_id"]),
+            )
+            return
         n = row["attempts"] + 1
         engine.store.db.execute(
             "UPDATE feedback_jobs SET attempts=?,status=?,next_at=? WHERE event_id=?",
             (n, "pending" if n <= 3 else "held",
-             engine.clock() + [60, 300, 1800][min(n - 1, 2)], row["event_id"]),
+             now + [60, 300, 1800][min(n - 1, 2)], row["event_id"]),
         )

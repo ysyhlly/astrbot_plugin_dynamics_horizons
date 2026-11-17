@@ -817,12 +817,11 @@ async def fetch_bilibili_content(
         except Exception as exc:
             rc = _classify_bili_exception(exc, secrets)
             if rc is not None:
-                return {
-                    "full_text": fallback_desc,
-                    "content_origin": "bilibili_description",
-                    "chapter_label": "",
-                    "total_chapters": None,
-                }
+                raise BilibiliRiskControlError(
+                    redact_error_text(rc, secrets),
+                    code=rc.code,
+                    cooldown_seconds=rc.cooldown_seconds,
+                ) from None
 
     best_desc = clean_external_text(info_desc or fallback_desc, max_chars=4000)
 
@@ -844,13 +843,13 @@ async def fetch_bilibili_content(
                     "total_chapters": None,
                 }
         except Exception as exc:
-            if _classify_bili_exception(exc, secrets) is not None:
-                return {
-                    "full_text": best_desc,
-                    "content_origin": "bilibili_description",
-                    "chapter_label": "",
-                    "total_chapters": None,
-                }
+            rc = _classify_bili_exception(exc, secrets)
+            if rc is not None:
+                raise BilibiliRiskControlError(
+                    redact_error_text(rc, secrets),
+                    code=rc.code,
+                    cooldown_seconds=rc.cooldown_seconds,
+                ) from None
 
     # (b) CC / AI subtitle JSON (`get_subtitle` -> download subtitle body JSON)
     if cid:
@@ -868,10 +867,16 @@ async def fetch_bilibili_content(
                         "chapter_label": "",
                         "total_chapters": None,
                     }
-        except SSRFBlockedError:
+        except (SSRFBlockedError, BilibiliRiskControlError, AdapterRateLimitError):
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            rc = _classify_bili_exception(exc, secrets)
+            if rc is not None:
+                raise BilibiliRiskControlError(
+                    redact_error_text(rc, secrets),
+                    code=rc.code,
+                    cooldown_seconds=rc.cooldown_seconds,
+                ) from None
 
     # (c) Video description fallback
     return {

@@ -244,7 +244,6 @@ class HorizonsWebAPI:
         async def op(_body: dict[str, Any], _actor: str):
             eng = self.plugin.engine
             now = eng.clock()
-            await run_io(eng.store.settle_decay, now, eng.half_life_days)
 
             req_id = _query_param("identity", "")
             active_identity, personas = self._resolve_active_identity(req_id)

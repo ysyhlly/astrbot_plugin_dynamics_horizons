@@ -167,11 +167,38 @@ class DiscussionStoreMixin:
     def _list_discussion_reflections_for_logs(
         self, identity: str, log_ids: list[str], *, limit_per_log: int = 5
     ) -> dict[str, list[dict[str, Any]]]:
-        """Load a bounded set for the admin reading-log view, retaining scope labels."""
-        result: dict[str, list[dict[str, Any]]] = {}
-        for log_id in log_ids:
-            result[log_id] = self.list_discussion_reflections(
-                identity, log_id=log_id, limit=limit_per_log
+        """Load a bounded set for the admin reading-log view in one batched query."""
+        norm_id = normalize_identity(identity)
+        clean_ids = list(dict.fromkeys(str(lid or "").strip() for lid in log_ids if str(lid or "").strip()))
+        result: dict[str, list[dict[str, Any]]] = {lid: [] for lid in clean_ids}
+        if not clean_ids:
+            return result
+        per_limit = max(1, min(200, int(limit_per_log or 5)))
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self.lock:
+            rows = self.db.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT d.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY d.log_id
+                               ORDER BY d.occurred_at DESC, d.reflection_id DESC
+                           ) AS rn
+                    FROM discussion_reflections d
+                    JOIN reading_logs l ON l.log_id=d.log_id AND l.identity=d.identity
+                    WHERE d.identity=?
+                      AND d.status='active'
+                      AND l.status='active'
+                      AND l.revision=d.source_log_revision
+                      AND d.log_id IN ({placeholders})
+                )
+                SELECT * FROM ranked WHERE rn<=? ORDER BY occurred_at DESC, reflection_id DESC
+                """,
+                [norm_id, *clean_ids, per_limit],
+            ).fetchall()
+        for row in rows:
+            result.setdefault(str(row["log_id"]), []).append(
+                self._format_discussion_reflection(row)
             )
         return result
 

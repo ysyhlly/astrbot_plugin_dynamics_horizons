@@ -200,7 +200,8 @@ class Main(Star):
         from .core.feedback import enqueue
 
         result = enqueue(self.engine, event)
-        self.engine.refresh_projection_sync()
+        if result.pop("projection_dirty", False):
+            self.engine.refresh_projection_sync()
         return {"schema_version": SCHEMA_VERSION, **result}
 
     # ------------------------------------------------------------------

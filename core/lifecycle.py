@@ -153,7 +153,7 @@ class LifecycleStore:
                 "UPDATE reading_tasks SET status='pending_review' WHERE status='interrupted' AND task_id IN (SELECT task_id FROM proposals WHERE state='pending_review')"
             )
 
-    def defer_review(self, proposal_id, now, reason, *, expected_revision=None):
+    def defer_review(self, proposal_id, now, reason, *, expected_revision=None, delay=300):
         with self.lock, self.db:
             if not self.db.execute(
                 "SELECT 1 FROM proposals WHERE proposal_id=? AND state='pending_review' AND (? IS NULL OR revision=?)",
@@ -162,22 +162,31 @@ class LifecycleStore:
                 return
             self.db.execute(
                 "INSERT INTO review_jobs(proposal_id,kind,attempts,next_at,last_error) VALUES(?,'retry',0,?,?) ON CONFLICT(proposal_id) DO UPDATE SET kind='retry',next_at=excluded.next_at,last_error=excluded.last_error WHERE review_jobs.kind!='exhausted'",
-                (proposal_id, now + 300, str(reason)[:200]),
+                (proposal_id, now + delay, str(reason)[:200]),
             )
 
-    def reserve_call(self, identity, role, limit, now):
+    def reserve_call(self, identity, role, limit, now, *, lane="reading"):
         start, end = shanghai_day_bounds(now)
         with self.lock, self.db:
-            used = self.db.execute(
-                "SELECT count(*) FROM model_calls WHERE identity=? AND created_at>=? AND created_at<?",
+            rows = self.db.execute(
+                "SELECT role FROM model_calls WHERE identity=? AND created_at>=? AND created_at<?",
                 (identity, start, end),
-            ).fetchone()[0]
+            ).fetchall()
+            used = len(rows)
             if used >= limit:
                 raise ValueError("daily_model_call_quota_reached")
+            if lane == "feedback" and limit >= 6:
+                reading_reserved = max(2, limit // 2)
+                feedback_used = sum(
+                    1 for r in rows if str(r["role"] or "").endswith(":feedback")
+                )
+                if feedback_used >= limit - reading_reserved:
+                    raise ValueError("feedback_model_call_quota_reached")
             cid = uuid.uuid4().hex
+            stored_role = f"{role}:{lane}" if lane != "reading" else role
             self.db.execute(
                 "INSERT INTO model_calls VALUES(?,?,?,?,?)",
-                (cid, identity, role, "reserved", now),
+                (cid, identity, stored_role, "reserved", now),
             )
             return cid
 
@@ -531,10 +540,16 @@ class LifecycleStore:
 
     def bind_scope(self, umo, identity, managed, now):
         with self.lock, self.db:
+            prev = self.db.execute(
+                "SELECT identity,managed FROM scope_bindings WHERE umo=?", (umo,)
+            ).fetchone()
+            if prev is not None and prev["identity"] == identity and int(prev["managed"]) == int(managed):
+                return False
             self.db.execute(
                 "INSERT OR REPLACE INTO scope_bindings VALUES(?,?,?,?)",
                 (umo, identity, int(managed), now),
             )
+            return True
 
     def known_managed_scopes(self, identity: str = ""):
         with self.lock:
@@ -561,7 +576,7 @@ class LifecycleStore:
         with self.lock, self.db:
             eligible = "archived=0 AND pinned=0 AND NOT EXISTS(SELECT 1 FROM proposals p WHERE p.candidate_id=candidate_items.candidate_id) AND NOT EXISTS(SELECT 1 FROM reading_tasks t WHERE t.candidate_id=candidate_items.candidate_id)"
             self.db.execute(
-                f"UPDATE candidate_items SET archived=1 WHERE {eligible} AND created_at<?",
+                f"UPDATE candidate_items SET archived=1, full_text='' WHERE {eligible} AND created_at<?",
                 (now - days * 86400,),
             )
             for r in self.db.execute(
@@ -570,9 +585,129 @@ class LifecycleStore:
                 excess = max(0, r["n"] - limit)
                 if excess:
                     self.db.execute(
-                        f"UPDATE candidate_items SET archived=1 WHERE candidate_id IN (SELECT candidate_id FROM candidate_items WHERE identity=? AND {eligible} ORDER BY created_at LIMIT ?)",
+                        f"UPDATE candidate_items SET archived=1, full_text='' WHERE candidate_id IN (SELECT candidate_id FROM candidate_items WHERE identity=? AND {eligible} ORDER BY created_at LIMIT ?)",
                         (r["identity"], excess),
                     )
+            # Clear already-archived full_text unless referenced by an active/held proposal
+            self.db.execute(
+                "UPDATE candidate_items SET full_text='' WHERE archived=1 AND full_text!='' AND NOT EXISTS(SELECT 1 FROM proposals p WHERE p.candidate_id=candidate_items.candidate_id AND p.state IN ('pending_review','held'))"
+            )
+
+    def prune_terminal_records(
+        self,
+        now,
+        *,
+        retention_days: float = 30.0,
+        attempt_days: float = 30.0,
+        batch_limit: int = 2000,
+    ) -> dict[str, int]:
+        """Bounded retention GC for completed/expired terminal rows to prevent unbounded SQLite growth."""
+        cutoff = float(now) - max(1.0, float(retention_days)) * 86400.0
+        held_cutoff = float(now) - max(60.0, float(retention_days)) * 86400.0
+        # Never prune records within the recent 7 Shanghai days so daily quota counts stay exact.
+        attempt_cutoff = float(now) - max(7.0, float(attempt_days)) * 86400.0
+        lim = max(1, min(10000, int(batch_limit)))
+        removed: dict[str, int] = {}
+        with self.lock, self.db:
+            cur = self.db.execute(
+                """
+                DELETE FROM feedback_jobs
+                WHERE event_id IN (
+                    SELECT event_id FROM feedback_jobs
+                    WHERE (status='done' AND created_at<?)
+                       OR (status='held' AND created_at<?)
+                    LIMIT ?
+                )
+                """,
+                (cutoff, held_cutoff, lim),
+            )
+            removed["feedback_jobs"] = int(cur.rowcount or 0)
+            cur = self.db.execute(
+                """
+                DELETE FROM feedback_receipts
+                WHERE event_id IN (
+                    SELECT event_id FROM feedback_receipts
+                    WHERE created_at<?
+                    LIMIT ?
+                )
+                """,
+                (cutoff, lim),
+            )
+            removed["feedback_receipts"] = int(cur.rowcount or 0)
+            cur = self.db.execute(
+                """
+                DELETE FROM reading_attempts
+                WHERE attempt_id IN (
+                    SELECT attempt_id FROM reading_attempts
+                    WHERE created_at<?
+                    LIMIT ?
+                )
+                """,
+                (attempt_cutoff, lim),
+            )
+            removed["reading_attempts"] = int(cur.rowcount or 0)
+            cur = self.db.execute(
+                """
+                DELETE FROM model_calls
+                WHERE call_id IN (
+                    SELECT call_id FROM model_calls
+                    WHERE created_at<?
+                    LIMIT ?
+                )
+                """,
+                (attempt_cutoff, lim),
+            )
+            removed["model_calls"] = int(cur.rowcount or 0)
+            cur = self.db.execute(
+                """
+                DELETE FROM world_outbox
+                WHERE log_id IN (
+                    SELECT log_id FROM world_outbox
+                    WHERE status IN ('done', 'skipped', 'failed') AND next_at<?
+                    LIMIT ?
+                )
+                """,
+                (cutoff, lim),
+            )
+            removed["world_outbox"] = int(cur.rowcount or 0)
+            cur = self.db.execute(
+                """
+                DELETE FROM horizon_intents
+                WHERE intent_id IN (
+                    SELECT intent_id FROM horizon_intents
+                    WHERE status IN ('sent', 'expired', 'cancelled') AND updated_at<?
+                    LIMIT ?
+                )
+                """,
+                (cutoff, lim),
+            )
+            removed["horizon_intents"] = int(cur.rowcount or 0)
+            cur = self.db.execute(
+                """
+                DELETE FROM book_chapters
+                WHERE EXISTS (
+                    SELECT 1 FROM books b
+                    WHERE b.book_id=book_chapters.book_id
+                      AND b.status IN ('finished', 'dropped')
+                      AND b.updated_at<?
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM proposals p
+                    WHERE p.book_id=book_chapters.book_id
+                      AND p.chapter_index=book_chapters.chapter_index
+                      AND p.state IN ('pending_review', 'held')
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM reading_tasks t
+                    WHERE t.book_id=book_chapters.book_id
+                      AND t.chapter_index=book_chapters.chapter_index
+                      AND t.status IN ('running', 'pending_review', 'interrupted', 'failed')
+                )
+                """,
+                (cutoff,),
+            )
+            removed["book_chapters"] = int(cur.rowcount or 0)
+        return removed
 
     def diagnostics(self, identity, now):
         start, end = shanghai_day_bounds(now)

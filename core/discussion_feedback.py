@@ -140,6 +140,29 @@ def queue_received(engine, event, *, identity, umo, member, user, now):
     if not opening_ids:
         return False
     eid = hashlib.sha256(encode_json([identity, umo, member, "discussion_reply", message_id]).encode()).hexdigest()
+    already_queued = store.db.execute(
+        "SELECT 1 FROM feedback_jobs WHERE event_id=?",
+        (eid,),
+    ).fetchone()
+    if already_queued is None:
+        existing_replies = store.db.execute(
+            "SELECT member_id, created_at FROM feedback_jobs "
+            "WHERE identity=? AND umo=? AND json_extract(payload_json,'$.kind')='discussion_reply' "
+            "AND json_extract(payload_json,'$.opening_event_ids[0]')=? ORDER BY created_at DESC LIMIT 10",
+            (identity, umo, opening_ids[0]),
+        ).fetchall()
+        if len(existing_replies) >= 3:
+            return False
+        if not quoted:
+            same_member = [r for r in existing_replies if r["member_id"] == member]
+            if same_member and (len(same_member) >= 2 or (now - float(same_member[0]["created_at"])) < 180):
+                return False
+        reflected = store.db.execute(
+            "SELECT count(*) FROM discussion_reflections WHERE identity=? AND umo=? AND anchor_event_id=?",
+            (identity, umo, opening_ids[0]),
+        ).fetchone()[0]
+        if reflected >= 2 or (not quoted and reflected >= 1):
+            return False
     payload = {"kind": "discussion_reply", "source_message_id": message_id,
                "user_text": user, "reply_to_message_id": quoted,
                "opening_event_ids": opening_ids, "occurred_at": now}
@@ -196,7 +219,7 @@ async def process_received(engine, row, data):
         result = await engine.call_model(
             "review_provider", DISCUSSION_PROMPT,
             {"member_text": data["user_text"], "explicit_reply": bool(data.get("reply_to_message_id")),
-             "openings": list(anchors.values())}, identity=row["identity"],
+             "openings": list(anchors.values())}, identity=row["identity"], lane="feedback",
         )
     with store.lock, store.db:
         for item in _rows(result, "reflections", 2):

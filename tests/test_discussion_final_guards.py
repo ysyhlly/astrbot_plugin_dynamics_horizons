@@ -8,7 +8,6 @@ from test_discussion_feedback import (
     LOG_ID,
     REFLECTION,
     USER_TEXT,
-    Model,
     Rig,
     _count_reflections,
     _delivery_event,

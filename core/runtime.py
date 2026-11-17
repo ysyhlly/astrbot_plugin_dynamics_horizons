@@ -9,13 +9,14 @@ from .contract import chat_umo_kind, make_identity
 
 
 class EngineLifecycle:
-    async def call_model(self, role, instruction, payload, *, identity):
+    async def call_model(self, role, instruction, payload, *, identity, lane="reading"):
         cid = await run_io(
             self.store.reserve_call,
             identity,
             role,
             max(1, int(self.config.get("daily_model_call_quota", 50))),
             self.clock(),
+            lane=lane,
         )
         try:
             value = await self.model_caller(role, instruction, payload)
@@ -62,11 +63,19 @@ class EngineLifecycle:
                 raise ValueError("reading_source_changed")
 
     async def process_maintenance(self):
+        now = self.clock()
         await run_io(
             self.store.archive_candidates,
-            self.clock(),
+            now,
             max(1, int(self.config.get("archive_after_days", 90))),
             max(1, int(self.config.get("active_candidate_limit", 5000))),
+        )
+        await run_io(
+            self.store.prune_terminal_records,
+            now,
+            retention_days=max(
+                7.0, float(self.config.get("terminal_retention_days", 30) or 30)
+            ),
         )
         if not self.config.get("enabled", True) or self.closed:
             return

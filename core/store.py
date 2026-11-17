@@ -65,6 +65,16 @@ _OPT_IN_CUES = (
 )
 
 
+def _escape_like(value: str) -> str:
+    """Escape SQLite LIKE pattern metacharacters (`\\`, `%`, `_`)."""
+    return (
+        str(value or "")
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
 class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
     """Thread-safe SQLite store separating global character reading from per-UMO consumption."""
 
@@ -326,31 +336,31 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 "INSERT OR REPLACE INTO blocked_topics(topic, identity, created_at) VALUES (?, ?, ?)",
                 (clean, norm, stamp),
             )
-            like_pat = f"%{clean}%"
+            like_pat = f"%{_escape_like(clean)}%"
             if norm:
                 self.db.execute(
-                    "UPDATE staged_interests SET status='revoked', updated_at=? WHERE identity=? AND status='active' AND (topic=? OR topic LIKE ?)",
+                    "UPDATE staged_interests SET status='revoked', updated_at=? WHERE identity=? AND status='active' AND (topic=? OR topic LIKE ? ESCAPE '\\')",
                     (stamp, norm, clean, like_pat),
                 )
                 self.db.execute(
-                    "UPDATE discussion_questions SET status='archived' WHERE identity=? AND status='active' AND (topic=? OR question LIKE ?)",
+                    "UPDATE discussion_questions SET status='archived' WHERE identity=? AND status='active' AND (topic=? OR question LIKE ? ESCAPE '\\')",
                     (norm, clean, like_pat),
                 )
                 self.db.execute(
-                    "UPDATE candidate_items SET status='blocked' WHERE identity=? AND status='unread' AND (title LIKE ? OR summary LIKE ?)",
+                    "UPDATE candidate_items SET status='blocked' WHERE identity=? AND status='unread' AND (title LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\')",
                     (norm, like_pat, like_pat),
                 )
             else:
                 self.db.execute(
-                    "UPDATE staged_interests SET status='revoked', updated_at=? WHERE status='active' AND (topic=? OR topic LIKE ?)",
+                    "UPDATE staged_interests SET status='revoked', updated_at=? WHERE status='active' AND (topic=? OR topic LIKE ? ESCAPE '\\')",
                     (stamp, clean, like_pat),
                 )
                 self.db.execute(
-                    "UPDATE discussion_questions SET status='archived' WHERE status='active' AND (topic=? OR question LIKE ?)",
+                    "UPDATE discussion_questions SET status='archived' WHERE status='active' AND (topic=? OR question LIKE ? ESCAPE '\\')",
                     (clean, like_pat),
                 )
                 self.db.execute(
-                    "UPDATE candidate_items SET status='blocked' WHERE status='unread' AND (title LIKE ? OR summary LIKE ?)",
+                    "UPDATE candidate_items SET status='blocked' WHERE status='unread' AND (title LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\')",
                     (like_pat, like_pat),
                 )
             self.db.execute(
@@ -1488,15 +1498,70 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 f"SELECT * FROM proposals {where} ORDER BY created_at DESC, proposal_id DESC LIMIT ? OFFSET ?",
                 [*params, ps, (p - 1) * ps],
             ).fetchall()
-        return {
-            "items": [
+            audits_map: dict[str, list[dict[str, Any]]] = {}
+            task_ctx_map: dict[str, dict[str, Any]] = {}
+            continuity_cache: dict[tuple[str, int], dict[str, Any]] = {}
+            pids = [str(r["proposal_id"]) for r in rows]
+            if pids:
+                ph = ",".join("?" for _ in pids)
+                for a in self.db.execute(
+                    f"SELECT proposal_id,from_state,to_state,actor,reason,created_at FROM review_audit WHERE proposal_id IN ({ph}) ORDER BY audit_id",
+                    pids,
+                ).fetchall():
+                    audits_map.setdefault(str(a["proposal_id"]), []).append(
+                        {
+                            "from_state": a["from_state"],
+                            "to_state": a["to_state"],
+                            "actor": a["actor"],
+                            "reason": a["reason"],
+                            "created_at": a["created_at"],
+                        }
+                    )
+                tids = list(
+                    dict.fromkeys(
+                        str(r["task_id"])
+                        for r in rows
+                        if r["book_id"] and r["task_id"]
+                    )
+                )
+                if tids:
+                    tph = ",".join("?" for _ in tids)
+                    for t in self.db.execute(
+                        f"SELECT task_id,context_json FROM reading_tasks WHERE task_id IN ({tph})",
+                        tids,
+                    ).fetchall():
+                        task_ctx_map[str(t["task_id"])] = (
+                            json.loads(t["context_json"]) if t["context_json"] else {}
+                        )
+                for r in rows:
+                    bid = str(r["book_id"] or "")
+                    if not bid:
+                        continue
+                    cidx = int(r["chapter_index"] or 0)
+                    key = (bid, cidx)
+                    if key not in continuity_cache:
+                        continuity_cache[key] = self.continuity(bid, cidx)
+        items_out: list[dict[str, Any]] = []
+        for r in rows:
+            pid = str(r["proposal_id"])
+            bid = str(r["book_id"] or "")
+            if bid:
+                cidx = int(r["chapter_index"] or 0)
+                cont = {
+                    "proposed": task_ctx_map.get(str(r["task_id"] or ""), {}),
+                    "previous": continuity_cache.get((bid, cidx), {}),
+                }
+            else:
+                cont = {"proposed": {}, "previous": {}}
+            items_out.append(
                 {
                     **self._format_proposal_row(r),
-                    "continuity": self.proposal_continuity_evidence(r["proposal_id"]),
-                    "audit": self.proposal_audit(r["proposal_id"]),
+                    "continuity": cont,
+                    "audit": audits_map.get(pid, []),
                 }
-                for r in rows
-            ],
+            )
+        return {
+            "items": items_out,
             "page": p,
             "page_size": ps,
             "total": int(total),
@@ -1861,6 +1926,36 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         for umo in dict.fromkeys(allowed_umos):
             if not self.outreach_binding_valid(umo, identity):
                 continue
+            # Per-UMO daily/pending/topic cooldowns to prevent group spam bursts
+            umo_daily_used = self.db.execute(
+                """
+                SELECT COUNT(*) FROM horizon_intents
+                WHERE umo=? AND status IN ('pending', 'claimed', 'sent') AND created_at>?
+                """,
+                (umo, now - 86400.0),
+            ).fetchone()[0]
+            if int(umo_daily_used or 0) >= 3:
+                continue
+            umo_pending = self.db.execute(
+                """
+                SELECT COUNT(*) FROM horizon_intents
+                WHERE umo=? AND status IN ('pending', 'claimed') AND expires_at>?
+                """,
+                (umo, now),
+            ).fetchone()[0]
+            if int(umo_pending or 0) >= 3:
+                continue
+            same_topic_recent = self.db.execute(
+                """
+                SELECT 1 FROM horizon_intents
+                WHERE umo=? AND topic=?
+                  AND (status IN ('pending', 'claimed') OR (status='sent' AND updated_at>?))
+                LIMIT 1
+                """,
+                (umo, topic, now - 3 * 86400.0),
+            ).fetchone()
+            if same_topic_recent is not None:
+                continue
             platform = umo.split(":", 2)[0]
             # Find consenting member in this UMO with >=2 reciprocal turns on this topic
             rows = self.db.execute(
@@ -1869,10 +1964,10 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 WHERE identity=? AND umo=? AND opted_out=0
                   AND turn_count>=2 AND bot_reply_count>=1
                   AND last_occurred_at>=?
-                  AND (topic=? OR topic LIKE ? OR ? LIKE '%' || topic || '%')
+                  AND (topic=? OR topic LIKE ? ESCAPE '\\' OR (topic!='' AND instr(lower(?), lower(topic))>0))
                 ORDER BY turn_count DESC, last_occurred_at DESC
                 """,
-                (identity, umo, now - 14 * 86400.0, topic, f"%{topic}%", topic),
+                (identity, umo, now - 14 * 86400.0, topic, f"%{_escape_like(topic)}%", topic),
             ).fetchall()
             for r in rows:
                 member_id = str(r["member_id"])
@@ -2016,11 +2111,17 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 [*params, ps, (p - 1) * ps],
             ).fetchall()
             items = [self._format_log_row(r) for r in rows]
+            by_identity: dict[str, list[str]] = {}
             for item in items:
-                item["discussion_reflections"] = self._list_discussion_reflections_for_logs(
-                    item["identity"], [item["log_id"]]
-                ).get(
-                    item["log_id"], []
+                by_identity.setdefault(item["identity"], []).append(item["log_id"])
+            reflections_by_id_and_log: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for ident_key, lids in by_identity.items():
+                grouped = self._list_discussion_reflections_for_logs(ident_key, lids)
+                for lid, refs in grouped.items():
+                    reflections_by_id_and_log[(ident_key, lid)] = refs
+            for item in items:
+                item["discussion_reflections"] = reflections_by_id_and_log.get(
+                    (item["identity"], item["log_id"]), []
                 )
         return {
             "items": items,
@@ -2308,6 +2409,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
 
         discussed_qids: list[str] = []
         topics_recorded: list[str] = []
+        prefs_changed = False
 
         with self.lock, self.db:
             # 1. Explicit proactive contact opt-out / opt-in per (identity, umo, member)
@@ -2340,6 +2442,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                         """,
                         (stamp, norm_id, clean_umo, clean_member),
                     )
+                    prefs_changed = True
                 elif direct_request(_OPT_IN_CUES):
                     self.db.execute(
                         "INSERT OR REPLACE INTO member_outreach_prefs VALUES (?, ?, ?, 0, ?)",
@@ -2349,12 +2452,14 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                         "UPDATE co_discussed_topics SET opted_out=0 WHERE identity=? AND umo=? AND member_id=?",
                         (norm_id, clean_umo, clean_member),
                     )
+                    prefs_changed = True
 
             if not delivered or not verified:
                 return {
                     "accepted": True,
                     "discussed_questions": [],
                     "topics_recorded": [],
+                    "prefs_changed": prefs_changed,
                 }
             receipt_key = sha256_hex(
                 [norm_id, clean_umo, clean_member, event_id or turn_id]
@@ -2545,49 +2650,112 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         }
         if not allowed:
             return []
+        allowed_list = list(dict.fromkeys(allowed))
+        placeholders = ",".join("?" for _ in allowed_list)
+        day_ago = stamp - 86400.0
         out: list[dict[str, Any]] = []
         with self.lock, self.db:
             self.db.execute(
                 "UPDATE horizon_intents SET status='expired', updated_at=? WHERE status IN ('pending', 'failed') AND expires_at<=?",
                 (stamp, stamp),
             )
-            rows = self.db.execute(
+            # Mark due intents whose backing evidence or consent was revoked as cancelled before LIMIT
+            self.db.execute(
                 """
-                SELECT * FROM horizon_intents
+                UPDATE horizon_intents SET status='cancelled', updated_at=?
                 WHERE status='pending' AND not_before<=? AND expires_at>?
-                ORDER BY not_before ASC LIMIT 50
+                  AND (
+                      NOT EXISTS (
+                          SELECT 1 FROM reading_logs rl
+                          WHERE rl.log_id=horizon_intents.log_id
+                            AND rl.identity=horizon_intents.identity
+                            AND rl.status='active'
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM member_outreach_prefs mop
+                          WHERE mop.identity=horizon_intents.identity
+                            AND mop.umo=horizon_intents.umo
+                            AND mop.member_id=horizon_intents.recipient_user_id
+                            AND mop.opted_out=1
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM member_topic_prefs mtp
+                          WHERE mtp.identity=horizon_intents.identity
+                            AND mtp.umo=horizon_intents.umo
+                            AND mtp.member_id=horizon_intents.recipient_user_id
+                            AND mtp.topic=horizon_intents.topic
+                            AND mtp.blocked=1
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM corrections cor
+                          WHERE cor.identity=horizon_intents.identity
+                            AND cor.umo=horizon_intents.umo
+                            AND cor.member_id=horizon_intents.recipient_user_id
+                            AND cor.log_id=horizon_intents.log_id
+                            AND cor.status='pending'
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM scope_bindings sb
+                          WHERE sb.umo=horizon_intents.umo
+                            AND (sb.managed=0 OR sb.identity!=horizon_intents.identity)
+                      )
+                  )
                 """,
-                (stamp, stamp),
+                (stamp, stamp, stamp),
+            )
+            rows = self.db.execute(
+                f"""
+                SELECT hi.* FROM horizon_intents hi
+                WHERE hi.status='pending'
+                  AND hi.not_before<=?
+                  AND hi.expires_at>?
+                  AND hi.umo IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM blocked_topics bt
+                      WHERE bt.topic=hi.topic
+                        AND (bt.identity='' OR bt.identity=hi.identity)
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM horizon_intents o
+                      WHERE o.umo=hi.umo
+                        AND o.recipient_user_id=hi.recipient_user_id
+                        AND (
+                            o.status IN ('claimed', 'uncertain')
+                            OR (o.status='sent' AND o.updated_at>?)
+                        )
+                  )
+                  AND (
+                      SELECT COUNT(*) FROM horizon_intents u
+                      WHERE u.umo=hi.umo
+                        AND (
+                            u.status IN ('claimed', 'uncertain')
+                            OR (u.status='sent' AND u.updated_at>?)
+                        )
+                  ) < 3
+                ORDER BY hi.not_before ASC LIMIT 50
+                """,
+                (stamp, stamp, *allowed_list, day_ago, day_ago),
             ).fetchall()
+            seen_umo_topics: set[tuple[str, str]] = set()
+            seen_umo_members: set[tuple[str, str]] = set()
+            umo_batch_counts: dict[str, int] = {}
             for r in rows:
                 if not self.intent_evidence_valid(r):
-                    self.db.execute(
-                        "UPDATE horizon_intents SET status='cancelled' WHERE intent_id=?",
-                        (r["intent_id"],),
-                    )
-                    continue
-                if r["umo"] not in allowed:
-                    continue
-                pref = self.db.execute(
-                    "SELECT opted_out FROM member_outreach_prefs WHERE identity=? AND umo=? AND member_id=?",
-                    (r["identity"], r["umo"], r["recipient_user_id"]),
-                ).fetchone()
-                if pref is not None and bool(pref["opted_out"]):
                     self.db.execute(
                         "UPDATE horizon_intents SET status='cancelled', updated_at=? WHERE intent_id=?",
                         (stamp, r["intent_id"]),
                     )
                     continue
-                sent_recent = self.db.execute(
-                    """
-                    SELECT intent_id FROM horizon_intents
-                    WHERE umo=? AND recipient_user_id=? AND status='sent' AND updated_at>?
-                    LIMIT 1
-                    """,
-                    (r["umo"], r["recipient_user_id"], stamp - 86400.0),
-                ).fetchone()
-                if sent_recent is not None:
+                umo_key = str(r["umo"])
+                topic_key = (umo_key, str(r["topic"]))
+                member_key = (umo_key, str(r["recipient_user_id"]))
+                if member_key in seen_umo_members or topic_key in seen_umo_topics:
                     continue
+                if umo_batch_counts.get(umo_key, 0) >= 2:
+                    continue
+                seen_umo_members.add(member_key)
+                seen_umo_topics.add(topic_key)
+                umo_batch_counts[umo_key] = umo_batch_counts.get(umo_key, 0) + 1
                 item = json.loads(r["payload_json"])
                 item.update(
                     status=r["status"],

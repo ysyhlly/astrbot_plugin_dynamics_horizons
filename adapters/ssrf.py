@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import copy
 import html
 import ipaddress
 import json
+import os
 import re
 import socket
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
@@ -59,7 +64,12 @@ _METADATA_HOSTS = frozenset(
 _LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".lan", ".home.arpa", ".internal")
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 _FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
-_PUBLIC_DNS_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+_PUBLIC_DNS_CACHE: OrderedDict[str, tuple[float, tuple[str, ...]]] = OrderedDict()
+_PUBLIC_DNS_CACHE_LOCK = threading.RLock()
+_DEFAULT_DOH_ENDPOINTS = ("https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query")
+_SHARED_HTTP_SESSIONS: contextvars.ContextVar[
+    dict[bool, aiohttp.ClientSession] | None
+] = contextvars.ContextVar("horizons_shared_http_sessions", default=None)
 _ALIBABA_META_IP = ipaddress.ip_address("100.100.100.200")
 _AWS_IPV6_META_NET = ipaddress.ip_network("fd00:ec2::/32")
 
@@ -334,17 +344,76 @@ class _NoDNSRedirect(HTTPRedirectHandler):
         return None
 
 
+def _doh_endpoints() -> tuple[str, ...]:
+    raw = os.environ.get("DYNAMICS_HORIZONS_DOH_ENDPOINTS", "").strip()
+    if not raw:
+        return _DEFAULT_DOH_ENDPOINTS
+    valid: list[str] = []
+    for item in raw.split(","):
+        cand = item.strip()
+        if not cand:
+            continue
+        try:
+            sp = urlsplit(cand)
+            if (sp.scheme or "").lower() != "https" or not sp.hostname:
+                continue
+            ip_obj = ipaddress.ip_address(sp.hostname)
+            _check_ip_address(ip_obj, allow_private=False)
+            valid.append(cand)
+        except Exception:
+            continue
+    return tuple(valid) if valid else _DEFAULT_DOH_ENDPOINTS
+
+
+def _resolve_proxy_url(explicit_proxy: str | None = None) -> str | None:
+    raw = str(
+        explicit_proxy
+        if explicit_proxy is not None
+        else os.environ.get("DYNAMICS_HORIZONS_PROXY", "")
+    ).strip()
+    if not raw:
+        return None
+    try:
+        sp = urlsplit(raw)
+    except ValueError as exc:
+        raise SSRFBlockedError("代理 URL 格式无效") from exc
+    if (sp.scheme or "").lower() not in {"http", "https"} or not sp.hostname:
+        raise SSRFBlockedError("仅支持显式 HTTP/HTTPS 代理 URL")
+    return raw
+
+
+@contextlib.asynccontextmanager
+async def http_session_scope():
+    """Reuse aiohttp ClientSessions across sequential fetches inside a poll or read cycle."""
+    existing = _SHARED_HTTP_SESSIONS.get()
+    if existing is not None:
+        yield existing
+        return
+    pool: dict[bool, aiohttp.ClientSession] = {}
+    token = _SHARED_HTTP_SESSIONS.set(pool)
+    try:
+        yield pool
+    finally:
+        _SHARED_HTTP_SESSIONS.reset(token)
+        for session in pool.values():
+            if not session.closed:
+                await session.close()
+
+
 def _resolve_public_dns(hostname: str) -> list[str]:
     """Recover real IPv4 addresses from Fake-IP DNS, never trusting the fake address.
 
     Fixed HTTPS IP endpoints avoid the intercepted system DNS. TLS verification
     stays enabled, environment proxies are ignored, and only global answers pass.
     """
-    cached = _PUBLIC_DNS_CACHE.get(hostname)
-    if cached and cached[0] > time.monotonic():
-        return list(cached[1])
+    now_m = time.monotonic()
+    with _PUBLIC_DNS_CACHE_LOCK:
+        cached = _PUBLIC_DNS_CACHE.get(hostname)
+        if cached and cached[0] > now_m:
+            _PUBLIC_DNS_CACHE.move_to_end(hostname)
+            return list(cached[1])
     opener = build_opener(ProxyHandler({}), _NoDNSRedirect())
-    for endpoint in ("https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query"):
+    for endpoint in _doh_endpoints():
         try:
             request = Request(
                 endpoint + "?" + urlencode({"name": hostname, "type": "A"}),
@@ -372,9 +441,11 @@ def _resolve_public_dns(hostname: str) -> list[str]:
                     ips.append(str(addr))
             if not ips:
                 raise ValueError("DNS response has no public IPv4 addresses")
-            if len(_PUBLIC_DNS_CACHE) >= 256:
-                _PUBLIC_DNS_CACHE.clear()
-            _PUBLIC_DNS_CACHE[hostname] = (time.monotonic() + ttl, tuple(ips))
+            with _PUBLIC_DNS_CACHE_LOCK:
+                while len(_PUBLIC_DNS_CACHE) >= 256 and hostname not in _PUBLIC_DNS_CACHE:
+                    _PUBLIC_DNS_CACHE.popitem(last=False)
+                _PUBLIC_DNS_CACHE[hostname] = (time.monotonic() + ttl, tuple(ips))
+                _PUBLIC_DNS_CACHE.move_to_end(hostname)
             return ips
         except SSRFBlockedError:
             raise
@@ -597,18 +668,24 @@ def _origin_tuple(url: str) -> tuple[str, str, int]:
 
 
 class _CheckedResolver(aiohttp.abc.AbstractResolver):
-    """Validate the addresses actually supplied to the connector (no second DNS lookup)."""
+    """Validate the addresses actually supplied to the connector (single DNS lookup per hop)."""
 
     def __init__(self, allow_private: bool = False):
         self.allow_private = allow_private
 
     async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
-        ips = await async_resolve_host_ips(host)
+        try:
+            ips = await async_resolve_host_ips(host)
+        except socket.gaierror as exc:
+            raise SSRFBlockedError(f"域名无法解析：{host}") from exc
         if not ips:
             raise SSRFBlockedError(f"域名解析结果为空：{host}")
         records = []
         for addr in ips:
-            ip_obj = ipaddress.ip_address(addr)
+            try:
+                ip_obj = ipaddress.ip_address(addr)
+            except ValueError as exc:
+                raise SSRFBlockedError(f"域名解析返回异常地址：{addr}") from exc
             _check_ip_address(ip_obj, allow_private=self.allow_private)
             ip_family = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
             if family not in (socket.AF_UNSPEC, ip_family):
@@ -637,16 +714,18 @@ async def _aiohttp_single_get(
     timeout: float,
     max_bytes: int,
     allow_private: bool = False,
+    *,
+    session: aiohttp.ClientSession | None = None,
+    proxy: str | None = None,
 ) -> HttpResponse:
     client_timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout)))
-    connector = aiohttp.TCPConnector(
-        resolver=_CheckedResolver(allow_private), use_dns_cache=False
-    )
-    async with aiohttp.ClientSession(
-        timeout=client_timeout, connector=connector
-    ) as session:
+    if session is not None:
         async with session.get(
-            url, headers=dict(headers), allow_redirects=False
+            url,
+            headers=dict(headers),
+            allow_redirects=False,
+            timeout=client_timeout,
+            proxy=proxy,
         ) as resp:
             resp_headers = {str(k): str(v) for k, v in resp.headers.items()}
             if resp.status in {301, 302, 303, 307, 308, 304}:
@@ -661,6 +740,21 @@ async def _aiohttp_single_get(
             return HttpResponse(
                 status=resp.status, body=bytes(buf), headers=resp_headers, url=url
             )
+    connector = aiohttp.TCPConnector(
+        resolver=_CheckedResolver(allow_private), use_dns_cache=False
+    )
+    async with aiohttp.ClientSession(
+        timeout=client_timeout, connector=connector, trust_env=False
+    ) as local_session:
+        return await _aiohttp_single_get(
+            url,
+            headers,
+            timeout,
+            max_bytes,
+            allow_private,
+            session=local_session,
+            proxy=proxy,
+        )
 
 
 async def safe_http_get(
@@ -675,6 +769,7 @@ async def safe_http_get(
     etag: str = "",
     last_modified: str = "",
     secrets_to_redact: Sequence[str] = (),
+    proxy: str | None = None,
 ) -> HttpResponse:
     """Perform SSRF-guarded HTTP GET with manual hop validation, size cap, 304, and 429 Retry-After."""
     target_url = str(url or "").strip()
@@ -704,56 +799,100 @@ async def safe_http_get(
     if last_modified and "If-Modified-Since" not in req_headers:
         req_headers["If-Modified-Since"] = str(last_modified).strip()
 
-    current_url = await validate_url_async(
-        target_url, allow_private=allow_private, require_dns=True
-    )
+    effective_proxy = _resolve_proxy_url(proxy) if _http_transport is None else None
+    all_secrets = list(secrets_to_redact)
+    if effective_proxy:
+        all_secrets.append(effective_proxy)
+
+    async def _prepare_hop_url(raw_hop_url: str) -> str:
+        if _http_transport is not None:
+            return await validate_url_async(
+                raw_hop_url, allow_private=allow_private, require_dns=True
+            )
+        # Validate scheme/host/IP-literal synchronously; _CheckedResolver resolves DNS
+        # and checks private/SSRF ranges once per hop at connection time.
+        normalized, _ = _validate_parsed_url(raw_hop_url, allow_private=allow_private)
+        return normalized
+
+    current_url = await _prepare_hop_url(target_url)
     initial_origin = _origin_tuple(current_url)
 
-    for hop in range(max_redirects + 1):
-        if hop > 0:
-            current_url = await validate_url_async(
-                current_url, allow_private=allow_private, require_dns=True
-            )
-            if _origin_tuple(current_url) != initial_origin:
-                for sensitive in ("Authorization", "authorization", "Cookie", "cookie"):
-                    req_headers.pop(sensitive, None)
-
-        try:
-            if _http_transport is not None:
-                resp = await _http_transport(current_url, dict(req_headers), timeout)
-                if len(resp.body) > max_bytes:
-                    raise ValueError(f"响应体超过大小上限 ({max_bytes} bytes)")
-                resp.url = current_url
-            else:
-                resp = await _aiohttp_single_get(
-                    current_url, req_headers, timeout, max_bytes, allow_private
+    local_session: aiohttp.ClientSession | None = None
+    active_session: aiohttp.ClientSession | None = None
+    if _http_transport is None:
+        pool = _SHARED_HTTP_SESSIONS.get()
+        if pool is not None:
+            active_session = pool.get(allow_private)
+            if active_session is None or active_session.closed:
+                connector = aiohttp.TCPConnector(
+                    resolver=_CheckedResolver(allow_private), use_dns_cache=False
                 )
-        except (SSRFBlockedError, AdapterRateLimitError, ValueError):
-            raise
-        except Exception as exc:
-            raise RuntimeError(redact_error_text(exc, secrets_to_redact)) from None
-
-        if resp.status in {301, 302, 303, 307, 308}:
-            if hop >= max_redirects:
-                raise AdapterHTTPError(resp.status, "重定向次数超过安全上限")
-            location = resp.header("location", "").strip()
-            if not location:
-                raise AdapterHTTPError(resp.status, "重定向响应缺少 Location 头")
-            current_url = urljoin(current_url, location)
-            continue
-
-        if resp.status == 304:
-            return resp
-        if resp.status == 429:
-            wait_s = parse_retry_after(resp.header("retry-after"), default=300.0)
-            raise AdapterRateLimitError(
-                f"远端站点触发频率限制 (HTTP 429, retry_after={int(wait_s)}s)",
-                retry_after=wait_s,
-                status_code=429,
+                active_session = aiohttp.ClientSession(
+                    connector=connector, trust_env=False
+                )
+                pool[allow_private] = active_session
+        else:
+            connector = aiohttp.TCPConnector(
+                resolver=_CheckedResolver(allow_private), use_dns_cache=False
             )
-        if resp.status >= 400:
-            raise AdapterHTTPError(resp.status, f"HTTP 请求失败 (status={resp.status})")
-        return resp
+            local_session = aiohttp.ClientSession(
+                connector=connector, trust_env=False
+            )
+            active_session = local_session
+
+    try:
+        for hop in range(max_redirects + 1):
+            if hop > 0:
+                current_url = await _prepare_hop_url(current_url)
+                if _origin_tuple(current_url) != initial_origin:
+                    for sensitive in ("Authorization", "authorization", "Cookie", "cookie"):
+                        req_headers.pop(sensitive, None)
+
+            try:
+                if _http_transport is not None:
+                    resp = await _http_transport(current_url, dict(req_headers), timeout)
+                    if len(resp.body) > max_bytes:
+                        raise ValueError(f"响应体超过大小上限 ({max_bytes} bytes)")
+                    resp.url = current_url
+                else:
+                    resp = await _aiohttp_single_get(
+                        current_url,
+                        req_headers,
+                        timeout,
+                        max_bytes,
+                        allow_private,
+                        session=active_session,
+                        proxy=effective_proxy,
+                    )
+            except (SSRFBlockedError, AdapterRateLimitError, ValueError):
+                raise
+            except Exception as exc:
+                raise RuntimeError(redact_error_text(exc, all_secrets)) from None
+
+            if resp.status in {301, 302, 303, 307, 308}:
+                if hop >= max_redirects:
+                    raise AdapterHTTPError(resp.status, "重定向次数超过安全上限")
+                location = resp.header("location", "").strip()
+                if not location:
+                    raise AdapterHTTPError(resp.status, "重定向响应缺少 Location 头")
+                current_url = urljoin(current_url, location)
+                continue
+
+            if resp.status == 304:
+                return resp
+            if resp.status == 429:
+                wait_s = parse_retry_after(resp.header("retry-after"), default=300.0)
+                raise AdapterRateLimitError(
+                    f"远端站点触发频率限制 (HTTP 429, retry_after={int(wait_s)}s)",
+                    retry_after=wait_s,
+                    status_code=429,
+                )
+            if resp.status >= 400:
+                raise AdapterHTTPError(resp.status, f"HTTP 请求失败 (status={resp.status})")
+            return resp
+    finally:
+        if local_session is not None and not local_session.closed:
+            await local_session.close()
 
     raise AdapterHTTPError(310, "重定向次数超过安全上限")
 

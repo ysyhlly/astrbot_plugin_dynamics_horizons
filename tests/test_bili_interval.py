@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from astrbot_plugin_dynamics_horizons.core.engine import HorizonsEngine

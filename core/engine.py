@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import io
+import random
 import time
 import zipfile
 from collections.abc import Callable
@@ -17,6 +19,7 @@ from .contract import (
     SOURCE_KINDS,
     compact_json,
     normalize_identity,
+    shanghai_day_bounds,
 )
 from .io import run_io
 from .lifecycle import SourcePollConflict, check_review_target
@@ -53,6 +56,13 @@ try:
     from ..adapters import search_public_ebooks
 except Exception:  # pragma: no cover
     search_public_ebooks = None
+
+try:
+    from ..adapters.ssrf import http_session_scope
+except Exception:  # pragma: no cover
+    @contextlib.asynccontextmanager
+    async def http_session_scope():
+        yield {}
 
 
 STAGE1_TRIAGE_PROMPT = (
@@ -259,6 +269,7 @@ class HorizonsEngine(EngineLifecycle):
         self.world_bridge = WorldBridge(context, self.projection)
         self.lock = asyncio.Lock()
         self.polling_sources: set[str] = set()
+        self._domain_cooldowns: dict[str, float] = {}
         self.closed = False
 
         self.last_poll_at: float = 0.0
@@ -428,6 +439,24 @@ class HorizonsEngine(EngineLifecycle):
                 or bool(cursor.get("rate_limited"))
             )
         )
+        bili_domain_cd = (
+            self._domain_cooldowns.get("bilibili", 0.0)
+            if src.get("source_kind") == "bilibili"
+            else 0.0
+        )
+        if bili_domain_cd > now:
+            return {
+                "polled": False,
+                "added": 0,
+                "status": (
+                    status
+                    if bili_protected_cooldown and status
+                    else "domain_cooldown_circuit_breaker"
+                ),
+                "outcome": "cooldown",
+                "cooldown_until": max(cooldown_until, bili_domain_cd),
+                "source": mask_secrets(src),
+            }
         if cooldown_until > now and (not force or bili_protected_cooldown):
             return {
                 "polled": False,
@@ -453,20 +482,21 @@ class HorizonsEngine(EngineLifecycle):
 
     async def _poll_source(self, src: dict[str, Any]) -> dict[str, Any]:
         try:
-            res = await self.poll_source_adapter(
-                {
-                    "source_id": src["source_id"],
-                    "source_kind": src["source_kind"],
-                    "identity": src["identity"],
-                    "name": src["name"],
-                    "enabled": src["enabled"],
-                    "config": src["config"],
-                },
-                src.get("cursor") or {},
-                timeout=20.0,
-            )
+            async with http_session_scope():
+                res = await self.poll_source_adapter(
+                    {
+                        "source_id": src["source_id"],
+                        "source_kind": src["source_kind"],
+                        "identity": src["identity"],
+                        "name": src["name"],
+                        "enabled": src["enabled"],
+                        "config": src["config"],
+                    },
+                    src.get("cursor") or {},
+                    timeout=20.0,
+                )
             outcome = res.get("outcome", "success")
-            items = res.get("items")
+            items = list(res.get("items") or []) if isinstance(res.get("items"), list) else []
             next_cursor = res.get("next_cursor")
             cooldown_until = float(res.get("cooldown_until") or 0.0)
             status = strip_raw_urls(str(res.get("status") or "ok"))
@@ -475,6 +505,44 @@ class HorizonsEngine(EngineLifecycle):
             has_poll_data = succeeded or outcome == "partial"
             if not succeeded and not error:
                 error = status
+            if (
+                src.get("source_kind") == "feed"
+                and has_poll_data
+                and isinstance(next_cursor, dict)
+                and next_cursor.get("pending_items")
+            ):
+                # Store feed backlog in candidate_items ('unread') rather than inflating sources.cursor_json
+                next_cursor = dict(next_cursor)
+                overflow = [
+                    it
+                    for it in (next_cursor.get("pending_items") or [])
+                    if isinstance(it, dict)
+                ][:50]
+                if overflow:
+                    seen_set = {
+                        str(it.get("external_id") or "")
+                        for it in items
+                        if isinstance(it, dict)
+                    }
+                    seen_ids = list(next_cursor.get("seen_ids") or [])
+                    seen_id_set = set(seen_ids)
+                    for ov in overflow:
+                        ext_id = str(ov.get("external_id") or "")
+                        if ext_id and ext_id not in seen_set:
+                            items.append(ov)
+                            seen_set.add(ext_id)
+                        if ext_id and ext_id not in seen_id_set:
+                            seen_ids.append(ext_id)
+                            seen_id_set.add(ext_id)
+                    next_cursor["seen_ids"] = seen_ids[-200:]
+                next_cursor["pending_items"] = []
+            if src.get("source_kind") == "bilibili":
+                if status.startswith(("risk_control_backoff", "partial_risk_control_backoff", "rate_limited", "partial_rate_limited")) and cooldown_until > 0:
+                    self._domain_cooldowns["bilibili"] = max(
+                        self._domain_cooldowns.get("bilibili", 0.0), cooldown_until
+                    )
+                elif outcome == "success":
+                    self._domain_cooldowns.pop("bilibili", None)
 
             inserted = await run_io(
                 self.store.commit_poll,
@@ -555,37 +623,48 @@ class HorizonsEngine(EngineLifecycle):
         polled_count = 0
         failed_count = 0
         cooldown_count = 0
-        for s in sources:
-            if self.closed:
-                break
-            if s["source_kind"] == "manual" and not force:
-                continue
-            if s["source_kind"] == "bilibili" and not force:
-                poll_interval = max(
-                    60,
-                    min(
-                        86400,
-                        int(self.config.get("poll_interval_seconds", 900) or 900),
-                    ),
-                )
-                last_poll_at = float(s.get("last_poll_at") or 0.0)
-                if last_poll_at > 0 and self.clock() < last_poll_at + poll_interval:
-                    cooldown_count += 1
+        bili_polled = 0
+        async with http_session_scope():
+            for s in sources:
+                if self.closed:
+                    break
+                if s["source_kind"] == "manual" and not force:
                     continue
-            try:
-                res = await self.poll_one_source(
-                    s["source_id"], force=force, expected_identity=s["identity"]
-                )
-            except ValueError:
-                # A source can be deleted or reassigned after the list was read.
-                continue
-            if res.get("polled"):
-                polled_count += 1
-                total_added += int(res.get("added", 0))
-            elif res.get("outcome") == "error":
-                failed_count += 1
-            elif res.get("outcome") == "cooldown":
-                cooldown_count += 1
+                if s["source_kind"] == "bilibili" and not force:
+                    poll_interval = max(
+                        60,
+                        min(
+                            86400,
+                            int(self.config.get("poll_interval_seconds", 900) or 900),
+                        ),
+                    )
+                    last_poll_at = float(s.get("last_poll_at") or 0.0)
+                    if last_poll_at > 0 and self.clock() < last_poll_at + poll_interval:
+                        cooldown_count += 1
+                        continue
+                    if bili_polled > 0:
+                        jitter = max(
+                            0.0,
+                            min(5.0, float(self.config.get("bilibili_poll_jitter_max", 1.5) or 0.0)),
+                        )
+                        if jitter > 0:
+                            await asyncio.sleep(random.uniform(0.3 * jitter, jitter))
+                try:
+                    res = await self.poll_one_source(
+                        s["source_id"], force=force, expected_identity=s["identity"]
+                    )
+                except ValueError:
+                    # A source can be deleted or reassigned after the list was read.
+                    continue
+                if s["source_kind"] == "bilibili" and (res.get("polled") or res.get("outcome") == "error"):
+                    bili_polled += 1
+                if res.get("polled"):
+                    polled_count += 1
+                    total_added += int(res.get("added", 0))
+                elif res.get("outcome") == "error":
+                    failed_count += 1
+                elif res.get("outcome") == "cooldown":
+                    cooldown_count += 1
         return {
             "polled_sources": polled_count,
             "added_candidates": total_added,
@@ -999,9 +1078,57 @@ class HorizonsEngine(EngineLifecycle):
                     self.store.get_source, unit_obj["source_id"], mask=False
                 )
                 if src is not None:
-                    fetched = await self.fetch_item_content_adapter(
-                        src, unit_obj, timeout=25.0
+                    now_ts = self.clock()
+                    domain_cd = (
+                        self._domain_cooldowns.get("bilibili", 0.0)
+                        if source_kind == "bilibili"
+                        else 0.0
                     )
+                    if source_kind == "bilibili" and max(float(src.get("cooldown_until") or 0.0), domain_cd) > now_ts:
+                        return None
+                    try:
+                        async with http_session_scope():
+                            fetched = await self.fetch_item_content_adapter(
+                                src, unit_obj, timeout=25.0
+                            )
+                    except Exception as exc:
+                        from ..adapters.bilibili import BilibiliRiskControlError
+                        from ..adapters.ssrf import AdapterRateLimitError
+
+                        if isinstance(exc, (BilibiliRiskControlError, AdapterRateLimitError)):
+                            cur = dict(src.get("cursor") or {})
+                            step = int(cur.get("backoff_step") or 0) + 1
+                            cur["backoff_step"] = step
+                            base_cd = float(
+                                getattr(exc, "cooldown_seconds", 0.0)
+                                or getattr(exc, "retry_after", 0.0)
+                                or 1800.0
+                            )
+                            wait_s = min(7200.0, base_cd * (1.5 ** min(step - 1, 3)))
+                            cooldown_until = now_ts + wait_s
+                            status_kind = (
+                                "rate_limited"
+                                if isinstance(exc, AdapterRateLimitError)
+                                else "risk_control_backoff"
+                            )
+                            err_msg = strip_raw_urls(str(exc))[:180] or type(exc).__name__
+                            await run_io(
+                                self.store.update_source_poll_state,
+                                src["source_id"],
+                                next_cursor=cur,
+                                cooldown_until=cooldown_until,
+                                status=f"{status_kind}: stage2:{err_msg}",
+                                last_error=f"stage2:{err_msg}",
+                                now=now_ts,
+                                expected_source=src,
+                            )
+                            if source_kind == "bilibili":
+                                self._domain_cooldowns["bilibili"] = max(
+                                    self._domain_cooldowns.get("bilibili", 0.0),
+                                    cooldown_until,
+                                )
+                            return None
+                        raise
                     if isinstance(fetched, dict) and fetched.get("full_text"):
                         unit_obj["content_origin"] = str(
                             fetched.get("content_origin") or "unknown"
@@ -1371,6 +1498,18 @@ class HorizonsEngine(EngineLifecycle):
         except Exception as exc:
             self.review_status = f"error:{type(exc).__name__}"
             self.last_error = str(exc)[:200]
+            if "quota_reached" in str(exc):
+                now_ts = self.clock()
+                _, next_day = shanghai_day_bounds(now_ts)
+                await run_io(
+                    self.store.defer_review,
+                    proposal_id,
+                    now_ts,
+                    str(exc)[:180],
+                    expected_revision=captured_revision,
+                    delay=max(300.0, next_day + 60.0 - now_ts),
+                )
+                return proposal
             return await run_io(
                 self.store.record_review_verdict,
                 proposal_id,

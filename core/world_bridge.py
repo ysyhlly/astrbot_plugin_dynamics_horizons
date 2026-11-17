@@ -62,6 +62,27 @@ class WorldBridge:
             name == "astrbot_plugin_dynamics_world" for name, _ in self.iter_plugins()
         )
 
+    def _inspect_installed_world_state(self) -> tuple[bool, bool | None, bool | None]:
+        """Return `(installed, enabled_flag, ready_flag)` for an activated World plugin."""
+        for name, plugin in _iter_star_instances(self.context) or ():
+            if name != "astrbot_plugin_dynamics_world":
+                continue
+            getter = getattr(plugin, "get_dynamics_capabilities", None)
+            if not callable(getter) or inspect.iscoroutinefunction(getter):
+                return True, None, None
+            try:
+                caps = getter()
+            except Exception:
+                return True, None, None
+            if not isinstance(caps, dict):
+                return True, None, None
+            return (
+                True,
+                caps.get("enabled") if isinstance(caps.get("enabled"), bool) else None,
+                caps.get("ready") if isinstance(caps.get("ready"), bool) else None,
+            )
+        return False, None, None
+
     def find_world_plugin(self) -> Any | None:
         found: list[Any] = []
         for name, plugin in _iter_star_instances(self.context) or ():
@@ -461,20 +482,39 @@ class WorldBridge:
                 host_prompt = hp.get("prompt", "")
                 break
 
-        blocked = self.world_installed() or not host_prompt.strip()
+        installed, world_enabled, world_ready = self._inspect_installed_world_state()
+        has_host = bool(host_prompt.strip())
+        # Allow graceful fallback to host persona when World is disabled or not yet ready,
+        # instead of permanently deadlocking reading in 'world_unavailable'.
+        blocked = (installed and world_enabled is True and world_ready is True) or not has_host
+        if blocked:
+            skip_reason = "world_unavailable" if installed else "character_profile_missing"
+        elif in_quiet:
+            skip_reason = "quiet_hours"
+        else:
+            skip_reason = ""
+
+        if installed and not blocked:
+            state_label = "已停用" if world_enabled is False else "未就绪"
+            mode_summary = (
+                f"群间世界{state_label} · 静默时段({quiet_hours})免读中"
+                if in_quiet
+                else f"群间世界{state_label} · 降级按宿主角色与静默时段运行"
+            )
+        else:
+            mode_summary = (
+                f"未接入群间世界 · 静默时段({quiet_hours})免读中"
+                if in_quiet
+                else "未接入群间世界 · 按宿主角色与静默时段运行"
+            )
+
         return {
             "world_connected": False,
             "awake": not in_quiet and not blocked,
             "asleep": in_quiet,
             "paused": False,
             "in_transit": False,
-            "skip_reason": (
-                "world_unavailable"
-                if self.world_installed()
-                else "character_profile_missing"
-            )
-            if blocked
-            else ("quiet_hours" if in_quiet else ""),
+            "skip_reason": skip_reason,
             "availability": "asleep" if in_quiet else "available",
             "activity": "",
             "character_name": persona_id,
@@ -486,9 +526,7 @@ class WorldBridge:
                 "asleep": in_quiet,
                 "paused": False,
                 "availability": "asleep" if in_quiet else "available",
-                "summary": f"未接入群间世界 · 静默时段({quiet_hours})免读中"
-                if in_quiet
-                else "未接入群间世界 · 按宿主角色与静默时段运行",
+                "summary": mode_summary,
             },
         }
 
