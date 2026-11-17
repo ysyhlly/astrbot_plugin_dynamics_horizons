@@ -33,6 +33,7 @@ from .core.engine import HorizonsEngine
 from .core.io import run_io
 from .core.projection import _empty_result
 from .core.store import HorizonsStore
+from .series_panels import get_series_defaults, inherit_provider
 from .core.web_api import HorizonsWebAPI
 
 
@@ -267,10 +268,30 @@ class Main(Star):
     # Dual-LLM Provider Invocation
     # ------------------------------------------------------------------
 
+    def _effective_provider(self, role: str) -> str:
+        if self.engine is not None:
+            return self.engine.effective_provider(role)
+        explicit = str(self.config.get(role, "") or "").strip()
+        if explicit:
+            return explicit
+        if role == "analysis_provider":
+            return inherit_provider("", self.context, role="reply")
+        if role == "review_provider":
+            defaults = get_series_defaults(self.context)
+            decision_p = str(defaults.get("decision_provider") or "").strip()
+            allow_same = bool(self.config.get("allow_same_provider_for_review", False))
+            if decision_p and (
+                allow_same or decision_p != self._effective_provider("analysis_provider")
+            ):
+                return decision_p
+            if allow_same:
+                return inherit_provider("", self.context, role="reply")
+        return ""
+
     async def _model(
         self, role: str, instruction: str, data: dict[str, Any]
     ) -> dict[str, Any]:
-        provider_id = str(self.config.get(role, "") or "").strip()
+        provider_id = self._effective_provider(role)
         if not provider_id:
             label = "阅读与分析模型" if role == "analysis_provider" else "独立审查模型"
             raise ValueError(f"请先配置{label} ({role})")
@@ -294,7 +315,7 @@ class Main(Star):
             self.closed
             or not self.config.get("enabled", True)
             or self.context.get_provider_by_id(provider_id) is not provider
-            or str(self.config.get(role, "") or "").strip() != provider_id
+            or self._effective_provider(role) != provider_id
         ):
             raise ValueError("模型绑定已改变，本次结果作废")
         content = getattr(response, "completion_text", None)

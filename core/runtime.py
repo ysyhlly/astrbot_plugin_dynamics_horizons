@@ -28,11 +28,17 @@ class EngineLifecycle:
         await run_io(self.store.finish_call, cid, "success")
         return value
 
+    def _provider_id(self, role: str) -> str:
+        fn = getattr(self, "effective_provider", None)
+        if callable(fn):
+            return str(fn(role) or "").strip()
+        return str(self.config.get(role, "") or "").strip()
+
     def binding_revision(self):
         return (
             self.config.get("enabled", True),
-            self.config.get("analysis_provider", ""),
-            self.config.get("review_provider", ""),
+            self._provider_id("analysis_provider"),
+            self._provider_id("review_provider"),
             self.config.get("review_mode", "llm"),
             bool(self.config.get("allow_same_provider_for_review", False)),
         )
@@ -164,16 +170,17 @@ class EngineLifecycle:
         reasons = [wake["skip_reason"]] if wake and wake.get("skip_reason") else []
         if not self.config.get("enabled", True):
             reasons.append("disabled")
-        if not self.config.get("analysis_provider"):
+        analysis_provider = self._provider_id("analysis_provider")
+        review_provider = self._provider_id("review_provider")
+        if not analysis_provider:
             reasons.append("analysis_provider_missing")
-        if self.review_mode != "human" and not self.config.get("review_provider"):
+        if self.review_mode != "human" and not review_provider:
             reasons.append("review_provider_missing")
         if (
             self.review_mode != "human"
             and not self.config.get("allow_same_provider_for_review", False)
-            and self.config.get("analysis_provider")
-            and self.config.get("analysis_provider")
-            == self.config.get("review_provider")
+            and analysis_provider
+            and analysis_provider == review_provider
         ):
             reasons.append("independent_review_provider_required")
         plugins = dict(self.world_bridge.iter_plugins())
@@ -193,8 +200,8 @@ class EngineLifecycle:
         return {
             "blockers": reasons,
             "last_error": self.last_error,
-            "analysis_provider": self.config.get("analysis_provider", ""),
-            "review_provider": self.config.get("review_provider", ""),
+            "analysis_provider": self._provider_id("analysis_provider"),
+            "review_provider": self._provider_id("review_provider"),
             "review_context_policy": "independent_calls"
             if self.config.get("allow_same_provider_for_review", False)
             else "distinct_providers",

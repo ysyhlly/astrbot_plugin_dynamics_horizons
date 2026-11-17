@@ -19,6 +19,7 @@ from .contract import (
     SOURCE_KINDS,
     compact_json,
     normalize_identity,
+    parse_quiet_hours,
     shanghai_day_bounds,
 )
 from .io import run_io
@@ -36,6 +37,7 @@ from .sanitize import (
 )
 from .store import HorizonsStore
 from .world_bridge import WorldBridge
+from ..series_panels import get_series_defaults, inherit_provider, inherit_umos
 
 try:
     from ..adapters import (
@@ -368,16 +370,48 @@ class HorizonsEngine(EngineLifecycle):
         mode = str(self.config.get("review_mode", "llm") or "llm").strip()
         return mode if mode in REVIEW_MODES else "llm"
 
+    def effective_provider(self, role: str) -> str:
+        explicit = str(self.config.get(role, "") or "").strip()
+        if explicit:
+            return explicit
+        if self.context is None:
+            return ""
+        if role == "analysis_provider":
+            return inherit_provider("", self.context, role="reply")
+        if role == "review_provider":
+            defaults = get_series_defaults(self.context)
+            decision_p = str(defaults.get("decision_provider") or "").strip()
+            allow_same = bool(self.config.get("allow_same_provider_for_review", False))
+            if decision_p and (
+                allow_same or decision_p != self.effective_provider("analysis_provider")
+            ):
+                return decision_p
+            if allow_same:
+                return inherit_provider("", self.context, role="reply")
+        return ""
+
     @property
     def quiet_hours(self) -> str:
-        return str(
-            self.config.get("quiet_hours", "00:00-08:00") or "00:00-08:00"
-        ).strip()
+        raw = str(self.config.get("quiet_hours", "") or "").strip()
+        if raw:
+            return raw
+        if self.context is not None:
+            shared_qh = get_series_defaults(self.context).get("quiet_hours")
+            if (
+                isinstance(shared_qh, str)
+                and shared_qh.strip()
+                and parse_quiet_hours(shared_qh.strip())
+            ):
+                return shared_qh.strip()
+        return "00:00-08:00"
 
     @property
     def sessions(self) -> list[str]:
         raw = self.config.get("sessions", [])
-        return [str(s).strip() for s in (raw or []) if str(s or "").strip()]
+        cleaned = [str(s).strip() for s in (raw or []) if str(s or "").strip()]
+        if cleaned:
+            return cleaned
+        return inherit_umos([], self.context) if self.context is not None else []
 
     @property
     def proactive_sessions(self) -> list[str]:
@@ -727,12 +761,13 @@ class HorizonsEngine(EngineLifecycle):
     async def _digest_for_identity(self, identity: str) -> dict[str, Any]:
         norm_id = normalize_identity(identity)
         now = self.clock()
+        analysis_provider = self.effective_provider("analysis_provider")
+        review_provider = self.effective_provider("review_provider")
         if (
             self.review_mode != "human"
             and not self.config.get("allow_same_provider_for_review", False)
-            and self.config.get("analysis_provider")
-            and self.config.get("analysis_provider")
-            == self.config.get("review_provider")
+            and analysis_provider
+            and analysis_provider == review_provider
         ):
             return {
                 "identity": norm_id,
@@ -1416,7 +1451,7 @@ class HorizonsEngine(EngineLifecycle):
                 now=self.clock(),
             )
 
-        review_provider_id = str(self.config.get("review_provider", "") or "").strip()
+        review_provider_id = self.effective_provider("review_provider")
         if not review_provider_id:
             self.review_status = "awaiting_review_provider"
             return await run_io(
@@ -1657,7 +1692,7 @@ class HorizonsEngine(EngineLifecycle):
                 await self.refresh_projection()
                 if (
                     self.config.get("enabled", True)
-                    and str(self.config.get("analysis_provider", "") or "").strip()
+                    and self.effective_provider("analysis_provider")
                 ):
                     await self.run_digest_cycle()
             except asyncio.CancelledError:
