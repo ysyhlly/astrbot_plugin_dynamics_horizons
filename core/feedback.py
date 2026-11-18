@@ -211,6 +211,7 @@ async def process_jobs(engine):
             ]
             contexts = opening_contexts(store, row, data)
         try:
+            phase = "model"
             result = await engine.call_model(
                 "review_provider",
                 FEEDBACK_PROMPT,
@@ -224,6 +225,11 @@ async def process_jobs(engine):
                 identity=row["identity"],
                 lane="feedback",
             )
+            phase = "validation"
+            if not isinstance(result, dict) or any(
+                not isinstance(result.get(key, []), list) for key in ("topics", "questions", "openings")
+            ):
+                raise ValueError("invalid_feedback_shape")
             qids = []
             topics = []
             for item in result.get("questions", [])[:8]:
@@ -249,7 +255,8 @@ async def process_jobs(engine):
                     and item.get("topic") in data["topics"]
                 ):
                     topics.append(item["topic"])
-            await run_io(
+            phase = "storage"
+            recorded = await run_io(
                 store.record_turn_feedback,
                 identity=row["identity"],
                 umo=row["umo"],
@@ -268,28 +275,44 @@ async def process_jobs(engine):
             )
             with store.lock, store.db:
                 data["verified_anchors"] = verified_openings(store, row, data, contexts, result)
+                if recorded.get("topics_recorded") or recorded.get("discussed_questions") or data["verified_anchors"]:
+                    outcome = "verified"
+                elif topics or qids:
+                    outcome = "not_recorded"
+                elif any(result.get(key) for key in ("topics", "questions", "openings")):
+                    outcome = "insufficient_evidence"
+                else:
+                    outcome = "unrelated"
+                data["feedback_outcome"] = outcome
                 store.db.execute(
                     "UPDATE feedback_jobs SET status='done',payload_json=? WHERE event_id=?",
                     (encode_json(data), row["event_id"]),
                 )
         except Exception as exc:
-            _retry_job(engine, row, exc)
+            _retry_job(engine, row, exc, phase)
 
 
-def _retry_job(engine, row, exc=None):
+def _retry_job(engine, row, exc=None, phase="processing"):
     now = engine.clock()
     msg = str(exc or "")
     with engine.store.lock, engine.store.db:
         if "daily_model_call_quota_reached" in msg or "feedback_model_call_quota_reached" in msg:
             _, next_day = shanghai_day_bounds(now)
             engine.store.db.execute(
-                "UPDATE feedback_jobs SET status='pending',next_at=? WHERE event_id=?",
+                "UPDATE feedback_jobs SET status='pending',next_at=?, "
+                "payload_json=json_set(payload_json,'$.feedback_outcome','quota_wait') WHERE event_id=?",
                 (next_day + 60.0, row["event_id"]),
             )
             return
+        if isinstance(exc, TimeoutError):
+            reason = "timeout"
+        else:
+            reason = {"model": "model_failure", "validation": "invalid_result",
+                      "storage": "storage_failure"}.get(phase, "processing_failure")
         n = row["attempts"] + 1
         engine.store.db.execute(
-            "UPDATE feedback_jobs SET attempts=?,status=?,next_at=? WHERE event_id=?",
+            "UPDATE feedback_jobs SET attempts=?,status=?,next_at=?, "
+            "payload_json=json_set(payload_json,'$.feedback_outcome',?) WHERE event_id=?",
             (n, "pending" if n <= 3 else "held",
-             now + [60, 300, 1800][min(n - 1, 2)], row["event_id"]),
+             now + [60, 300, 1800][min(n - 1, 2)], reason, row["event_id"]),
         )

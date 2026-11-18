@@ -1,7 +1,7 @@
 name: astrbot_plugin_dynamics_horizons
 display_name: 群间见闻 · Dynamics Horizons
 desc: 为角色提供隔离的外部信息源订阅与连载书架，空闲清醒时自主挑拣精读，经独立调用审查生成阅读记录、带衰减暂存兴趣与分群待讨论问题，并与群间及群间世界双向联动。
-version: v0.2.0-rc.1
+version: v0.2.0-rc.2
 author: ysyhlly
 astrbot_version: ">=4.29.4,<5"
 tags:
@@ -11,3 +11,4 @@ tags:
   - world
 
 repo: https://github.com/ysyhlly/astrbot_plugin_dynamics_horizons
+# source-commit: $Format:%H$

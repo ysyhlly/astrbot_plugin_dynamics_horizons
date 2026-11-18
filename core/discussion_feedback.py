@@ -222,6 +222,7 @@ async def process_received(engine, row, data):
              "openings": list(anchors.values())}, identity=row["identity"], lane="feedback",
         )
     with store.lock, store.db:
+        saved = False
         for item in _rows(result, "reflections", 2):
             if not all(isinstance(item.get(key), str) for key in ("anchor_event_id", "log_id", "member_quote", "reflection")):
                 continue
@@ -230,11 +231,21 @@ async def process_received(engine, row, data):
             reflection = item["reflection"].strip()
             if not anchor or len(quote) < 4 or quote not in data["user_text"] or not reflection:
                 continue
-            store.record_discussion_reflection(
+            recorded = store.record_discussion_reflection(
                 identity=row["identity"], umo=row["umo"], member_id=row["member_id"],
                 log_id=anchor["log_id"], topic=anchor["topic"],
                 anchor_event_id=anchor["anchor_event_id"], source_message_id=data["source_message_id"],
                 member_quote=quote, reflection=reflection,
                 source_log_revision=anchor["source_log_revision"], occurred_at=data["occurred_at"], now=engine.clock(),
             )
-        store.db.execute("UPDATE feedback_jobs SET status='done' WHERE event_id=?", (row["event_id"],))
+            saved = bool(recorded) or saved
+        if saved:
+            outcome = "verified"
+        elif not anchors:
+            outcome = "no_verified_opening"
+        else:
+            outcome = "insufficient_evidence" if result.get("reflections") else "unrelated"
+        store.db.execute(
+            "UPDATE feedback_jobs SET status='done',payload_json=json_set(payload_json,'$.feedback_outcome',?) "
+            "WHERE event_id=?", (outcome, row["event_id"]),
+        )

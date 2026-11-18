@@ -10,7 +10,7 @@ import re
 from zoneinfo import ZoneInfo
 
 PLUGIN_ID = "astrbot_plugin_dynamics_horizons"
-PLUGIN_VERSION = "0.2.0-rc.1"
+PLUGIN_VERSION = "0.2.0-rc.2"
 SCHEMA_VERSION = 1
 
 SOURCE_KINDS = ("bilibili", "ebook", "feed", "manual")

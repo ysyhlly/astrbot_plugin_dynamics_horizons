@@ -1,4 +1,6 @@
-# astrbot_plugin_dynamics_horizons v0.2.0-rc.1
+# astrbot_plugin_dynamics_horizons v0.2.0-rc.2
+
+在健康面板按角色显示讨论反馈的核实结果、失败阶段和挂起数量。
 
 整合角色隔离的信息源、连载书架、阅读与独立审查、共同话题分享及讨论反思；包含 B 站风控退避、人工刷新和来源隔离修复。新增 MIT 许可证。
 

@@ -398,3 +398,25 @@ async def test_proactive_intent_must_match_stored_umo_and_recipient(tmp_path):
         assert _count_reflections(rig) == 0
     finally:
         rig.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer,expected", [
+    ({"topics": [{"topic": "茶文化", "user_quote": USER_TEXT[:12], "reply_quote": OPENING_TEXT[:12]}]}, "verified"),
+    ({"topics": [], "questions": []}, "unrelated"),
+    ({"topics": [{"topic": "茶文化", "user_quote": "编造了一段话", "reply_quote": "编造了一段话"}]}, "insufficient_evidence"),
+    (RuntimeError("fixture provider error"), "model_failure"),
+])
+async def test_health_distinguishes_unrelated_invalid_evidence_and_provider_error(tmp_path, answer, expected):
+    rig = Rig(tmp_path / "reason.sqlite3", Model([answer]))
+    try:
+        event = _delivery_event()
+        event["user_text"] = USER_TEXT if expected != "unrelated" else "我们来聊昨天的足球比赛吧。"
+        assert enqueue(rig.engine, event)["queued"]
+        await process_jobs(rig.engine)
+        rows = rig.store.diagnostics(IDENTITY, rig.clock_value)["feedback_jobs"]
+        assert [(r["outcome"], r["count"]) for r in rows] == [(expected, 1)]
+        count = rig.store.db.execute("SELECT count(*) FROM co_discussed_topics").fetchone()[0]
+        assert count == (1 if expected == "verified" else 0)
+    finally:
+        rig.close()

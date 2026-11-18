@@ -730,6 +730,11 @@ class LifecycleStore:
                     (identity,),
                 )
             ]
+            feedback = [dict(r) for r in self.db.execute(
+                "SELECT status,COALESCE(json_extract(payload_json,'$.feedback_outcome'),'legacy') AS outcome,"
+                "count(*) AS count FROM feedback_jobs WHERE identity=? GROUP BY status,outcome",
+                (identity,),
+            )]
             outbox = [
                 dict(r)
                 for r in self.db.execute(
@@ -751,6 +756,7 @@ class LifecycleStore:
         return {
             "corrections": corrections,
             "model_calls_today": calls,
+            "feedback_jobs": feedback,
             "reading_tasks": tasks,
             "review_jobs": jobs,
             "world_pending": outbox,

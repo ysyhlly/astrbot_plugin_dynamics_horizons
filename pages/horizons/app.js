@@ -1463,6 +1463,20 @@ function renderHealth(h) {
     box.append(details);
   }
   if (d.storage_bytes > (h.storage_warning_mb || 512)*1048576) box.append(el('p','pill warn','存储超过告警阈值；只归档，不自动删除，可导出后人工管理。'));
+  if (d.feedback_jobs?.length) {
+    const reasons = {verified:'已核实讨论',not_recorded:'未形成共同话题',insufficient_evidence:'原话依据不足',
+      unrelated:'未讨论候选话题',no_verified_opening:'缺少已核实的分享',model_failure:'模型调用失败',
+      invalid_result:'模型结果格式错误',storage_failure:'写入失败',processing_failure:'处理失败',timeout:'超时',
+      quota_wait:'等待额度',legacy:'未记录原因'};
+    const statuses = {held:'已挂起',done:'已完成',pending:'等待处理',running:'处理中'};
+    const section = el('details','item-card');
+    section.append(el('summary','',msg('讨论反馈')));
+    for (const group of d.feedback_jobs) {
+      section.append(el('p','item-meta', [msg(statuses[group.status] || '未知状态'),
+        msg(reasons[group.outcome] || '未记录原因'), String(group.count)].join(' · ')));
+    }
+    box.append(section);
+  }
   for (const job of d.review_jobs || []) {
     if (job.kind==='done') continue;
     const line=el('div','item-actions',`${job.kind} · 重试 ${job.attempts} · ${formatTime(job.next_at)} ${job.last_error || ''}`);
