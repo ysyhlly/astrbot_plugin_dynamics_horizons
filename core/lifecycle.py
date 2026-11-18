@@ -7,7 +7,12 @@ import json
 import time
 import uuid
 
-from .contract import chat_umo_kind, encode_json, normalize_identity, shanghai_day_bounds
+from .contract import (
+    chat_umo_kind,
+    encode_json,
+    normalize_identity,
+    shanghai_day_bounds,
+)
 
 
 class ReviewConflict(ValueError):

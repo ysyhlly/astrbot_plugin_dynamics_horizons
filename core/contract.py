@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import math
 import re
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 PLUGIN_ID = "astrbot_plugin_dynamics_horizons"
-PLUGIN_VERSION = "0.2.0-rc.2"
+PLUGIN_VERSION = "0.2.0-rc.3"
 SCHEMA_VERSION = 1
 
 SOURCE_KINDS = ("bilibili", "ebook", "feed", "manual")

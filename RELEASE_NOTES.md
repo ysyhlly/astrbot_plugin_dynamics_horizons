@@ -1,4 +1,6 @@
-# astrbot_plugin_dynamics_horizons v0.2.0-rc.2
+# astrbot_plugin_dynamics_horizons v0.2.0-rc.3
+
+对齐上游托管检查中的导入与兼容性规则，讨论反馈继续区分无关对话、证据不足与模型调用失败。
 
 在健康面板按角色显示讨论反馈的核实结果、失败阶段和挂起数量。
 

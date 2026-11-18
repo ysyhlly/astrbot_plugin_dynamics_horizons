@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
+from ..series_panels import get_series_defaults, inherit_provider, inherit_umos
 from .contract import (
     PERSONALITY_REDLINE,
     REVIEW_MODES,
@@ -37,7 +38,6 @@ from .sanitize import (
 )
 from .store import HorizonsStore
 from .world_bridge import WorldBridge
-from ..series_panels import get_series_defaults, inherit_provider, inherit_umos
 
 try:
     from ..adapters import (

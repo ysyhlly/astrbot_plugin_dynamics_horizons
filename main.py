@@ -12,7 +12,7 @@ ensure_current(
         ("core.runtime", "EngineLifecycle", "proactive_scope"),
         ("core.world_bridge", "WorldBridge", "_group_wake_scope_v2"),
     ],
-    version='0.2.0-beta.2.reliability.1.expression.1.allchats.1.bili.2.discussion.1',
+    version="0.2.0-beta.2.reliability.1.expression.1.allchats.1.bili.2.discussion.1",
 )
 
 import asyncio
@@ -33,8 +33,8 @@ from .core.engine import HorizonsEngine
 from .core.io import run_io
 from .core.projection import _empty_result
 from .core.store import HorizonsStore
-from .series_panels import get_series_defaults, inherit_provider
 from .core.web_api import HorizonsWebAPI
+from .series_panels import get_series_defaults, inherit_provider
 
 
 class Main(Star):

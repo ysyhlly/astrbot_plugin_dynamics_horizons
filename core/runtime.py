@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from .io import run_io
 
 from .contract import chat_umo_kind, make_identity
+from .io import run_io
 
 
 class EngineLifecycle:

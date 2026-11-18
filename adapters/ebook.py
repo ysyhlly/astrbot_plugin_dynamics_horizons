@@ -918,7 +918,7 @@ def _opds_auth_headers(cfg: Mapping[str, Any]) -> tuple[dict[str, str], list[str
         headers["Authorization"] = f"Bearer {token}"
         secrets.append(token)
     elif username and password and not is_masked_secret(password):
-        raw_pair = f"{username}:{password}".encode("utf-8")
+        raw_pair = f"{username}:{password}".encode()
         b64 = base64.b64encode(raw_pair).decode("ascii")
         headers["Authorization"] = f"Basic {b64}"
         secrets.extend([password, b64])

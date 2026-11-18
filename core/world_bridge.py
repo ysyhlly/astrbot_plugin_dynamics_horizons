@@ -150,7 +150,7 @@ class WorldBridge:
                     }
                 )
                 if self.projection is not None:
-                    fp = hashlib.sha256(f"{pid}\0{prompt}".encode("utf-8")).hexdigest()
+                    fp = hashlib.sha256(f"{pid}\0{prompt}".encode()).hexdigest()
                     self.projection.bind_persona_alias(fp, ident)
                     self.projection.bind_persona_alias(pid, ident)
         return results

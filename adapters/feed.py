@@ -167,7 +167,7 @@ def _parse_json_feed(
         raw_id = str(entry.get("id") or resolved_url or "").strip()
         if not raw_id:
             raw_id = hashlib.sha256(
-                f"{title}:{summary_clean}".encode("utf-8")
+                f"{title}:{summary_clean}".encode()
             ).hexdigest()[:16]
 
         pub_ts = _parse_feed_timestamp(
@@ -298,7 +298,7 @@ def _parse_xml_feed(
                 raw_id = (
                     resolved_url
                     or hashlib.sha256(
-                        f"{title}:{summary_clean}".encode("utf-8")
+                        f"{title}:{summary_clean}".encode()
                     ).hexdigest()[:16]
                 )
 
@@ -374,7 +374,7 @@ def _parse_xml_feed(
             guid
             or resolved_url
             or hashlib.sha256(
-                f"{title}:{pub_raw}:{summary_clean}".encode("utf-8")
+                f"{title}:{pub_raw}:{summary_clean}".encode()
             ).hexdigest()[:16]
         )
         has_rich_body = len(body) >= 220 or not resolved_url or not fetch_full_article

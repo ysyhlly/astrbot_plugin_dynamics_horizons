@@ -12,12 +12,14 @@ from typing import Any
 
 from bilibili_api import (
     Credential,
-    exceptions as bili_exc,
     homepage,
     hot,
     rank,
     user,
     video,
+)
+from bilibili_api import (
+    exceptions as bili_exc,
 )
 
 from .ssrf import (
