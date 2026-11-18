@@ -13,6 +13,10 @@ DISCUSSION_PROMPT = """你整理角色发起见闻话题后收到的回应，不
 返回严格JSON：{"reflections":[{"anchor_event_id":"提供的发起事件ID","log_id":"提供的阅读记录ID","member_quote":"本次成员发言的连续原文片段","reflection":"不超过120字的后续感想"}]}。最多两条。不确定返回空数组。"""
 
 
+class DiscussionModelError(RuntimeError):
+    """Identify a failed review call without exposing the provider's message."""
+
+
 def _rows(result, field, limit):
     values = result.get(field) if isinstance(result, dict) else None
     return [item for item in values[:limit] if isinstance(item, dict)] if isinstance(values, list) else []
@@ -216,11 +220,14 @@ async def process_received(engine, row, data):
         return
     result = {"reflections": []}
     if anchors:
-        result = await engine.call_model(
-            "review_provider", DISCUSSION_PROMPT,
-            {"member_text": data["user_text"], "explicit_reply": bool(data.get("reply_to_message_id")),
-             "openings": list(anchors.values())}, identity=row["identity"], lane="feedback",
-        )
+        try:
+            result = await engine.call_model(
+                "review_provider", DISCUSSION_PROMPT,
+                {"member_text": data["user_text"], "explicit_reply": bool(data.get("reply_to_message_id")),
+                 "openings": list(anchors.values())}, identity=row["identity"], lane="feedback",
+            )
+        except Exception as exc:
+            raise DiscussionModelError("discussion_review_call_failed") from exc
     with store.lock, store.db:
         saved = False
         for item in _rows(result, "reflections", 2):

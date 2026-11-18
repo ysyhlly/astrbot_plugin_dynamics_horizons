@@ -334,6 +334,8 @@ async def test_discussion_reviewer_failure_retries_and_then_records(tmp_path):
         ).fetchone()
         assert reply["attempts"] == 1
         assert reply["status"] == "pending"
+        reasons = rig.store.diagnostics(IDENTITY, rig.clock_value)["feedback_jobs"]
+        assert {"status": "pending", "outcome": "model_failure", "count": 1} in reasons
         assert _count_reflections(rig) == 0
         rig.clock_value = reply["next_at"] + 1
         await process_jobs(rig.engine)

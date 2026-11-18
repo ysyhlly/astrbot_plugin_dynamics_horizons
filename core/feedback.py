@@ -10,7 +10,7 @@ import re
 from .contract import chat_umo_kind, encode_json, make_identity, normalize_identity, shanghai_day_bounds
 from .sanitize import sanitize_untrusted_text
 from .discussion_feedback import (
-    opening_contexts, process_received, queue_received, recent_correction_logs,
+    DiscussionModelError, opening_contexts, process_received, queue_received, recent_correction_logs,
     verified_openings,
 )
 
@@ -197,6 +197,8 @@ async def process_jobs(engine):
         if data.get("kind") == "discussion_reply":
             try:
                 await process_received(engine, row, data)
+            except DiscussionModelError as exc:
+                _retry_job(engine, row, exc.__cause__, "model")
             except Exception as exc:
                 _retry_job(engine, row, exc)
             continue
