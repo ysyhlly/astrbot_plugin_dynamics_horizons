@@ -58,6 +58,14 @@ _patch_local_chromium_if_needed()
 @pytest.fixture(scope="module")
 def server():
     class QuietHandler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/api/plugin/page/bridge-sdk.js":
+                # The browser fixture already installs the SDK double at document start.
+                self.send_response(204)
+                self.end_headers()
+                return
+            super().do_GET()
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(PAGE_DIR), **kwargs)
 
