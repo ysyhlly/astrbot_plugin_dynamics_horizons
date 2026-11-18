@@ -222,7 +222,7 @@ function initTheme() {
 /* ===== Bridge & API ===== */
 let bridgeReadyPromise = null;
 function getBridge() {
-  return window.AstrBotPluginPage || window.AstrBotPluginView;
+  return (window.DynamicsPanelBridge || window.AstrBotPluginPage || window.AstrBotPluginView);
 }
 
 async function ensureBridge() {

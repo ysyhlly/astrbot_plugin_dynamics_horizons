@@ -130,6 +130,8 @@ class HorizonsWebAPI:
         self.operations: set[asyncio.Task] = set()
 
     def register(self) -> None:
+        from ..series_workspace import register_panel_api
+
         specs = [
             ("overview", self.overview_get, ["GET"], "群间见闻总览与兴趣池"),
             ("sources", self.sources_get, ["GET"], "群间见闻信息源与书架列表"),
@@ -141,7 +143,7 @@ class HorizonsWebAPI:
         self.routes = []
         for endpoint, handler, methods, desc in specs:
             path = f"/{PLUGIN_ID}/{endpoint}"
-            self.plugin.context.register_web_api(path, handler, methods, desc)
+            register_panel_api(self.plugin, self.plugin.context.register_web_api, path, handler, methods, desc)
             self.routes.append((path, handler, methods, desc))
 
     def unregister(self) -> None:
