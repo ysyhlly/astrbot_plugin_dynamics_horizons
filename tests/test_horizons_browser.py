@@ -556,7 +556,10 @@ def test_series_presence_and_safe_navigation(server, width):
 
         page.evaluate("delete window.AstrBotPluginPage.navigateToPlugin")
         panel.get_by_role("button").filter(has_text="对话主控").click()
-        assert "宿主未提供跨插件导航" in panel.inner_text()
+        assert "请更新入口和目标群间插件后重试" in panel.inner_text()
+        page.evaluate("window.DynamicsWorkspace={open:async(id,view)=>window.__nav.push([id,view])}")
+        panel.get_by_role("button").filter(has_text="对话主控").click()
+        assert page.evaluate("window.__nav[1]") == ["astrbot_plugin_chat_dynamics", "app"]
         assert not page_errors and not console_errors
         browser.close()
 
