@@ -389,13 +389,13 @@ async def test_world_sleep_gate_and_full_three_stage_pipeline(tmp_path: Path):
         assert res_paused["skip_reason"] == "world_paused"
         assert len(p_analysis.calls) == 0
 
-        # Waking up allows Stage 1 -> Stage 2 -> Stage 3 -> World bookmark sync!
+        # Waking up allows merged Stage 1+2 -> independent Stage 3 -> World bookmark sync!
         world.paused = False
         res_awake = await plugin.engine.run_digest_cycle(identity=alice_id)
         assert res_awake["status"] == "ok"
         assert res_awake["proposals_created"] == 1
         assert res_awake["approved"] == 1
-        assert len(p_analysis.calls) == 2
+        assert len(p_analysis.calls) == 1
         assert len(p_review.calls) == 1
         assert len(world.recorded_readings) == 1
         assert world.recorded_readings[0][1]["title"] == "暴风雪山庄模式百年演变考"

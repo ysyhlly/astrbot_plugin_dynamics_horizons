@@ -118,6 +118,12 @@
     "type": "bool",
     "description": "允许同一模型独立复核",
     "default": false,
-    "hint": "开启后分析与审查可以选择同一 Provider；审查仍单独调用，使用空历史上下文和独立审查指令。"
+    "hint": "开启后分析与审查可以选择同一 Provider；配合 merge_same_provider_review 可合并为单次结构化自检调用，关闭合并时仍拆分为独立二次调用。"
+  },
+  "merge_same_provider_review": {
+    "type": "bool",
+    "description": "同模型审查合并到单次消化调用",
+    "default": true,
+    "hint": "当 analysis_provider 与 review_provider 相同且开启 allow_same_provider_for_review 时，将自检审查字段合并到单次精读输出中（仍做严格字段校验与安全红线拦截）；关闭时仍拆分为独立二次调用。"
   }
 }

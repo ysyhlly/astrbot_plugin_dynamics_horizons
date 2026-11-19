@@ -41,6 +41,7 @@ class EngineLifecycle:
             self._provider_id("review_provider"),
             self.config.get("review_mode", "llm"),
             bool(self.config.get("allow_same_provider_for_review", False)),
+            bool(self.config.get("merge_same_provider_review", True)),
         )
 
     async def assert_reading_current(self, identity, wake, revision, source_id=""):
@@ -202,9 +203,21 @@ class EngineLifecycle:
             "last_error": self.last_error,
             "analysis_provider": self._provider_id("analysis_provider"),
             "review_provider": self._provider_id("review_provider"),
-            "review_context_policy": "independent_calls"
-            if self.config.get("allow_same_provider_for_review", False)
-            else "distinct_providers",
+            "review_context_policy": (
+                "merged_self_review"
+                if (
+                    self.config.get("allow_same_provider_for_review", False)
+                    and self.config.get("merge_same_provider_review", True)
+                    and analysis_provider
+                    and analysis_provider == review_provider
+                    and self.review_mode != "human"
+                )
+                else (
+                    "independent_calls"
+                    if self.config.get("allow_same_provider_for_review", False)
+                    else "distinct_providers"
+                )
+            ),
             "model_call_quota": self.config.get("daily_model_call_quota", 50),
             "storage_warning_mb": self.config.get("storage_warning_mb", 512),
             "proactive_enabled": proactive_scope != "disabled",
