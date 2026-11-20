@@ -17,6 +17,19 @@
     "_special": "select_provider",
     "hint": "普通聊天模型，用于候选挑拣与精读内化；不要选择 Jev 抉择模型。"
   },
+  "video_provider": {
+    "description": "视频多模态精读模型（可选）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "专用于阶段2视频直读的多模态模型（支持 Gemini 原生看视频、MiniMax 或其他视觉模型）；留空时回退到阅读与分析模型 (analysis_provider)。阶段1筛选、电子书、RSS 与图文动态仍使用低成本 analysis_provider。"
+  },
+  "video_audio_stt_provider": {
+    "description": "视频语音转写兜底模型（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "可选填 AstrBot 的 STT 或音频模型 ID；仅在视频无官方 CC/AI 字幕且走抽帧通道时尝试抽取音轨转写作为补充文本，留空禁用。"
+  },
   "review_provider": {
     "description": "独立审查模型",
     "type": "string",
@@ -125,5 +138,41 @@
     "description": "同模型审查合并到单次消化调用",
     "default": true,
     "hint": "当 analysis_provider 与 review_provider 相同且开启 allow_same_provider_for_review 时，将自检审查字段合并到单次精读输出中（仍做严格字段校验与安全红线拦截）；关闭时仍拆分为独立二次调用。"
+  },
+  "bilibili_shared_cookie": {
+    "type": "string",
+    "description": "B站共享只读 Cookie（可选）",
+    "default": "",
+    "hint": "可选插件级只读 Cookie（仅使用 SESSDATA/buvid3，自动剔除 bili_jct 等写操作凭据，日志与接口中严格脱敏）。当热门榜或 UP 主源未单独配置 Cookie 时自动复用。"
+  },
+  "video_native_max_duration_sec": {
+    "type": "int",
+    "description": "原生视频直传最大时长（秒）",
+    "default": 480,
+    "hint": "使用 Gemini 等支持原生 video/mp4 的模型时，不超过此时长（默认 480 秒 / 8 分钟）的视频优先走原生直传，超时则改走抽帧通道。"
+  },
+  "video_native_max_mb": {
+    "type": "int",
+    "description": "原生视频直传体积上限（MB）",
+    "default": 15,
+    "hint": "压缩后直传给模型的单段视频体积上限（默认 15 MB），超出或通道拒绝时自动回退到关键帧抽帧。"
+  },
+  "video_max_frames": {
+    "type": "int",
+    "description": "视频抽帧最大关键帧数",
+    "default": 12,
+    "hint": "走通用视觉抽帧通道或中长视频时，单次送入视觉模型的最大关键帧数量（默认 12）。"
+  },
+  "video_danmaku_enabled": {
+    "type": "bool",
+    "description": "启用视频高能弹幕采样",
+    "default": false,
+    "hint": "默认关闭。开启后抓取脱敏的高能弹幕时间戳辅助选帧并附带少量弹幕摘要（严格隔离防注入）。"
+  },
+  "video_danmaku_max_items": {
+    "type": "int",
+    "description": "单视频弹幕采样上限",
+    "default": 15,
+    "hint": "开启高能弹幕采样后，最多提取并附带的脱敏弹幕条数（默认 15）。"
   }
 }

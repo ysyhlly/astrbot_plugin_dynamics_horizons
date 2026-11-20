@@ -75,6 +75,60 @@ def _escape_like(value: str) -> str:
     )
 
 
+def _extract_media_view(raw: Any) -> dict[str, Any]:
+    """Normalize watch_mode, content_origin, visual_observations, and media_meta safely."""
+    obj = raw if isinstance(raw, dict) else {}
+    raw_meta = obj.get("media_meta") if isinstance(obj.get("media_meta"), dict) else {}
+    watch_mode = str(obj.get("watch_mode") or raw_meta.get("watch_mode") or "").strip()[
+        :48
+    ]
+    content_origin = str(
+        obj.get("content_origin") or raw_meta.get("content_origin") or ""
+    ).strip()[:80]
+    raw_obs = obj.get("visual_observations")
+    visual_observations: list[str] = []
+    if isinstance(raw_obs, list):
+        for item in raw_obs[:8]:
+            if isinstance(item, str):
+                cleaned = strip_raw_urls(item).replace("\n", " ").strip()[:120]
+                if cleaned:
+                    visual_observations.append(cleaned)
+    media_meta: dict[str, Any] = {}
+    if raw_meta:
+        if raw_meta.get("watch_mode") or watch_mode:
+            media_meta["watch_mode"] = str(
+                raw_meta.get("watch_mode") or watch_mode
+            ).strip()[:48]
+        if raw_meta.get("content_origin") or content_origin:
+            media_meta["content_origin"] = str(
+                raw_meta.get("content_origin") or content_origin
+            ).strip()[:80]
+        for bkey in (
+            "has_visual",
+            "has_subtitle",
+            "has_audio_transcript",
+            "has_danmaku",
+        ):
+            if bkey in raw_meta:
+                media_meta[bkey] = bool(raw_meta[bkey])
+        for ikey in ("frame_count", "duration_sec"):
+            if ikey in raw_meta:
+                try:
+                    media_meta[ikey] = max(0, int(raw_meta[ikey] or 0))
+                except (TypeError, ValueError):
+                    media_meta[ikey] = 0
+        if "provider_id" in raw_meta:
+            media_meta["provider_id"] = str(raw_meta.get("provider_id") or "").strip()[
+                :120
+            ]
+    return {
+        "watch_mode": watch_mode,
+        "content_origin": content_origin,
+        "visual_observations": visual_observations,
+        "media_meta": media_meta,
+    }
+
+
 class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
     """Thread-safe SQLite store separating global character reading from per-UMO consumption."""
 
@@ -210,6 +264,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     digest TEXT NOT NULL,
                     reflection TEXT NOT NULL,
                     fact_kind TEXT NOT NULL DEFAULT 'external_media',
+                    media_meta_json TEXT NOT NULL DEFAULT '{}',
                     created_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_logs_identity ON reading_logs(identity, created_at DESC);
@@ -302,6 +357,13 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 );
                 """
             )
+            log_cols = {
+                r[1] for r in self.db.execute("PRAGMA table_info(reading_logs)")
+            }
+            if "media_meta_json" not in log_cols:
+                self.db.execute(
+                    "ALTER TABLE reading_logs ADD COLUMN media_meta_json TEXT NOT NULL DEFAULT '{}'"
+                )
 
     def close(self) -> None:
         with self.lock:
@@ -1221,8 +1283,19 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         chapter_label: str = "",
         total_chapters: int | None = None,
         content_origin: str = "unknown",
+        max_chars: int | None = None,
     ) -> dict[str, Any] | None:
-        san = sanitize_untrusted_text(full_text, max_chars=4000)
+        effective_max = (
+            max(4000, min(8000, int(max_chars)))
+            if isinstance(max_chars, int)
+            else (
+                6000
+                if str(content_origin or "").startswith("bilibili_")
+                and str(content_origin or "") != "bilibili_dynamic"
+                else 4000
+            )
+        )
+        san = sanitize_untrusted_text(full_text, max_chars=effective_max)
         ch_label = (
             sanitize_untrusted_text(chapter_label, max_chars=80)["text"]
             if chapter_label
@@ -1264,14 +1337,36 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             ).fetchone()
         return self._format_candidate_row(updated)
 
-    def set_candidate_status(self, candidate_id: str, status: str) -> None:
+    def set_candidate_status(
+        self, candidate_id: str, status: str, *, reason: str = ""
+    ) -> None:
         if not candidate_id:
             return
+        clean_reason = strip_raw_urls(str(reason or "")).strip()[:160]
         with self.lock, self.db:
-            self.db.execute(
-                "UPDATE candidate_items SET status=? WHERE candidate_id=?",
-                (str(status), str(candidate_id)),
-            )
+            if clean_reason:
+                row = self.db.execute(
+                    "SELECT meta_json FROM candidate_items WHERE candidate_id=?",
+                    (str(candidate_id),),
+                ).fetchone()
+                meta: dict[str, Any] = {}
+                if row is not None:
+                    try:
+                        parsed = json.loads(row["meta_json"] or "{}")
+                        if isinstance(parsed, dict):
+                            meta = parsed
+                    except Exception:
+                        meta = {}
+                meta["skip_reason"] = clean_reason
+                self.db.execute(
+                    "UPDATE candidate_items SET status=?, meta_json=? WHERE candidate_id=?",
+                    (str(status), encode_json(mask_secrets(meta)), str(candidate_id)),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE candidate_items SET status=? WHERE candidate_id=?",
+                    (str(status), str(candidate_id)),
+                )
 
     # ------------------------------------------------------------------
     # Proposals, Reviews, Reading Logs, Staged Interests & Questions
@@ -1279,6 +1374,8 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
 
     @staticmethod
     def _format_proposal_row(row: sqlite3.Row) -> dict[str, Any]:
+        evidence = json.loads(row["evidence_json"] or "{}")
+        media_view = _extract_media_view(evidence)
         return {
             "proposal_id": row["proposal_id"],
             "identity": row["identity"],
@@ -1302,7 +1399,11 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             "review_risks": json.loads(row["review_risks_json"] or "[]"),
             "reviewed_by": row["reviewed_by"],
             "revision": int(row["revision"]),
-            "evidence": json.loads(row["evidence_json"]),
+            "evidence": evidence,
+            "watch_mode": media_view["watch_mode"],
+            "content_origin": media_view["content_origin"],
+            "visual_observations": media_view["visual_observations"],
+            "media_meta": media_view["media_meta"],
             "task_id": row["task_id"],
             "applied_log_id": row["applied_log_id"],
             "applied_interest_id": row["applied_interest_id"],
@@ -1693,12 +1794,27 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 }
             )
             log_id = "log_" + uuid.uuid4().hex[:16]
+            try:
+                proposal_evidence = json.loads(row["evidence_json"] or "{}")
+            except Exception:
+                proposal_evidence = {}
+            log_media_view = _extract_media_view(proposal_evidence)
+            log_media_payload = (
+                log_media_view
+                if (
+                    log_media_view["watch_mode"]
+                    or log_media_view["content_origin"]
+                    or log_media_view["visual_observations"]
+                    or log_media_view["media_meta"]
+                )
+                else {}
+            )
             self.db.execute(
                 """
                 INSERT INTO reading_logs(
                     log_id, proposal_id, identity, source_kind,
-                    citation_json, raw_url, digest, reflection, fact_kind, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'external_media', ?)
+                    citation_json, raw_url, digest, reflection, fact_kind, media_meta_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'external_media', ?, ?)
                 """,
                 (
                     log_id,
@@ -1709,6 +1825,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     row["raw_url"],
                     row["digest"],
                     row["reflection"],
+                    encode_json(log_media_payload),
                     stamp,
                 ),
             )
@@ -2068,6 +2185,14 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
 
     @staticmethod
     def _format_log_row(row: sqlite3.Row) -> dict[str, Any]:
+        raw_media = {}
+        try:
+            keys = row.keys()
+            if "media_meta_json" in keys and row["media_meta_json"]:
+                raw_media = json.loads(row["media_meta_json"])
+        except Exception:
+            raw_media = {}
+        media_view = _extract_media_view(raw_media)
         return {
             "log_id": row["log_id"],
             "proposal_id": row["proposal_id"],
@@ -2078,6 +2203,10 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             "digest": row["digest"],
             "reflection": row["reflection"],
             "fact_kind": row["fact_kind"],
+            "watch_mode": media_view["watch_mode"],
+            "content_origin": media_view["content_origin"],
+            "visual_observations": media_view["visual_observations"],
+            "media_meta": media_view["media_meta"],
             "created_at": float(row["created_at"]),
             "status": row["status"],
         }

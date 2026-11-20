@@ -1,4 +1,4 @@
-"""Read-only Bilibili source adapter (`up` / `popular` / `recommend` + AI conclusion/subtitle/desc)."""
+"""Read-only Bilibili source adapter (`up` / `popular` / `recommend` + subtitle/visual/danmaku)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from http.cookies import SimpleCookie
 from typing import Any
 
@@ -34,10 +34,17 @@ from .ssrf import (
     safe_http_get,
     validate_url_sync,
 )
+from .video_media import (
+    acquire_video_media,
+    build_empty_media_bundle,
+    format_timestamp,
+    normalize_media_options,
+)
 
 BILI_MODES = ("up", "popular", "recommend")
 POPULAR_KINDS = ("hot", "weekly", "rank")
 RISK_CONTROL_CODES = frozenset({-412, -352, -509, -799})
+PERMANENT_UNAVAILABLE_CODES = frozenset({-404, -403, -10403, 62002, 62004, 62012, 87007, 87008})
 BILI_RCMD_URL = "https://api.bilibili.com/x/web-interface/index/top/feed/rcmd"
 
 _BILI_HEADERS = {
@@ -119,11 +126,45 @@ def _extract_cookie_parts(
 
 def _build_readonly_credential(
     config: Mapping[str, Any],
+    *,
+    shared_cookie: str = "",
+    fallback_cookies: Sequence[str] | None = None,
 ) -> tuple[Credential | None, str, list[str]]:
+    """Build strictly read-only Bilibili credentials (zero `bili_jct`) with optional cookie fallbacks."""
     parts, secrets = _extract_cookie_parts(config)
-    sessdata = parts.get("SESSDATA") or parts.get("sessdata") or ""
-    buvid3 = parts.get("buvid3") or ""
-    dedeuserid = parts.get("DedeUserID") or parts.get("dedeuserid") or ""
+    candidates: list[dict[str, str]] = [parts]
+
+    raw_fallbacks: list[str] = []
+    if isinstance(shared_cookie, str) and shared_cookie.strip():
+        raw_fallbacks.append(shared_cookie.strip())
+    if fallback_cookies:
+        for item in fallback_cookies:
+            if isinstance(item, str) and item.strip():
+                raw_fallbacks.append(item.strip())
+
+    for fb_raw in raw_fallbacks:
+        fb_parts, fb_secrets = _extract_cookie_parts({"cookie": fb_raw})
+        secrets.extend(fb_secrets)
+        if fb_parts:
+            candidates.append(fb_parts)
+
+    # Prefer the first candidate carrying SESSDATA; otherwise keep first with buvid3
+    chosen: dict[str, str] = {}
+    for cand in candidates:
+        if cand.get("SESSDATA") or cand.get("sessdata"):
+            chosen = cand
+            break
+    if not chosen:
+        for cand in candidates:
+            if cand.get("buvid3"):
+                chosen = cand
+                break
+
+    # Defensive: ensure bili_jct is never kept
+    chosen.pop("bili_jct", None)
+    sessdata = chosen.get("SESSDATA") or chosen.get("sessdata") or ""
+    buvid3 = chosen.get("buvid3") or ""
+    dedeuserid = chosen.get("DedeUserID") or chosen.get("dedeuserid") or ""
 
     if not (sessdata or buvid3):
         return None, "", secrets
@@ -142,6 +183,45 @@ def _build_readonly_credential(
     if dedeuserid:
         readonly_pairs.append(f"DedeUserID={dedeuserid}")
     return cred, "; ".join(readonly_pairs), secrets
+
+
+def _classify_permanent_unavailable(exc: BaseException) -> str:
+    """Return a non-empty permanent skip reason when Bilibili indicates deleted/private/VIP/paid."""
+    code = 0
+    if isinstance(exc, bili_exc.ResponseCodeException):
+        code = int(getattr(exc, "code", 0) or 0)
+    elif hasattr(exc, "code"):
+        try:
+            code = int(getattr(exc, "code", 0) or 0)
+        except (TypeError, ValueError):
+            code = 0
+    if code in {-404, 62002, 62004, 62012}:
+        return f"video_deleted_or_hidden:{code}"
+    if code in {-10403, 87007, 87008}:
+        return f"vip_or_paid:{code}"
+    if code == -403:
+        return "access_denied:-403"
+    return ""
+
+
+def _parse_duration_seconds(raw: Any) -> int:
+    """Parse Bilibili duration (int seconds or `MM:SS` / `HH:MM:SS` string) into seconds."""
+    if raw is None:
+        return 0
+    if isinstance(raw, (int, float)):
+        return max(0, int(round(raw)))
+    text = str(raw).strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return max(0, int(text))
+    parts = text.split(":")
+    if len(parts) in {2, 3} and all(p.isdigit() for p in parts):
+        nums = [int(p) for p in parts]
+        if len(nums) == 2:
+            return nums[0] * 60 + nums[1]
+        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    return 0
 
 
 def _classify_bili_exception(
@@ -177,6 +257,11 @@ def _classify_bili_exception(
         http_status = exc.status_code
     elif isinstance(exc, bili_exc.NetworkException):
         http_status = exc.status
+    elif getattr(exc, "status_code", None) is not None:
+        try:
+            http_status = int(getattr(exc, "status_code"))
+        except (TypeError, ValueError):
+            http_status = None
     if http_status in {412, 403}:
         return BilibiliRiskControlError(
             f"risk_control:http={http_status}",
@@ -196,10 +281,26 @@ def _classify_bili_exception(
     redacted = redact_error_text(exc, secrets).lower()
     if any(
         tok in redacted
-        for tok in ("-412", "-352", "geetest", "v_voucher", "security control")
+        for tok in (
+            "-412",
+            "-352",
+            "-509",
+            "-799",
+            "risk_control:",
+            "geetest",
+            "v_voucher",
+            "security control",
+        )
     ):
+        detected_code = -412
+        for rc_code in (-412, -352, -509, -799):
+            if str(rc_code) in redacted:
+                detected_code = rc_code
+                break
         return BilibiliRiskControlError(
-            "risk_control:detected", code=-412, cooldown_seconds=1800.0
+            f"risk_control:code={detected_code}",
+            code=detected_code,
+            cooldown_seconds=1800.0,
         )
     return None
 
@@ -296,6 +397,9 @@ def _video_row_to_candidate(
             pass
     if rcmd_reason:
         meta["rcmd_reason"] = clean_inline_field(rcmd_reason, max_chars=80)
+    dur_s = _parse_duration_seconds(row.get("duration") or row.get("length"))
+    if dur_s > 0:
+        meta["duration_sec"] = dur_s
 
     return normalize_candidate(
         external_id=f"bili:bv:{bvid}",
@@ -680,12 +784,13 @@ def _format_ai_conclusion(payload: Mapping[str, Any] | None) -> str:
     return clean_external_text("\n\n".join(pieces), max_chars=4000)
 
 
-def _pick_subtitle_url(sub_info: Any) -> str:
+def _pick_subtitle_track(sub_info: Any) -> tuple[str, str]:
+    """Select the best subtitle URL and classify its kind (`cc` vs `ai_subtitle`)."""
     if not isinstance(sub_info, Mapping):
-        return ""
+        return "", ""
     tracks = sub_info.get("subtitles") or sub_info.get("list") or []
     if not isinstance(tracks, list) or not tracks:
-        return ""
+        return "", ""
 
     valid_tracks: list[Mapping[str, Any]] = [
         t
@@ -693,21 +798,94 @@ def _pick_subtitle_url(sub_info: Any) -> str:
         if isinstance(t, Mapping) and str(t.get("subtitle_url") or "").strip()
     ]
     if not valid_tracks:
-        return ""
+        return "", ""
 
-    def _score(track: Mapping[str, Any]) -> int:
+    def _is_ai(track: Mapping[str, Any]) -> bool:
         lan = str(track.get("lan") or "").lower()
+        return (
+            lan.startswith("ai-")
+            or bool(track.get("ai_type"))
+            or bool(track.get("ai_status"))
+        )
+
+    def _score(track: Mapping[str, Any]) -> tuple[int, int]:
+        lan = str(track.get("lan") or "").lower()
+        ai_rank = 1 if _is_ai(track) else 0
         if lan in {"zh-cn", "zh-hans"}:
-            return 0
-        if lan.startswith("zh") or "zh" in lan:
-            return 1
-        return 2
+            return (0, ai_rank)
+        if lan in {"ai-zh", "zh-hk", "zh-tw"} or lan.startswith("zh") or "zh" in lan:
+            return (1, ai_rank)
+        return (2, ai_rank)
 
     valid_tracks.sort(key=_score)
-    raw_url = str(valid_tracks[0]["subtitle_url"]).strip()
+    best = valid_tracks[0]
+    raw_url = str(best["subtitle_url"]).strip()
     if raw_url.startswith("//"):
         raw_url = "https:" + raw_url
-    return raw_url
+    kind = "ai_subtitle" if _is_ai(best) else "cc"
+    return raw_url, kind
+
+
+def _pick_subtitle_url(sub_info: Any) -> str:
+    url, _ = _pick_subtitle_track(sub_info)
+    return url
+
+
+def _condense_timestamped_lines(
+    lines: Sequence[str], *, max_chars: int = 4500
+) -> str:
+    """Keep full timeline coverage (opening, middle samples, ending) when long subtitles exceed budget."""
+    joined = "\n".join(lines)
+    if len(joined) <= max_chars:
+        return joined
+    if len(lines) <= 6:
+        return joined[:max_chars]
+
+    head_budget = int(max_chars * 0.42)
+    tail_budget = int(max_chars * 0.28)
+    mid_budget = max(200, max_chars - head_budget - tail_budget - 60)
+
+    head_lines: list[str] = []
+    acc = 0
+    head_end = 0
+    for idx, ln in enumerate(lines):
+        if acc + len(ln) + 1 > head_budget and head_lines:
+            break
+        head_lines.append(ln)
+        acc += len(ln) + 1
+        head_end = idx + 1
+
+    tail_lines: list[str] = []
+    acc = 0
+    tail_start = len(lines)
+    for idx in range(len(lines) - 1, head_end - 1, -1):
+        ln = lines[idx]
+        if acc + len(ln) + 1 > tail_budget and tail_lines:
+            break
+        tail_lines.append(ln)
+        acc += len(ln) + 1
+        tail_start = idx
+    tail_lines.reverse()
+
+    middle_pool = lines[head_end:tail_start]
+    mid_lines: list[str] = []
+    if middle_pool:
+        approx_slots = max(3, min(len(middle_pool), mid_budget // 32))
+        step = len(middle_pool) / approx_slots
+        acc = 0
+        for s in range(approx_slots):
+            ln = middle_pool[int(s * step)]
+            if acc + len(ln) + 1 > mid_budget:
+                break
+            mid_lines.append(ln)
+            acc += len(ln) + 1
+
+    sections = ["\n".join(head_lines)]
+    if mid_lines:
+        sections.append("... [中段节选] ...\n" + "\n".join(mid_lines))
+    if tail_lines:
+        sections.append("... [后段] ...\n" + "\n".join(tail_lines))
+    return "\n".join(sections)[:max_chars]
 
 
 async def _download_subtitle_text(
@@ -715,6 +893,7 @@ async def _download_subtitle_text(
     *,
     timeout: float,
     secrets: list[str],
+    max_chars: int = 4500,
 ) -> str:
     clean_url = validate_url_sync(sub_url, allow_private=False, require_dns=False)
     resp = await safe_http_get(
@@ -736,10 +915,67 @@ async def _download_subtitle_text(
         if not isinstance(row, Mapping):
             continue
         line = str(row.get("content") or "").strip()
-        if line and line != prev:
+        if not line or line == prev:
+            continue
+        prev = line
+        raw_from = row.get("from")
+        if raw_from is not None:
+            try:
+                ts_label = format_timestamp(float(raw_from))
+                lines.append(f"[{ts_label}] {line}")
+            except (TypeError, ValueError):
+                lines.append(line)
+        else:
             lines.append(line)
-            prev = line
-    return clean_external_text("\n".join(lines), max_chars=4000)
+    condensed = _condense_timestamped_lines(lines, max_chars=max_chars)
+    return clean_external_text(condensed, max_chars=max_chars)
+
+
+def _compose_video_full_text(
+    *,
+    subtitle_text: str,
+    audio_transcript: str,
+    danmaku_sample: Sequence[str],
+    ai_text: str,
+    best_desc: str,
+    fallback_title: str,
+    has_visual: bool,
+    legacy_mode: bool,
+    max_chars: int,
+) -> str:
+    parts: list[str] = []
+    if subtitle_text:
+        parts.append(subtitle_text)
+    elif audio_transcript:
+        parts.append(f"【音频转写】\n{audio_transcript}")
+
+    if danmaku_sample:
+        parts.append("【高能弹幕采样】\n" + "\n".join(danmaku_sample))
+
+    if ai_text:
+        if parts or has_visual:
+            parts.append(f"【B站AI参考提纲（辅助）】\n{ai_text[:1200]}")
+        else:
+            parts.append(ai_text)
+
+    if best_desc:
+        if parts or has_visual:
+            parts.append(f"【视频简介】\n{best_desc[:600]}")
+        else:
+            parts.append(best_desc)
+
+    if not parts:
+        parts.append(fallback_title)
+
+    # Preserve clean legacy formatting when only subtitle or only ai_conclusion exists without extras
+    if legacy_mode and not danmaku_sample and not has_visual:
+        if subtitle_text:
+            return clean_external_text(subtitle_text, max_chars=max_chars)
+        if ai_text:
+            return clean_external_text(ai_text, max_chars=max_chars)
+        return clean_external_text(best_desc or fallback_title, max_chars=max_chars)
+
+    return clean_external_text("\n\n".join(parts), max_chars=max_chars)
 
 
 async def fetch_bilibili_content(
@@ -747,15 +983,27 @@ async def fetch_bilibili_content(
     candidate: Mapping[str, Any],
     *,
     timeout: float = 25.0,
+    shared_cookie: str = "",
+    fallback_cookies: Sequence[str] | None = None,
+    media_options: Mapping[str, Any] | None = None,
+    audio_transcriber: Callable[[str, int], Awaitable[str]] | None = None,
 ) -> dict[str, Any]:
-    """Fetch Stage-2 content for a Bilibili item: AI conclusion -> CC/AI subtitle -> description.
+    """Fetch Stage-2 content for a Bilibili item with subtitle-first priority and dual-channel visuals.
 
-    Never downloads video/audio media streams and never attempts CAPTCHA bypass.
+    - Strictly read-only (strips `bili_jct` from source & fallback cookies).
+    - Subtitle priority: official CC / AI subtitle (with `[mm:ss]`) BEFORE `ai_conclusion`.
+    - Visual acquisition (when `media_options` enables it): short native video / ffmpeg keyframes /
+      videoshot sprite fallback + optional lightweight high-energy danmaku & audio-STT fallback.
+    - Never bypasses CAPTCHA or risk control (-412/-352/-509/-799).
     """
     meta = candidate.get("meta") if isinstance(candidate.get("meta"), Mapping) else {}
     if meta.get("kind") == "dynamic" or (
         not candidate.get("bvid") and candidate.get("full_text")
     ):
+        dyn_bundle = build_empty_media_bundle(
+            watch_mode="dynamic",
+            content_origin="bilibili_dynamic",
+        )
         return {
             "full_text": clean_external_text(
                 candidate.get("full_text") or candidate.get("summary") or "",
@@ -764,6 +1012,7 @@ async def fetch_bilibili_content(
             "content_origin": "bilibili_dynamic",
             "chapter_label": "",
             "total_chapters": None,
+            "media_bundle": dyn_bundle,
         }
 
     bvid = str(candidate.get("bvid") or "").strip()
@@ -774,6 +1023,9 @@ async def fetch_bilibili_content(
         if m:
             bvid = m.group(1)
 
+    fallback_title = clean_inline_field(
+        candidate.get("title") or bvid or "B站视频", max_chars=160
+    )
     fallback_desc = clean_external_text(
         candidate.get("full_text")
         or candidate.get("summary")
@@ -781,24 +1033,50 @@ async def fetch_bilibili_content(
         or "",
         max_chars=4000,
     )
+    legacy_mode = media_options is None
+    eff_opts = normalize_media_options(
+        media_options, default_visual_enabled=(not legacy_mode)
+    )
+    max_text_chars = 4000 if legacy_mode else 6000
+
     if not bvid:
+        empty_bundle = build_empty_media_bundle(
+            watch_mode="unavailable" if not legacy_mode else "metadata_only",
+            content_origin="bilibili_description"
+            if legacy_mode
+            else "bilibili_unavailable_permanent",
+            skip_reason="missing_bvid",
+            is_permanent_unavailable=(not legacy_mode),
+        )
         return {
             "full_text": fallback_desc,
-            "content_origin": "bilibili_description",
+            "content_origin": empty_bundle["content_origin"],
             "chapter_label": "",
             "total_chapters": None,
+            "media_bundle": empty_bundle,
         }
 
     cfg = source.get("config") if isinstance(source.get("config"), Mapping) else {}
-    cred, _, secrets = _build_readonly_credential(cfg)
+    cred, cookie_header, secrets = _build_readonly_credential(
+        cfg, shared_cookie=shared_cookie, fallback_cookies=fallback_cookies
+    )
     v = video.Video(bvid=bvid, credential=cred)
 
     cid = meta.get("cid")
     up_mid = meta.get("up_mid")
+    duration_sec = float(_parse_duration_seconds(meta.get("duration_sec") or meta.get("duration")))
     info_desc = ""
     info_subtitle: Any = None
+    is_paid_or_vip_hint = False
+    info_transient_err = ""
 
-    if not cid or not up_mid or not fallback_desc:
+    need_info = (
+        not cid
+        or not up_mid
+        or not fallback_desc
+        or (eff_opts["visual_enabled"] and duration_sec <= 0)
+    )
+    if need_info:
         try:
             info = await _call_with_timeout(v.get_info(), timeout)
             if isinstance(info, Mapping):
@@ -814,8 +1092,17 @@ async def fetch_bilibili_content(
                             cid = p0.get("cid")
                 if not up_mid and isinstance(info.get("owner"), Mapping):
                     up_mid = info["owner"].get("mid")
+                if duration_sec <= 0:
+                    duration_sec = float(_parse_duration_seconds(info.get("duration")))
                 info_desc = str(info.get("desc") or "").strip()
                 info_subtitle = info.get("subtitle")
+                rights = info.get("rights") if isinstance(info.get("rights"), Mapping) else {}
+                if (
+                    rights.get("pay")
+                    or info.get("is_upower_exclusive")
+                    or info.get("is_upower_preview")
+                ):
+                    is_paid_or_vip_hint = True
         except Exception as exc:
             rc = _classify_bili_exception(exc, secrets)
             if rc is not None:
@@ -824,51 +1111,48 @@ async def fetch_bilibili_content(
                     code=rc.code,
                     cooldown_seconds=rc.cooldown_seconds,
                 ) from None
+            perm_reason = _classify_permanent_unavailable(exc)
+            if perm_reason:
+                perm_bundle = build_empty_media_bundle(
+                    watch_mode="unavailable",
+                    content_origin="bilibili_unavailable_permanent",
+                    duration_sec=int(round(duration_sec)),
+                    skip_reason=perm_reason,
+                    is_permanent_unavailable=True,
+                    error_detail=redact_error_text(exc, secrets),
+                )
+                return {
+                    "full_text": clean_external_text(
+                        fallback_desc or fallback_title, max_chars=max_text_chars
+                    ),
+                    "content_origin": "bilibili_unavailable_permanent",
+                    "chapter_label": "",
+                    "total_chapters": None,
+                    "media_bundle": perm_bundle,
+                }
+            info_transient_err = redact_error_text(exc, secrets)
 
     best_desc = clean_external_text(info_desc or fallback_desc, max_chars=4000)
 
-    # (a) Official AI conclusion (`x/web-interface/view/conclusion/get` via `get_ai_conclusion`)
-    if cid:
-        try:
-            ai_raw = await _call_with_timeout(
-                v.get_ai_conclusion(
-                    cid=int(cid), up_mid=int(up_mid) if up_mid else None
-                ),
-                timeout,
-            )
-            ai_text = _format_ai_conclusion(ai_raw)
-            if ai_text:
-                return {
-                    "full_text": ai_text,
-                    "content_origin": "bilibili_ai_conclusion",
-                    "chapter_label": "",
-                    "total_chapters": None,
-                }
-        except Exception as exc:
-            rc = _classify_bili_exception(exc, secrets)
-            if rc is not None:
-                raise BilibiliRiskControlError(
-                    redact_error_text(rc, secrets),
-                    code=rc.code,
-                    cooldown_seconds=rc.cooldown_seconds,
-                ) from None
-
-    # (b) CC / AI subtitle JSON (`get_subtitle` -> download subtitle body JSON)
+    # (a) Official CC / AI subtitle JSON FIRST (before ai_conclusion) with compact [mm:ss]
+    subtitle_text = ""
+    subtitle_source = ""
+    subtitle_transient_err = ""
     if cid:
         try:
             sub_meta = await _call_with_timeout(v.get_subtitle(cid=int(cid)), timeout)
-            sub_url = _pick_subtitle_url(sub_meta) or _pick_subtitle_url(info_subtitle)
+            sub_url, sub_kind = _pick_subtitle_track(sub_meta)
+            if not sub_url:
+                sub_url, sub_kind = _pick_subtitle_track(info_subtitle)
             if sub_url:
-                sub_text = await _download_subtitle_text(
-                    sub_url, timeout=timeout, secrets=secrets
+                subtitle_text = await _download_subtitle_text(
+                    sub_url,
+                    timeout=timeout,
+                    secrets=secrets,
+                    max_chars=4500 if not legacy_mode else 4000,
                 )
-                if sub_text:
-                    return {
-                        "full_text": sub_text,
-                        "content_origin": "bilibili_subtitle",
-                        "chapter_label": "",
-                        "total_chapters": None,
-                    }
+                if subtitle_text:
+                    subtitle_source = sub_kind or "ai_subtitle"
         except (SSRFBlockedError, BilibiliRiskControlError, AdapterRateLimitError):
             raise
         except Exception as exc:
@@ -879,12 +1163,146 @@ async def fetch_bilibili_content(
                     code=rc.code,
                     cooldown_seconds=rc.cooldown_seconds,
                 ) from None
+            subtitle_transient_err = redact_error_text(exc, secrets)
 
-    # (c) Video description fallback
+    has_subtitle = bool(subtitle_text)
+
+    # (b) Dual-channel visual + optional danmaku + optional audio STT acquisition
+    audio_transcript = ""
+    want_media_pipeline = bool(
+        cid
+        and (
+            eff_opts["visual_enabled"]
+            or eff_opts["danmaku_enabled"]
+            or callable(audio_transcriber)
+        )
+    )
+    if want_media_pipeline:
+        media_bundle = await acquire_video_media(
+            video_obj=v,
+            bvid=bvid,
+            cid=int(cid),
+            duration_sec=duration_sec,
+            has_subtitle=has_subtitle,
+            subtitle_source=subtitle_source,
+            media_options=eff_opts,
+            cookie_header=cookie_header,
+            secrets=secrets,
+            audio_transcriber=audio_transcriber,
+            timeout=max(timeout, 40.0),
+            classify_error=lambda e: _classify_bili_exception(e, secrets),
+        )
+        audio_transcript = str(media_bundle.pop("_audio_transcript", "") or "")
+    else:
+        media_bundle = build_empty_media_bundle(
+            watch_mode="subtitle_only" if has_subtitle else "metadata_only",
+            content_origin="bilibili_subtitle"
+            if has_subtitle
+            else ("bilibili_description" if legacy_mode else "bilibili_metadata_only"),
+            duration_sec=int(round(duration_sec)),
+            has_subtitle=has_subtitle,
+            subtitle_source=subtitle_source,
+            is_transient_error=bool(
+                not has_subtitle and (info_transient_err or subtitle_transient_err)
+            ),
+            skip_reason=(
+                "transient_fetch_error"
+                if (not has_subtitle and (info_transient_err or subtitle_transient_err))
+                else ("" if has_subtitle else "no_subtitle_or_visual")
+            ),
+            error_detail=info_transient_err or subtitle_transient_err,
+        )
+
+    # Promote VIP/paid hint to permanent unavailable if neither visual nor subtitle succeeded
+    if (
+        is_paid_or_vip_hint
+        and not media_bundle["has_visual"]
+        and not has_subtitle
+        and not media_bundle["has_audio_transcript"]
+    ):
+        media_bundle["watch_mode"] = "unavailable"
+        media_bundle["content_origin"] = "bilibili_unavailable_permanent"
+        media_bundle["is_permanent_unavailable"] = True
+        media_bundle["is_transient_error"] = False
+        media_bundle["skip_reason"] = "vip_or_paid"
+
+    # (c) Supplementary official AI conclusion (never replaces subtitles/visuals)
+    ai_text = ""
+    should_fetch_ai = bool(
+        cid
+        and not media_bundle["is_permanent_unavailable"]
+        and not media_bundle["is_transient_error"]
+        and (
+            (legacy_mode and not has_subtitle)
+            or (
+                not legacy_mode
+                and not has_subtitle
+                and media_bundle["has_visual"]
+            )
+            or (not legacy_mode and duration_sec > 600 and media_bundle["has_visual"])
+        )
+    )
+    if should_fetch_ai:
+        try:
+            ai_raw = await _call_with_timeout(
+                v.get_ai_conclusion(
+                    cid=int(cid), up_mid=int(up_mid) if up_mid else None
+                ),
+                timeout,
+            )
+            ai_text = _format_ai_conclusion(ai_raw)
+        except Exception as exc:
+            rc = _classify_bili_exception(exc, secrets)
+            if rc is not None:
+                # Only raise risk control if we have no usable subtitle/visual content yet
+                if not has_subtitle and not media_bundle["has_visual"]:
+                    media_bundle["cleanup"]()
+                    raise BilibiliRiskControlError(
+                        redact_error_text(rc, secrets),
+                        code=rc.code,
+                        cooldown_seconds=rc.cooldown_seconds,
+                    ) from None
+
+    # Resolve final content_origin & watch_mode consistently
+    if media_bundle["has_visual"]:
+        content_origin = str(media_bundle["content_origin"])
+    elif has_subtitle:
+        content_origin = "bilibili_subtitle"
+        media_bundle["watch_mode"] = "subtitle_only"
+        media_bundle["content_origin"] = content_origin
+    elif media_bundle["has_audio_transcript"]:
+        content_origin = "bilibili_audio_transcript"
+        media_bundle["watch_mode"] = "audio_transcript"
+        media_bundle["content_origin"] = content_origin
+    elif media_bundle["is_permanent_unavailable"]:
+        content_origin = "bilibili_unavailable_permanent"
+        media_bundle["watch_mode"] = "unavailable"
+        media_bundle["content_origin"] = content_origin
+    elif legacy_mode:
+        content_origin = "bilibili_ai_conclusion" if ai_text else "bilibili_description"
+        media_bundle["watch_mode"] = "metadata_only"
+        media_bundle["content_origin"] = content_origin
+    else:
+        content_origin = "bilibili_metadata_only"
+        media_bundle["watch_mode"] = "metadata_only"
+        media_bundle["content_origin"] = content_origin
+
+    full_text = _compose_video_full_text(
+        subtitle_text=subtitle_text,
+        audio_transcript=audio_transcript,
+        danmaku_sample=media_bundle.get("danmaku_sample") or (),
+        ai_text=ai_text,
+        best_desc=best_desc,
+        fallback_title=fallback_title,
+        has_visual=bool(media_bundle["has_visual"]),
+        legacy_mode=legacy_mode,
+        max_chars=max_text_chars,
+    )
+
     return {
-        "full_text": best_desc
-        or clean_inline_field(candidate.get("title") or bvid, max_chars=160),
-        "content_origin": "bilibili_description",
+        "full_text": full_text,
+        "content_origin": content_origin,
         "chapter_label": "",
         "total_chapters": None,
+        "media_bundle": media_bundle,
     }

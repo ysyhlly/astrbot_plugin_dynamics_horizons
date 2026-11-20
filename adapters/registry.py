@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
 from .bilibili import (
@@ -147,8 +147,13 @@ async def fetch_item_content(
     candidate: dict[str, Any],
     *,
     timeout: float = 25.0,
+    shared_cookie: str = "",
+    fallback_cookies: Sequence[str] | None = None,
+    media_options: Mapping[str, Any] | None = None,
+    audio_transcriber: Callable[[str, int], Awaitable[str]] | None = None,
+    stt_transcriber: Callable[[str, int], Awaitable[str]] | None = None,
 ) -> dict[str, Any]:
-    """Stage-2 lazy content fetcher returning sanitized `{full_text, content_origin, chapter_label, total_chapters}`."""
+    """Stage-2 lazy content fetcher returning sanitized `{full_text, content_origin, chapter_label, total_chapters, media_bundle}`."""
     if not isinstance(candidate, Mapping):
         raise ValueError("candidate 必须是字典对象")
     src = source if isinstance(source, Mapping) else {}
@@ -161,8 +166,17 @@ async def fetch_item_content(
         raise ValueError(f"不支持的信息源类型：{kind}")
 
     effective_timeout = max(1.0, float(timeout or 25.0))
+    transcriber = audio_transcriber or stt_transcriber
     if kind == "bilibili":
-        raw = await fetch_bilibili_content(src, candidate, timeout=effective_timeout)
+        raw = await fetch_bilibili_content(
+            src,
+            candidate,
+            timeout=effective_timeout,
+            shared_cookie=shared_cookie,
+            fallback_cookies=fallback_cookies,
+            media_options=media_options,
+            audio_transcriber=transcriber,
+        )
     elif kind == "ebook":
         raw = await fetch_ebook_content(src, candidate, timeout=effective_timeout)
     elif kind == "feed":
@@ -177,9 +191,10 @@ async def fetch_item_content(
         except (TypeError, ValueError):
             total_ch = None
 
-    return {
+    max_text_chars = 6000 if (kind == "bilibili" and media_options is not None) else 4000
+    result: dict[str, Any] = {
         "full_text": clean_external_text(
-            raw.get("full_text") or "", max_chars=4000, strip_html=True
+            raw.get("full_text") or "", max_chars=max_text_chars, strip_html=True
         ),
         "content_origin": clean_inline_field(
             raw.get("content_origin") or kind, max_chars=60
@@ -190,6 +205,9 @@ async def fetch_item_content(
         ),
         "total_chapters": total_ch,
     }
+    if "media_bundle" in raw:
+        result["media_bundle"] = raw["media_bundle"]
+    return result
 
 
 __all__ = [

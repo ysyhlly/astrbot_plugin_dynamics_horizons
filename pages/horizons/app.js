@@ -97,6 +97,28 @@ const BOOK_STATUS_ITEMS = [
   ['finished', '读完'],
 ];
 
+const WATCH_MODE_BADGES = {
+  native_video: { label: '原生视频', tone: 'accent' },
+  keyframes_subtitle: { label: '关键帧+字幕', tone: 'info' },
+  keyframes_only: { label: '关键帧', tone: 'info' },
+  videoshot_subtitle: { label: '雪碧图+字幕', tone: '' },
+  videoshot_only: { label: '雪碧图', tone: '' },
+  subtitle_only: { label: '纯字幕', tone: '' },
+  audio_transcript: { label: '音频转写', tone: '' },
+  dynamic: { label: '动态', tone: '' },
+};
+
+const ORIGIN_TO_WATCH_MODE = {
+  bilibili_native_video: 'native_video',
+  bilibili_vision_subtitle: 'keyframes_subtitle',
+  bilibili_vision_frames: 'keyframes_only',
+  bilibili_videoshot_subtitle: 'videoshot_subtitle',
+  bilibili_videoshot: 'videoshot_only',
+  bilibili_subtitle: 'subtitle_only',
+  bilibili_audio_transcript: 'audio_transcript',
+  bilibili_dynamic: 'dynamic',
+};
+
 const state = {
   tab: 'overview',
   identity: '',
@@ -715,6 +737,80 @@ function formatCitationText(citation, fallbackKind) {
   return parts.length ? parts.join(' · ') : (KIND_LABELS[fallbackKind] || '外部读物');
 }
 
+function formatDurationLabel(sec) {
+  const total = Math.floor(Number(sec) || 0);
+  if (total <= 0) return '';
+  const mins = Math.floor(total / 60);
+  const rem = total % 60;
+  return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+}
+
+function resolveMediaMeta(item) {
+  if (item?.media_meta && typeof item.media_meta === 'object') return item.media_meta;
+  if (item?.evidence?.media_meta && typeof item.evidence.media_meta === 'object') return item.evidence.media_meta;
+  return {};
+}
+
+function buildWatchBadges(item) {
+  const meta = resolveMediaMeta(item);
+  const rawMode = String(item?.watch_mode || meta.watch_mode || '').trim();
+  const rawOrigin = String(item?.content_origin || meta.content_origin || item?.evidence?.content_origin || '').trim();
+  const mode = rawMode || ORIGIN_TO_WATCH_MODE[rawOrigin] || '';
+  const badges = [];
+  const spec = WATCH_MODE_BADGES[mode];
+  if (spec) {
+    const cls = spec.tone ? `pill ${spec.tone} watch-badge` : 'pill watch-badge';
+    const badge = el('span', cls, spec.label);
+    const tips = [];
+    const frames = Number(meta.frame_count) || 0;
+    if (frames > 0) tips.push(`${frames} 帧`);
+    const dur = formatDurationLabel(meta.duration_sec);
+    if (dur) tips.push(`时长 ${dur}`);
+    if (meta.provider_id) tips.push(`模型 ${String(meta.provider_id)}`);
+    if (tips.length) badge.title = tips.join(' · ');
+    badges.push(badge);
+  }
+  if (meta.has_danmaku === true) {
+    badges.push(el('span', 'pill warn watch-badge', '含高能弹幕'));
+  }
+  return badges;
+}
+
+function extractVisualObservations(item) {
+  const raw = Array.isArray(item?.visual_observations)
+    ? item.visual_observations
+    : (Array.isArray(item?.evidence?.visual_observations) ? item.evidence.visual_observations : []);
+  const out = [];
+  for (const entry of raw) {
+    const text = typeof entry === 'string' ? entry.trim() : (entry == null ? '' : String(entry).trim());
+    if (text) out.push(text);
+  }
+  return out;
+}
+
+function buildVisualObservationsBlock(item) {
+  const observations = extractVisualObservations(item);
+  if (!observations.length) return null;
+  const meta = resolveMediaMeta(item);
+  const box = el('details', 'visual-obs-box');
+  box.open = true;
+  const summary = el('summary', 'visual-obs-summary');
+  summary.append(
+    el('span', 'visual-obs-title', '画面观察'),
+    el('span', 'pill info watch-badge', `${observations.length} 条`),
+  );
+  const frames = Number(meta.frame_count) || 0;
+  if (frames > 0) {
+    summary.append(el('span', 'visual-obs-meta', `${frames} 帧采样`));
+  }
+  const list = el('ul', 'visual-obs-list');
+  for (const obs of observations) {
+    list.append(el('li', 'visual-obs-item', obs));
+  }
+  box.append(summary, list);
+  return box;
+}
+
 function renderLogs() {
   const { items, page, total, page_size, source_kind } = state.logs;
   for (const btn of $$('#logs-filter-group [data-log-kind]')) {
@@ -734,6 +830,7 @@ function renderLogs() {
         left.append(
           el('span', 'pill accent', KIND_LABELS[item.source_kind] || item.source_kind || '见闻'),
           el('span', 'citation-badge', formatCitationText(item.citation, item.source_kind)),
+          ...buildWatchBadges(item),
         );
 
         const right = el('div', 'item-meta');
@@ -761,6 +858,8 @@ function renderLogs() {
         dual.append(digestPane, reflectionPane);
 
         card.append(head, dual);
+        const visualObs = buildVisualObservationsBlock(item);
+        if (visualObs) card.append(visualObs);
         const discussionNotes = (item.discussion_reflections || []).slice(0, 5);
         if (discussionNotes.length) {
           const notesPane = el('div', 'log-pane reflection');
@@ -822,7 +921,10 @@ function renderReviews() {
 
         const st = item.state || 'pending_review';
         const stTone = st === 'approved' ? 'accent' : st === 'rejected' ? 'danger' : 'warn';
-        titleGroup.append(el('span', `pill ${stTone}`, PROPOSAL_STATE_LABELS[st] || st));
+        titleGroup.append(
+          el('span', `pill ${stTone}`, PROPOSAL_STATE_LABELS[st] || st),
+          ...buildWatchBadges(item),
+        );
 
         const actions = el('div', 'item-actions');
         const target = {
@@ -865,7 +967,7 @@ function renderReviews() {
         card.append(head);
         const evidence = el('details','log-pane');
         evidence.append(el('summary','','阅读证据与审核历史'));
-        evidence.append(el('p','',`内容来源：${item.evidence?.content_origin || '旧记录，原文未留档'} · 抓取：${formatTime(item.evidence?.fetched_at)}`));
+        evidence.append(el('p','',`内容来源：${item.evidence?.content_origin || item.content_origin || '旧记录，原文未留档'} · 抓取：${formatTime(item.evidence?.fetched_at)}`));
         evidence.append(el('p','item-body',item.evidence?.text || '没有可核验的原文快照'));
         for (const [key,label] of [['summary','累计摘要'],['characters','人物关系'],['open_questions','未解问题']]) if (item.continuity?.proposed?.[key]) evidence.append(el('p','item-body',`${label}：${item.continuity.proposed[key]}`));
         for (const entry of item.audit || []) evidence.append(el('p','item-meta',`${formatTime(entry.created_at)} ${entry.actor}：${entry.from_state} → ${entry.to_state} ${entry.reason}`));
@@ -897,6 +999,9 @@ function renderReviews() {
         rPane.append(el('span', 'log-pane-label', msg('角色随感')), el('p', '', item.reflection || '—'));
         dual.append(dPane, rPane);
         card.append(dual);
+
+        const visualObs = buildVisualObservationsBlock(item);
+        if (visualObs) card.append(visualObs);
 
         const metaLines = el('div', 'item-meta');
         if (item.staged_interest) {
@@ -1444,6 +1549,22 @@ function renderHealth(h) {
   const d=h.diagnostics || {};
   box.append(el('p','',msg('今日模型调用 {0}/{1} · 已归档候选 {2} · 存储 {3} MB',d.model_calls_today||0,h.model_call_quota,d.archived_candidates||0,(Number(d.storage_bytes||0)/1048576).toFixed(1))));
   box.append(el('p','',msg('分析：{0}；审查：{1}',h.analysis_provider||msg('未配置'),h.review_provider||msg('未配置'))));
+  if ('video_provider' in h || 'video_provider_explicit' in h || 'video_provider_fallback' in h) {
+    const explicit = String(h.video_provider_explicit || '').trim();
+    const effective = String(h.video_provider || '').trim();
+    const isFallback = h.video_provider_fallback === true || (!explicit && h.video_provider_fallback !== false);
+    let videoLabel;
+    if (explicit) {
+      videoLabel = explicit;
+    } else if (effective) {
+      videoLabel = isFallback ? `${effective}（未单独配置，回退分析模型）` : effective;
+    } else {
+      videoLabel = '未配置（回退分析模型）';
+    }
+    const stt = String(h.video_audio_stt_provider || '').trim();
+    const lineText = stt ? `视频精读：${videoLabel}；音频转写：${stt}` : `视频精读：${videoLabel}`;
+    box.append(el('p', 'health-meta-line', lineText));
+  }
   if(h.review_context_policy==='independent_calls') box.append(el('p','',msg('审查采用独立调用，不继承分析对话的历史上下文。')));
   box.append(el('p','',msg('下次采集：{0}；下次阅读检查：{1}',formatTime(h.next_poll_at),formatTime(h.next_digest_at))));
   const sharingScope = {

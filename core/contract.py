@@ -17,6 +17,18 @@ SOURCE_KINDS = ("bilibili", "ebook", "feed", "manual")
 REVIEW_MODES = ("llm", "llm_then_human", "human")
 PROPOSAL_STATES = ("pending_review", "approved", "rejected", "held", "revoked")
 BOOK_STATUSES = ("reading", "finished", "dropped")
+WATCH_MODES = (
+    "native_video",
+    "keyframes_subtitle",
+    "keyframes_only",
+    "videoshot_subtitle",
+    "videoshot_only",
+    "subtitle_only",
+    "audio_transcript",
+    "dynamic",
+    "unavailable",
+    "metadata_only",
+)
 INTENT_STATUSES = (
     "pending",
     "claimed",
@@ -39,6 +51,37 @@ PERSONALITY_REDLINE = (
     "只能形成阶段性的阅读记录与带衰减的暂存兴趣，严禁改写角色核心性格，"
     "严禁把外部网帖传闻伪造为角色亲身现实经历或群友事实，严禁输出裸HTTP/HTTPS链接或广告引流。"
 )
+
+
+def sanitize_readonly_bilibili_cookie(
+    raw_cookie: str, raw_sessdata: str = ""
+) -> str:
+    """Return a strictly read-only Bilibili cookie string with write/CSRF fields stripped."""
+    parts: dict[str, str] = {}
+    raw = str(raw_cookie or "").strip()
+    if raw and not (raw == "[REDACTED]" or all(ch in {"*", "•"} for ch in raw)):
+        if "=" in raw:
+            for seg in raw.split(";"):
+                piece = seg.strip()
+                if not piece or "=" not in piece:
+                    continue
+                k, v = piece.split("=", 1)
+                key = k.strip()
+                val = v.strip()
+                if not key or not val:
+                    continue
+                if key.lower() in {"bili_jct", "csrf", "csrf_token"}:
+                    continue
+                parts[key] = val
+        else:
+            parts["SESSDATA"] = raw
+    sess = str(raw_sessdata or "").strip()
+    if sess and not (sess == "[REDACTED]" or all(ch in {"*", "•"} for ch in sess)):
+        parts["SESSDATA"] = sess
+    for forbidden in list(parts):
+        if forbidden.lower() in {"bili_jct", "csrf", "csrf_token"}:
+            parts.pop(forbidden, None)
+    return "; ".join(f"{k}={v}" for k, v in parts.items())
 
 
 def encode_json(value) -> str:

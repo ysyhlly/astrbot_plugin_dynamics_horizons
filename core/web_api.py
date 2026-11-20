@@ -121,6 +121,23 @@ def _coerce_int(val: Any, default: int, low: int = 1, high: int = 10000) -> int:
     return max(low, min(high, parsed))
 
 
+def _normalize_media_fields(item: dict[str, Any]) -> dict[str, Any]:
+    out = dict(item)
+    meta = out.get("media_meta") if isinstance(out.get("media_meta"), dict) else {}
+    obs = (
+        [str(x) for x in out.get("visual_observations") if isinstance(x, str) and x.strip()]
+        if isinstance(out.get("visual_observations"), list)
+        else []
+    )
+    out["watch_mode"] = str(out.get("watch_mode") or meta.get("watch_mode") or "")
+    out["content_origin"] = str(
+        out.get("content_origin") or meta.get("content_origin") or ""
+    )
+    out["visual_observations"] = obs[:8]
+    out["media_meta"] = meta
+    return out
+
+
 class HorizonsWebAPI:
     """Registers and serves `/astrbot_plugin_dynamics_horizons/*` endpoints."""
 
@@ -749,7 +766,8 @@ class HorizonsWebAPI:
                 page=page,
                 page_size=20,
             )
-            return {"identity": active_identity, **result}
+            items = [_normalize_media_fields(it) for it in result.get("items") or []]
+            return {"identity": active_identity, **result, "items": items}
 
         return await self._serve(op)
 
@@ -773,9 +791,10 @@ class HorizonsWebAPI:
                 page_size=20,
             )
             blocked = await run_io(eng.store.list_blocked_topics, filter_id)
+            items = [_normalize_media_fields(it) for it in result.get("items") or []]
             return {
                 "identity": active_identity,
-                "items": result["items"],
+                "items": items,
                 "blocked_topics": blocked,
                 "page": result["page"],
                 "page_size": result["page_size"],

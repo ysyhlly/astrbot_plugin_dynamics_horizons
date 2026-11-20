@@ -3,13 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 from .contract import chat_umo_kind, make_identity
 from .io import run_io
 
 
+def _caller_accepts_media_payload(fn) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "media_payload":
+            return True
+    return False
+
+
 class EngineLifecycle:
-    async def call_model(self, role, instruction, payload, *, identity, lane="reading"):
+    async def call_model(
+        self,
+        role,
+        instruction,
+        payload,
+        *,
+        identity,
+        lane="reading",
+        media_payload=None,
+    ):
         cid = await run_io(
             self.store.reserve_call,
             identity,
@@ -19,7 +40,14 @@ class EngineLifecycle:
             lane=lane,
         )
         try:
-            value = await self.model_caller(role, instruction, payload)
+            if media_payload is not None and _caller_accepts_media_payload(
+                self.model_caller
+            ):
+                value = await self.model_caller(
+                    role, instruction, payload, media_payload=media_payload
+                )
+            else:
+                value = await self.model_caller(role, instruction, payload)
             if not isinstance(value, dict):
                 raise ValueError("model_output_not_object")
         except BaseException:
@@ -38,6 +66,7 @@ class EngineLifecycle:
         return (
             self.config.get("enabled", True),
             self._provider_id("analysis_provider"),
+            self._provider_id("video_provider"),
             self._provider_id("review_provider"),
             self.config.get("review_mode", "llm"),
             bool(self.config.get("allow_same_provider_for_review", False)),
@@ -172,6 +201,12 @@ class EngineLifecycle:
         if not self.config.get("enabled", True):
             reasons.append("disabled")
         analysis_provider = self._provider_id("analysis_provider")
+        video_provider_explicit = str(self.config.get("video_provider", "") or "").strip()
+        video_provider = self._provider_id("video_provider")
+        video_provider_fallback = bool(not video_provider_explicit and video_provider)
+        video_audio_stt_provider = str(
+            self.config.get("video_audio_stt_provider", "") or ""
+        ).strip()
         review_provider = self._provider_id("review_provider")
         if not analysis_provider:
             reasons.append("analysis_provider_missing")
@@ -201,8 +236,12 @@ class EngineLifecycle:
         return {
             "blockers": reasons,
             "last_error": self.last_error,
-            "analysis_provider": self._provider_id("analysis_provider"),
-            "review_provider": self._provider_id("review_provider"),
+            "analysis_provider": analysis_provider,
+            "video_provider": video_provider,
+            "video_provider_explicit": video_provider_explicit,
+            "video_provider_fallback": video_provider_fallback,
+            "video_audio_stt_provider": video_audio_stt_provider,
+            "review_provider": review_provider,
             "review_context_policy": (
                 "merged_self_review"
                 if (
