@@ -1,6 +1,6 @@
 # 群间见闻 · Dynamics Horizons (`astrbot_plugin_dynamics_horizons`)
 
-> 发布候选：`v0.2.0-rc.4`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+> 发布候选：`v0.2.0-rc.5`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
 
 群间系列伴生插件，负责**角色隔离的外部信息源订阅、连载书架管理、空闲清醒窗口自主挑拣精读，以及双模型独立审查**。
 

@@ -1,4 +1,9 @@
-# astrbot_plugin_dynamics_horizons v0.2.0-rc.3
+# astrbot_plugin_dynamics_horizons v0.2.0-rc.5
+
+## v0.2.0-rc.5 — 2026-11-20
+
+- 优化摘要与审查链路（DH-1）：合并摘要阶段、精简审查载荷，并允许同服务商自审。
+- 新增 B 站视频多模态视觉感知管线（`adapters/video_media.py`）与对应配置项及控制台面板展示。
 
 ## v0.2.0-rc.4
 
