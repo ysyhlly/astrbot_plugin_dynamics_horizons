@@ -18,7 +18,7 @@
   </script>
   <title data-series-text="群间见闻 · Dynamics Horizons">群间见闻 · Dynamics Horizons</title>
   <link rel="stylesheet" href="./series-ui.css?v=round2.1">
-  <link rel="stylesheet" href="./styles.css?v=0.2.0">
+  <link rel="stylesheet" href="./styles.css?v=2.0.0">
   <script type="module" src="./series-panels.js?v=round2.1"></script>
 </head>
 <body>
@@ -29,19 +29,19 @@
       <a class="series-brand" href="#workspace"><span class="series-mark" aria-hidden="true">DH</span><span data-series-text="群间见闻">群间见闻</span></a>
       <nav class="side-nav series-tabs" role="tablist" aria-label="见闻工作区导航" data-series-aria-label="见闻工作区导航">
         <button id="tab-overview" type="button" role="tab" data-tab="overview" aria-controls="panel-overview" aria-selected="true" class="selected">
-          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true">◈</span><span data-series-text="总览与兴趣池">总览与兴趣池</span></span>
+          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg></span><span data-series-text="总览与兴趣池">总览与兴趣池</span></span>
           <span id="badge-overview" class="nav-count" hidden>0</span>
         </button>
         <button id="tab-sources" type="button" role="tab" data-tab="sources" aria-controls="panel-sources" aria-selected="false">
-          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true">▤</span><span data-series-text="信息源与书架">信息源与书架</span></span>
+          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span><span data-series-text="信息源与书架">信息源与书架</span></span>
           <span id="badge-sources" class="nav-count" hidden>0</span>
         </button>
         <button id="tab-logs" type="button" role="tab" data-tab="logs" aria-controls="panel-logs" aria-selected="false">
-          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true">✎</span><span data-series-text="阅读手账">阅读手账</span></span>
+          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></span><span data-series-text="阅读手账">阅读手账</span></span>
           <span id="badge-logs" class="nav-count" hidden>0</span>
         </button>
         <button id="tab-reviews" type="button" role="tab" data-tab="reviews" aria-controls="panel-reviews" aria-selected="false">
-          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true">✓</span><span data-series-text="审查与黑名单">审查与黑名单</span></span>
+          <span class="nav-label-wrap"><span class="nav-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span><span data-series-text="审查与黑名单">审查与黑名单</span></span>
           <span id="badge-reviews" class="nav-count" hidden>0</span>
         </button>
       </nav>
@@ -55,15 +55,22 @@
 
     <div class="workspace-shell">
       <main id="workspace" tabindex="-1">
-        <header class="topbar series-heading">
-          <div>
+        <header class="topbar series-heading hz-heading-compact">
+          <div class="hz-title-block">
             <span class="eyebrow">CHAT DYNAMICS / HORIZONS</span>
-            <h1 data-series-text="群间见闻">群间见闻</h1>
-            <p data-series-text="按角色隔离外部信息输入与连载书架，经双模型审查沉淀暂存兴趣与待聊话题。">按角色隔离外部信息输入与连载书架，经双模型审查沉淀暂存兴趣与待聊话题。</p>
+            <div class="hz-title-row">
+              <h1 data-series-text="群间见闻">群间见闻</h1>
+              <details class="info-popover">
+                <summary class="info-trigger" aria-label="查看群间见闻运行边界说明" title="查看说明">i</summary>
+                <div class="info-popover-body">
+                  <p data-series-text="按角色隔离外部信息输入与连载书架，经双模型审查沉淀暂存兴趣与待聊话题。">按角色隔离外部信息输入与连载书架，经双模型审查沉淀暂存兴趣与待聊话题。</p>
+                  <p class="info-popover-note" data-series-text="核心性格固定 · 外部媒介只读沙箱">核心性格固定 · 外部媒介只读沙箱</p>
+                </div>
+              </details>
+            </div>
           </div>
           <div class="topbar-tools">
-            <span class="identity-note" data-series-text="核心性格固定 · 外部媒介只读沙箱">核心性格固定 · 外部媒介只读沙箱</span>
-            <button id="btn-refresh" type="button" class="wb-button" data-series-text="刷新数据">刷新数据</button>
+            <button id="btn-refresh" type="button" class="wb-button hz-refresh-btn" data-series-text="刷新数据">刷新数据</button>
           </div>
         </header>
 
@@ -87,9 +94,14 @@
         <!-- Tab 1: Overview & Interests -->
         <section id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
           <div class="view-header">
-            <div>
+            <div class="view-title-wrap">
               <h2 data-series-text="总览与兴趣池">总览与兴趣池</h2>
-              <p data-series-text="空闲清醒时段自动挑拣精读；暂存兴趣带自然半衰期，待聊问题按群独立核销。">空闲清醒时段自动挑拣精读；暂存兴趣带自然半衰期，待聊问题按群独立核销。</p>
+              <details class="info-popover">
+                <summary class="info-trigger" aria-label="查看总览与兴趣池说明" title="查看说明">i</summary>
+                <div class="info-popover-body">
+                  <p data-series-text="空闲清醒时段自动挑拣精读；暂存兴趣带自然半衰期，待聊问题按群独立核销。">空闲清醒时段自动挑拣精读；暂存兴趣带自然半衰期，待聊问题按群独立核销。</p>
+                </div>
+              </details>
             </div>
             <div class="view-actions">
               <button id="btn-trigger-digest" type="button" class="wb-button primary" data-series-text="立即触发一次挑拣阅读">立即触发一次挑拣阅读</button>
@@ -98,33 +110,46 @@
 
           <div id="kpi-grid" class="kpi-grid" aria-label="见闻运行指标" data-series-aria-label="见闻运行指标"></div>
 
-          <section id="health-panel" class="panel-card" aria-label="运行状态与恢复" data-series-aria-label="运行状态与恢复"></section>
-          <section id="archive-panel" class="panel-card" aria-label="候选与归档" data-series-aria-label="候选与归档"></section>
+          <section id="health-panel" class="panel-card health-card-compact" aria-label="运行状态与恢复" data-series-aria-label="运行状态与恢复"></section>
+
           <div class="overview-columns">
             <section class="panel-card" aria-labelledby="heading-interests">
               <div class="panel-card-head">
-                <h3 id="heading-interests" data-series-text="活跃暂存兴趣">活跃暂存兴趣</h3>
-                <span id="interests-count-pill" class="pill accent">0</span>
+                <div class="panel-head-title">
+                  <h3 id="heading-interests" data-series-text="活跃暂存兴趣">活跃暂存兴趣</h3>
+                  <span class="panel-head-sub" data-series-text="自然半衰期 · 不改核心人设">自然半衰期 · 不改核心人设</span>
+                </div>
+                <span id="interests-count-pill" class="pill warm">0</span>
               </div>
               <div id="interests-list" class="stack-list"></div>
             </section>
 
             <section class="panel-card" aria-labelledby="heading-questions">
               <div class="panel-card-head">
-                <h3 id="heading-questions" data-series-text="待讨论问题">待讨论问题</h3>
+                <div class="panel-head-title">
+                  <h3 id="heading-questions" data-series-text="待讨论问题">待讨论问题</h3>
+                  <span class="panel-head-sub" data-series-text="按群独立核销">按群独立核销</span>
+                </div>
                 <span id="questions-count-pill" class="pill info">0</span>
               </div>
               <div id="questions-list" class="stack-list"></div>
             </section>
           </div>
+
+          <section id="archive-panel" class="panel-card archive-card-compact" aria-label="候选与归档" data-series-aria-label="候选与归档"></section>
         </section>
 
         <!-- Tab 2: Sources & Bookshelf -->
         <section id="panel-sources" role="tabpanel" aria-labelledby="tab-sources" hidden>
           <div class="view-header">
-            <div>
+            <div class="view-title-wrap">
               <h2 data-series-text="信息源与书架">信息源与书架</h2>
-              <p data-series-text="每个信息源严格绑定当前角色实例，防止跨设定串台；外部凭据掩码保存。">每个信息源严格绑定当前角色实例，防止跨设定串台；外部凭据掩码保存。</p>
+              <details class="info-popover">
+                <summary class="info-trigger" aria-label="查看信息源与书架说明" title="查看说明">i</summary>
+                <div class="info-popover-body">
+                  <p data-series-text="每个信息源严格绑定当前角色实例，防止跨设定串台；外部凭据掩码保存。">每个信息源严格绑定当前角色实例，防止跨设定串台；外部凭据掩码保存。</p>
+                </div>
+              </details>
             </div>
             <div class="view-actions">
               <button id="btn-open-source-drawer" type="button" class="wb-button primary" data-series-text="＋ 添加信息源">＋ 添加信息源</button>
@@ -153,9 +178,14 @@
         <!-- Tab 3: Reading Journal (Logs) -->
         <section id="panel-logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
           <div class="view-header">
-            <div>
+            <div class="view-title-wrap">
               <h2 data-series-text="阅读手账">阅读手账</h2>
-              <p data-series-text="区分客观核对摘要与角色第一人称随感；原始外链仅管理台留档，绝不发往群聊。">区分客观核对摘要与角色第一人称随感；原始外链仅管理台留档，绝不发往群聊。</p>
+              <details class="info-popover">
+                <summary class="info-trigger" aria-label="查看阅读手账说明" title="查看说明">i</summary>
+                <div class="info-popover-body">
+                  <p data-series-text="区分客观核对摘要与角色第一人称随感；原始外链仅管理台留档，绝不发往群聊。">区分客观核对摘要与角色第一人称随感；原始外链仅管理台留档，绝不发往群聊。</p>
+                </div>
+              </details>
             </div>
             <div id="logs-filter-group" class="segmented-group" role="group" aria-label="阅读手账来源筛选" data-series-aria-label="阅读手账来源筛选">
               <button type="button" data-log-kind="" aria-pressed="true" data-series-text="全部">全部</button>
@@ -178,9 +208,14 @@
         <!-- Tab 4: Reviews & Topic Blocklist -->
         <section id="panel-reviews" role="tabpanel" aria-labelledby="tab-reviews" hidden>
           <div class="view-header">
-            <div>
+            <div class="view-title-wrap">
               <h2 data-series-text="审查与黑名单">审查与黑名单</h2>
-              <p data-series-text="双模型独立核验人格一致性、防注入与外部媒介事实边界；支持人工裁决与话题屏蔽。">双模型独立核验人格一致性、防注入与外部媒介事实边界；支持人工裁决与话题屏蔽。</p>
+              <details class="info-popover">
+                <summary class="info-trigger" aria-label="查看审查与黑名单说明" title="查看说明">i</summary>
+                <div class="info-popover-body">
+                  <p data-series-text="双模型独立核验人格一致性、防注入与外部媒介事实边界；支持人工裁决与话题屏蔽。">双模型独立核验人格一致性、防注入与外部媒介事实边界；支持人工裁决与话题屏蔽。</p>
+                </div>
+              </details>
             </div>
             <div id="reviews-filter-group" class="segmented-group" role="group" aria-label="审查状态筛选" data-series-aria-label="审查状态筛选">
               <button type="button" data-review-state="pending_review" aria-pressed="true" data-series-text="待审">待审</button>
@@ -407,6 +442,6 @@
     <p id="book-modal-feedback" data-ui-state="info" role="status"></p>
   </dialog>
 
-  <script type="module" src="./app.js?v=round2.4"></script>
+  <script type="module" src="./app.js?v=2.0.0"></script>
 </body>
 </html>

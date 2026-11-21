@@ -542,31 +542,44 @@ def test_series_presence_and_safe_navigation(server, width):
         page.goto(server)
 
         panel = page.locator("#dynamics-series-panel")
-        panel.get_by_role("button").filter(has_text="对话主控").wait_for()
-        assert panel.get_by_role("button").filter(has_text="群间见闻").is_disabled()
-        assert panel.get_by_role("button").filter(has_text="群间记忆").is_disabled()
-        assert panel.get_by_role("button").filter(has_text="群间游戏").is_enabled()
+        panel.get_by_role("button").filter(has_text="返回群间小屋").wait_for()
         assert panel.get_by_role("button").filter(has_text="返回群间小屋").is_enabled()
+
+        def ensure_matrix_open():
+            trigger = panel.locator(".sp-matrix-trigger")
+            if trigger.count() > 0:
+                popover = page.locator("#sp-matrix-popover")
+                if popover.count() == 0 or not popover.is_visible():
+                    trigger.first.click()
+                    popover.wait_for(state="visible")
+                return popover
+            return panel
+
+        target_box = ensure_matrix_open()
+        target_box.get_by_role("button").filter(has_text="对话主控").wait_for()
+        assert target_box.get_by_role("button").filter(has_text="群间见闻").is_disabled()
+        assert target_box.get_by_role("button").filter(has_text="群间记忆").is_disabled()
+        assert target_box.get_by_role("button").filter(has_text="群间游戏").is_enabled()
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
         )
 
         page.evaluate("window.ChatDynamicsBeforeNavigate = async () => false")
-        panel.get_by_role("button").filter(has_text="对话主控").click()
+        ensure_matrix_open().get_by_role("button").filter(has_text="对话主控").click()
         assert page.evaluate("window.__nav.length") == 0
 
         page.evaluate("window.ChatDynamicsBeforeNavigate = async () => true")
-        panel.get_by_role("button").filter(has_text="对话主控").click()
+        ensure_matrix_open().get_by_role("button").filter(has_text="对话主控").click()
         assert page.evaluate("window.__nav[0].slice(0, 2)") == [
             "astrbot_plugin_chat_dynamics",
             "app",
         ]
 
         page.evaluate("delete window.AstrBotPluginPage.navigateToPlugin")
-        panel.get_by_role("button").filter(has_text="对话主控").click()
+        ensure_matrix_open().get_by_role("button").filter(has_text="对话主控").click()
         assert "请更新入口和目标群间插件后重试" in panel.inner_text()
         page.evaluate("window.DynamicsWorkspace={open:async(id,view)=>window.__nav.push([id,view])}")
-        panel.get_by_role("button").filter(has_text="对话主控").click()
+        ensure_matrix_open().get_by_role("button").filter(has_text="对话主控").click()
         assert page.evaluate("window.__nav[1]") == ["astrbot_plugin_chat_dynamics", "app"]
         assert not page_errors and not console_errors
         browser.close()
@@ -600,10 +613,14 @@ def test_theme_language_and_zero_overflow_all_tabs(server, width, theme):
         page.goto(server + ("?ui=night" if theme == "dark" else "?ui=day"))
         page.get_by_text("古建筑木构榫卯").first.wait_for()
 
-        expected_bg = "rgb(11, 20, 25)" if theme == "dark" else "rgb(245, 246, 244)"
+        expected_bgs = (
+            {"rgb(11, 20, 25)", "rgb(12, 20, 18)"}
+            if theme == "dark"
+            else {"rgb(245, 246, 244)", "rgb(243, 244, 239)"}
+        )
         assert (
             page.evaluate("getComputedStyle(document.body).backgroundColor")
-            == expected_bg
+            in expected_bgs
         )
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"
@@ -910,5 +927,85 @@ def test_reviews_verdict_actions_and_topic_blocklist(server):
             "window.__calls.some(c => c.route === 'reviews' && c.body?.op === 'unblock_topic' && c.body?.topic === '博彩广告')"
         )
 
+        assert not page_errors and not console_errors
+        browser.close()
+
+
+def test_v2_health_disclosure_half_life_bars_journal_chips_and_cmdk_deeplink(server):
+    mock = make_mock_state()
+    id_a = '["rin","rin-main"]'
+    mock["overviews"][id_a]["health"] = {
+        "blockers": [],
+        "last_error": "",
+        "analysis_provider": "openai/gpt-4.1",
+        "review_provider": "anthropic/claude-haiku",
+        "review_context_policy": "distinct_providers",
+        "model_call_quota": 50,
+        "storage_warning_mb": 512,
+        "proactive_scope": "all_managed_groups",
+        "next_poll_at": 1763034000,
+        "next_digest_at": 1763035000,
+        "diagnostics": {
+            "model_calls_today": 9,
+            "archived_candidates": 4,
+            "storage_bytes": 1677721,
+            "review_jobs": [],
+            "world_pending": [],
+            "corrections": [],
+        },
+    }
+    mock["logs"][0]["questions"] = [
+        {
+            "question_id": "q-1",
+            "topic": "古建筑木构榫卯",
+            "question": "你们去老街古建的时候，会抬头看屋檐底下的斗拱吗？",
+        }
+    ]
+    with playwright.sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1280, "height": 1000})
+        page_errors, console_errors = attach_error_guards(page)
+        page.add_init_script(
+            f"window.__mock = {json.dumps(mock, ensure_ascii=False)};\n"
+            + BRIDGE_INIT_SCRIPT
+        )
+        page.goto(server)
+
+        page.get_by_text("古建筑木构榫卯").first.wait_for()
+
+        # 1. Compact health summary chip & collapsible diagnostics disclosure
+        health_det = page.locator("#health-panel details.health-disclosure")
+        assert health_det.count() == 1
+        assert health_det.get_attribute("open") is None
+        assert "今日模型 9/50" in page.locator("#health-panel").inner_text()
+        health_det.locator("summary").click()
+        assert health_det.get_attribute("open") is not None
+        assert "openai/gpt-4.1" in page.locator("#health-panel").inner_text()
+
+        # 2. Visual half-life decay progress bar on active interest cards
+        decay_bar = page.locator("#interests-list .decay-track[role='progressbar']").first
+        assert decay_bar.get_attribute("aria-valuenow") == "82"
+        assert page.locator("#interests-list .decay-fill.is-hot").count() == 1
+
+        # 3. Compact (i) info popover opens and closes on Escape
+        pop = page.locator("#panel-overview .info-popover").first
+        pop.locator("summary").click()
+        assert pop.get_attribute("open") is not None
+        page.keyboard.press("Escape")
+        assert pop.get_attribute("open") is None
+
+        # 4. Ctrl+K same-plugin deep-link switches to Reading Journal & renders left-accent card + question chip
+        page.evaluate(
+            "window.dispatchEvent(new CustomEvent('dynamics-cmdk-deeplink', { detail: { deep_link: { tab: 'logs', log_id: 'log-1' } } }))"
+        )
+        page.locator("#panel-logs").wait_for(state="visible")
+        page.locator("#logs-list .journal-card.kind-bilibili").first.wait_for()
+        q_chip = page.locator("#logs-list .question-chip").first
+        assert "待聊：" in q_chip.inner_text()
+        assert "屋檐底下的斗拱" in q_chip.inner_text()
+
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        )
         assert not page_errors and not console_errors
         browser.close()

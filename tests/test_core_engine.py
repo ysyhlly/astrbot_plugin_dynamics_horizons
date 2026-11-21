@@ -251,7 +251,7 @@ def test_series_panels_catalog_contains_horizons(tmp_path: Path):
     )
     assert by_id.get("astrbot_plugin_group_chronicle") == (
         "astrbot_plugin_group_chronicle",
-        "群史记",
+        "群文化沿革",
         "culture",
         "收录有价值的结果与群史传记",
     )

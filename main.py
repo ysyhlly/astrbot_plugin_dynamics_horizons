@@ -18,8 +18,10 @@ ensure_current(
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,8 +32,12 @@ from .core.contract import (
     PLUGIN_ID,
     PLUGIN_VERSION,
     SCHEMA_VERSION,
+    SHANGHAI_TZ,
     decode_model_object,
     encode_json,
+    normalize_identity,
+    shanghai_day_bounds,
+    unpack_identity,
 )
 from .core.engine import HorizonsEngine
 from .core.io import run_io
@@ -267,6 +273,32 @@ def _filter_image_urls(urls: Any) -> list[str]:
     return out
 
 
+def build_cache_anchor_contexts(
+    instruction: str | None,
+    *,
+    task: str = "dynamics_horizons",
+) -> list[dict[str, str]]:
+    """Build a tiny deterministic 2-message static anchor keyed only on system_prompt hash."""
+    text = str(instruction or "")
+    if not text.strip():
+        return []
+    sha12 = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return [
+        {"role": "user", "content": f"[cache_anchor task={task} prefix={sha12}]"},
+        {"role": "assistant", "content": "OK"},
+    ]
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return False
+    return name in parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+
+
 class Main(Star):
     """Dynamics Horizons (群间见闻): isolated external reading, dual-LLM review, zero-I/O chat projection."""
 
@@ -384,6 +416,308 @@ class Main(Star):
                 "video_vision_v1",
             ],
         }
+
+    # ------------------------------------------------------------------
+    # Series v2.0 Cross-Plugin Read-Only Hooks (Sync, Standalone-Safe)
+    # ------------------------------------------------------------------
+
+    def _resolve_scope_identity_readonly(
+        self, *, persona: str = "", scope: str = ""
+    ) -> str:
+        eng = self.engine
+        if eng is None:
+            return ""
+        clean_persona = str(persona or "").strip()
+        if clean_persona:
+            resolved = eng.projection.resolve_identity(persona=clean_persona)
+            return resolved or normalize_identity(clean_persona)
+        clean_scope = str(scope or "").strip()
+        if clean_scope:
+            binding = eng.store.get_scope_binding(clean_scope)
+            if binding and binding.get("identity"):
+                return str(binding["identity"])
+            resolved = eng.projection.resolve_identity(umo=clean_scope)
+            if resolved:
+                return resolved
+        return ""
+
+    def _resolve_query_identity_readonly(
+        self, *, persona: str = "", scope: str = ""
+    ) -> tuple[str, bool]:
+        """Distinguish explicit global queries from unresolved per-scope persona lookups.
+
+        Returns ``(identity, allow_all)``. Only when both ``persona`` and ``scope``
+        are empty is ``allow_all`` True. When a specific scope is requested but has no
+        bound persona yet, returns ``("", False)`` so callers and the store never widen
+        the query to other personas.
+        """
+        clean_persona = str(persona or "").strip()
+        clean_scope = str(scope or "").strip()
+        if not clean_persona and not clean_scope:
+            return "", True
+        identity = self._resolve_scope_identity_readonly(
+            persona=clean_persona, scope=clean_scope
+        )
+        return identity, False
+
+    def get_series_summary(self) -> dict[str, Any]:
+        """Synchronous, read-only badge/pulse summary for series_presence v2."""
+        try:
+            if self.closed or not self.ready or self.engine is None:
+                return {
+                    "badge": {"count": 0, "tone": "muted", "label": "未就绪"},
+                    "pulse": {"headline": "群间见闻尚未就绪", "updated_at": ""},
+                }
+            if not bool(self.config.get("enabled", True)):
+                return {
+                    "badge": {"count": 0, "tone": "muted", "label": "已停用"},
+                    "pulse": {"headline": "群间见闻已停用", "updated_at": ""},
+                }
+            eng = self.engine
+            now = eng.clock()
+            summary = eng.projection.summary()
+            if not summary:
+                summary = eng.store.summary_counts(
+                    allow_all=True, now=now, half_life_days=eng.half_life_days
+                )
+            today_logs, latest_log_ts = eng.store.count_today_logs_and_latest(
+                now=now, allow_all=True
+            )
+            pending_reviews = int(summary.get("pending_reviews", 0) or 0)
+            active_interests = int(summary.get("active_interests", 0) or 0)
+            sources_enabled = int(
+                summary.get("sources_enabled", summary.get("sources", 0)) or 0
+            )
+            recent_title = str(summary.get("recent_title", "") or "").strip()
+
+            if pending_reviews > 0:
+                badge = {
+                    "count": pending_reviews,
+                    "tone": "warm",
+                    "label": f"{pending_reviews} 项待审",
+                }
+            elif today_logs > 0:
+                badge = {
+                    "count": today_logs,
+                    "tone": "accent",
+                    "label": f"{today_logs} 篇新精读",
+                }
+            elif active_interests > 0:
+                badge = {
+                    "count": active_interests,
+                    "tone": "info",
+                    "label": f"{active_interests} 项兴趣",
+                }
+            else:
+                badge = {"count": 0, "tone": "accent", "label": "就绪"}
+
+            if pending_reviews > 0:
+                headline = (
+                    f"{pending_reviews} 项待审提案 · {active_interests} 项活跃兴趣"
+                )
+            elif recent_title:
+                headline = (
+                    f"最近精读《{recent_title[:24]}》 · {active_interests} 项活跃兴趣"
+                )
+            else:
+                headline = (
+                    f"启用 {sources_enabled} 个信息源 · {active_interests} 项活跃兴趣"
+                )
+
+            latest_ts = max(
+                float(latest_log_ts or 0.0),
+                float(eng.last_digest_at or 0.0),
+                float(eng.last_poll_at or 0.0),
+            )
+            updated_at = (
+                datetime.fromtimestamp(latest_ts, SHANGHAI_TZ).isoformat()
+                if latest_ts > 0
+                else ""
+            )
+            return {
+                "badge": badge,
+                "pulse": {"headline": headline, "updated_at": updated_at},
+            }
+        except Exception:
+            return {
+                "badge": {"count": 0, "tone": "muted", "label": "暂不可用"},
+                "pulse": {"headline": "群间见闻状态读取异常", "updated_at": ""},
+            }
+
+    def get_series_scope_status(self, umo: str) -> dict[str, Any]:
+        """Synchronous, read-only per-UMO scope status for Chat Dynamics control matrix."""
+        try:
+            clean_umo = str(umo or "").strip()
+            if self.closed or not self.ready or self.engine is None:
+                return {
+                    "enabled": False,
+                    "supported": False,
+                    "persona_id": "",
+                    "activity_today": None,
+                    "summary": "群间见闻未就绪",
+                    "version": PLUGIN_VERSION,
+                }
+            eng = self.engine
+            now = eng.clock()
+            plugin_enabled = bool(self.config.get("enabled", True))
+            sessions = eng.sessions
+            if not clean_umo:
+                scope_enabled = plugin_enabled
+            elif sessions:
+                scope_enabled = plugin_enabled and (clean_umo in sessions)
+            else:
+                scope_enabled = plugin_enabled
+
+            identity, allow_all = self._resolve_query_identity_readonly(scope=clean_umo)
+            persona_id = unpack_identity(identity)[0] if identity else ""
+            if not scope_enabled or (not identity and not allow_all):
+                activity_today = 0
+                counts = eng.store.summary_counts(
+                    "", allow_all=False, now=now, half_life_days=eng.half_life_days
+                )
+                today_logs = 0
+            else:
+                activity_today = eng.store.count_scope_activity_today(
+                    clean_umo, identity=identity, allow_all=allow_all, now=now
+                )
+                counts = eng.store.summary_counts(
+                    identity,
+                    allow_all=allow_all,
+                    now=now,
+                    half_life_days=eng.half_life_days,
+                )
+                today_logs, _ = eng.store.count_today_logs_and_latest(
+                    identity, now=now, allow_all=allow_all
+                )
+
+            if not plugin_enabled:
+                summary_text = "插件已停用"
+            elif not scope_enabled:
+                summary_text = "未在当前会话白名单内"
+            elif clean_umo and not identity:
+                summary_text = "尚未绑定角色 · 活跃兴趣 0 项 · 今日精读 0 篇"
+            else:
+                parts = [
+                    f"活跃兴趣 {int(counts.get('active_interests', 0))} 项",
+                    f"今日精读 {today_logs} 篇",
+                ]
+                if clean_umo and eng.outreach_allowed(clean_umo):
+                    parts.append("主动分享开启")
+                summary_text = " · ".join(parts)
+
+            return {
+                "enabled": scope_enabled,
+                "supported": False,
+                "persona_id": persona_id,
+                "activity_today": int(activity_today),
+                "summary": summary_text,
+                "version": int(eng.projection.generation),
+            }
+        except Exception:
+            return {
+                "enabled": None,
+                "supported": False,
+                "persona_id": "",
+                "activity_today": None,
+                "summary": "状态读取异常",
+                "version": PLUGIN_VERSION,
+            }
+
+    def series_search_items(
+        self, query: str, scope: str = "", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Synchronous, read-only search hook for federated Ctrl+K command palette."""
+        try:
+            q_str = str(query or "").strip()
+            if (
+                not q_str
+                or self.closed
+                or not self.ready
+                or self.engine is None
+                or not bool(self.config.get("enabled", True))
+            ):
+                return []
+            eng = self.engine
+            clean_scope = str(scope or "").strip()
+            if clean_scope and eng.sessions and clean_scope not in eng.sessions:
+                return []
+            identity, allow_all = self._resolve_query_identity_readonly(
+                scope=clean_scope
+            )
+            if not identity and not allow_all:
+                return []
+            try:
+                lim = max(1, min(50, int(limit)))
+            except (TypeError, ValueError):
+                lim = 20
+            return eng.store.search_items_readonly(
+                q_str,
+                identity=identity,
+                allow_all=allow_all,
+                limit=lim,
+                half_life_days=eng.half_life_days,
+                now=eng.clock(),
+            )
+        except Exception:
+            return []
+
+    def get_journal_events(
+        self,
+        persona: str = "",
+        scope: str = "",
+        date: str = "today",
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Synchronous, read-only reading & interest events for World's Living Journal feed."""
+        try:
+            if (
+                self.closed
+                or not self.ready
+                or self.engine is None
+                or not bool(self.config.get("enabled", True))
+            ):
+                return []
+            eng = self.engine
+            clean_scope = str(scope or "").strip()
+            if clean_scope and eng.sessions and clean_scope not in eng.sessions:
+                return []
+
+            now = eng.clock()
+            raw_date = str(date or "today").strip().lower()
+            if not raw_date or raw_date == "today":
+                start_ts, end_ts = shanghai_day_bounds(now)
+            elif raw_date == "yesterday":
+                start_ts, end_ts = shanghai_day_bounds(now - 86400.0)
+            elif raw_date in {"all", "recent"}:
+                start_ts, end_ts = now - 7 * 86400.0, now + 60.0
+            else:
+                try:
+                    parsed = datetime.strptime(raw_date[:10], "%Y-%m-%d").replace(
+                        tzinfo=SHANGHAI_TZ
+                    )
+                    start_ts = parsed.timestamp()
+                    end_ts = start_ts + 86400.0
+                except ValueError:
+                    start_ts, end_ts = shanghai_day_bounds(now)
+
+            identity, allow_all = self._resolve_query_identity_readonly(
+                persona=str(persona or "").strip(), scope=clean_scope
+            )
+            if not identity and not allow_all:
+                return []
+            try:
+                lim = max(1, min(100, int(limit)))
+            except (TypeError, ValueError):
+                lim = 20
+            return eng.store.list_journal_events_readonly(
+                identity=identity,
+                allow_all=allow_all,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                limit=lim,
+            )
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------
     # Zero-I/O Synchronous Context Projection (Chat Dynamics Reply Path)
@@ -731,19 +1065,22 @@ class Main(Star):
                     )
 
         # Channel B: Universal Keyframes VLM via image_urls (or standard text chat)
+        anchor_contexts = build_cache_anchor_contexts(
+            instruction, task="dynamics_horizons"
+        )
+        call_kwargs: dict[str, Any] = {
+            "prompt": payload,
+            "system_prompt": instruction,
+        }
+        if _accepts_kwarg(provider.text_chat, "contexts"):
+            call_kwargs["contexts"] = anchor_contexts
         if image_urls:
+            call_kwargs["image_urls"] = image_urls
             async with asyncio.timeout(effective_timeout):
-                response = await provider.text_chat(
-                    prompt=payload,
-                    system_prompt=instruction,
-                    image_urls=image_urls,
-                    contexts=[],
-                )
+                response = await provider.text_chat(**call_kwargs)
         else:
             async with asyncio.timeout(base_timeout):
-                response = await provider.text_chat(
-                    prompt=payload, system_prompt=instruction, contexts=[]
-                )
+                response = await provider.text_chat(**call_kwargs)
         try:
             self._assert_binding_current(role, provider_id, provider)
         except _BindingChangedError as exc:

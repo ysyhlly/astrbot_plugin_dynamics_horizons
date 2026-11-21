@@ -16,7 +16,6 @@ from astrbot_plugin_dynamics_horizons.core.contract import (
 from astrbot_plugin_dynamics_horizons.core.engine import (
     STAGE3_REVIEW_PROMPT,
     VIDEO_STAGE2_VISUAL_ADDENDUM,
-    HorizonsEngine,
 )
 from astrbot_plugin_dynamics_horizons.core.store import HorizonsStore
 from astrbot_plugin_dynamics_horizons.main import Main, is_native_video_provider

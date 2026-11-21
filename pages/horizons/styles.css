@@ -1,4 +1,20 @@
-/* Dynamics Horizons Workbench — Sage series token consumer */
+/* Dynamics Horizons Workbench — Botanical Paper & Deep Forest Night v2.0 */
+:root {
+  --hz-warm: var(--ds-warm, #9a5d1f);
+  --hz-warm-soft: var(--ds-warm-soft, var(--ds-warning-soft, #f9efe2));
+  --hz-subtle: var(--ds-surface-subtle, var(--ds-soft));
+  --hz-card-shadow: var(--ds-shadow-card, 0 1px 2px rgba(24, 46, 33, 0.04), 0 8px 24px -6px rgba(24, 46, 33, 0.07));
+}
+
+html[data-ui-theme="night"],
+html[data-theme="dark"]:not([data-ui-theme="day"]) {
+  color-scheme: dark;
+  --hz-warm: var(--ds-warm, #e4b476);
+  --hz-warm-soft: var(--ds-warm-soft, var(--ds-warning-soft, #30261b));
+  --hz-subtle: var(--ds-surface-subtle, var(--ds-soft));
+  --hz-card-shadow: var(--ds-shadow-card, 0 2px 6px rgba(0, 0, 0, 0.22), 0 12px 28px -8px rgba(0, 0, 0, 0.42));
+}
+
 *, *::before, *::after {
   box-sizing: border-box;
   min-width: 0;
@@ -10,18 +26,13 @@
 
 html {
   color-scheme: light;
-  background: var(--ds-bg);
+  background: var(--ds-canvas, var(--ds-bg));
   color: var(--ds-text);
-}
-
-html[data-ui-theme="night"],
-html[data-theme="dark"]:not([data-ui-theme="day"]) {
-  color-scheme: dark;
 }
 
 body {
   margin: 0;
-  background: var(--ds-bg);
+  background: var(--ds-canvas, var(--ds-bg));
   color: var(--ds-text);
   font: 14px/1.65 var(--ds-font);
 }
@@ -853,23 +864,430 @@ dialog.workbench-dialog::backdrop {
   }
 }
 
+/* ===== v2.0 Botanical Paper & Deep Forest Night Upgrades ===== */
+.nav-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+}
+
+.nav-icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.hz-heading-compact {
+  padding: 14px 0 12px;
+  margin-bottom: 12px;
+}
+
+.hz-title-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.hz-title-row,
+.view-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.panel-head-title {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.panel-head-sub {
+  font-size: 12px;
+  color: var(--ds-muted);
+  font-weight: 450;
+}
+
+/* Compact (i) Info Popover (de-noising repeated disclaimer walls) */
+.info-popover {
+  position: relative;
+  display: inline-block;
+}
+
+.info-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid var(--ds-border);
+  background: var(--hz-subtle);
+  color: var(--ds-muted);
+  font: 650 11.5px/1 var(--ds-mono);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.info-trigger::-webkit-details-marker {
+  display: none;
+}
+
+.info-trigger:hover,
+.info-popover[open] > .info-trigger {
+  background: var(--ds-accent-soft);
+  color: var(--ds-accent);
+  border-color: var(--ds-accent);
+}
+
+.info-popover-body {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  z-index: 30;
+  width: min(320px, calc(100vw - 48px));
+  padding: 12px 14px;
+  border-radius: var(--ds-radius-md);
+  border: 1px solid var(--ds-border);
+  background: var(--ds-surface);
+  box-shadow: var(--hz-card-shadow);
+  color: var(--ds-text);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.info-popover-body p {
+  margin: 0;
+}
+
+.info-popover-note {
+  margin-top: 6px !important;
+  padding-top: 6px;
+  border-top: 1px solid var(--ds-border);
+  color: var(--ds-muted);
+  font-size: 11.5px;
+}
+
+/* Compact Persona / World Bar */
+.persona-bar {
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  box-shadow: var(--hz-card-shadow);
+}
+
+.persona-picker select {
+  min-height: 36px;
+  padding: 5px 10px;
+}
+
+/* Refined Botanical Paper Cards & KPIs */
+.kpi-card,
+.panel-card {
+  box-shadow: var(--hz-card-shadow);
+  transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+
+.kpi-card:hover {
+  transform: translateY(-1px);
+  border-color: var(--ds-strong);
+}
+
+.kpi-value {
+  font-size: 26px;
+  letter-spacing: -0.02em;
+}
+
+.pill.warm {
+  background: var(--hz-warm-soft);
+  color: var(--hz-warm);
+  border-color: transparent;
+}
+
+/* Compact Health & Archive Disclosures */
+.health-card-compact,
+.archive-card-compact {
+  padding: 12px 16px;
+  margin-bottom: 14px;
+}
+
+.health-disclosure,
+.archive-disclosure {
+  width: 100%;
+}
+
+.health-summary-bar,
+.archive-summary-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: 12.5px;
+}
+
+.health-summary-bar::-webkit-details-marker,
+.archive-summary-bar::-webkit-details-marker {
+  display: none;
+}
+
+.health-summary-left {
+  display: flex;
+  align-items: center;
+  gap: 8px 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.health-summary-title {
+  font-weight: 650;
+  color: var(--ds-text);
+  font-size: 13px;
+}
+
+.health-summary-meta {
+  color: var(--ds-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.health-toggle-label {
+  color: var(--ds-accent);
+  font-weight: 600;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.health-toggle-label::after {
+  content: " ▾";
+}
+
+.health-disclosure[open] .health-toggle-label::after,
+.archive-disclosure[open] .health-toggle-label::after {
+  content: " ▴";
+}
+
+.health-details-body {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--ds-border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.health-details-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.health-detail-box {
+  padding: 10px 12px;
+  border-radius: var(--ds-radius-sm);
+  border: 1px solid var(--ds-border);
+  background: var(--hz-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--ds-muted);
+}
+
+.health-detail-box strong {
+  color: var(--ds-text);
+  font-size: 12px;
+}
+
+.health-detail-box p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.archive-body {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--ds-border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Active Interest Cards with Half-Life Decay Bars */
+.interest-card {
+  background: var(--hz-subtle);
+  border: 1px solid var(--ds-border);
+  transition: transform 0.16s ease, border-color 0.16s ease;
+}
+
+.interest-card:hover {
+  transform: translateY(-1px);
+  border-color: var(--ds-strong);
+}
+
+.decay-bar-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.decay-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.decay-label {
+  color: var(--ds-muted);
+  font-weight: 500;
+}
+
+.decay-metric {
+  font-family: var(--ds-mono);
+  font-size: 11.5px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  color: var(--ds-accent);
+}
+
+.decay-metric.is-hot {
+  color: var(--hz-warm);
+}
+
+.decay-metric.is-fading {
+  color: var(--ds-muted);
+}
+
+.decay-track {
+  position: relative;
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--ds-border);
+  overflow: hidden;
+}
+
+.decay-midpoint {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--ds-surface);
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.decay-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--ds-accent);
+  transition: width 0.25s ease;
+}
+
+.decay-fill.is-hot {
+  background: var(--hz-warm);
+}
+
+.decay-fill.is-fading {
+  background: var(--ds-strong);
+}
+
+/* Reading Journal Magazine-Style Left-Accent Cards */
+.journal-card {
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-left: 4px solid var(--ds-accent);
+  box-shadow: var(--hz-card-shadow);
+  transition: transform 0.16s ease, border-color 0.16s ease;
+}
+
+.journal-card:hover {
+  transform: translateY(-1px);
+}
+
+.journal-card.kind-bilibili {
+  border-left-color: var(--hz-warm);
+}
+
+.journal-card.kind-ebook {
+  border-left-color: var(--ds-accent);
+}
+
+.journal-card.kind-feed {
+  border-left-color: var(--ds-info);
+}
+
+.journal-card.kind-manual {
+  border-left-color: var(--ds-accent);
+}
+
+.journal-card .log-pane {
+  background: var(--hz-subtle);
+}
+
+.journal-card .log-pane.reflection {
+  background: var(--ds-accent-soft);
+  border-color: transparent;
+  border-left: 3px solid var(--ds-accent);
+}
+
+.journal-questions-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+
+.question-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--ds-border);
+  background: var(--ds-surface);
+  color: var(--ds-text);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.question-chip-prefix {
+  color: var(--hz-warm);
+  font-weight: 650;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kpi-card,
+  .panel-card,
+  .interest-card,
+  .journal-card,
+  .decay-fill,
+  .meter-fill,
+  .info-trigger {
+    transition: none !important;
+  }
+
+  .kpi-card:hover,
+  .interest-card:hover,
+  .journal-card:hover {
+    transform: none !important;
+  }
+}
+
 @media (max-width: 768px) {
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
-  
-
   .kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -880,7 +1298,8 @@ dialog.workbench-dialog::backdrop {
 
   .log-dual,
   .form-grid,
-  .bookshelf-grid {
+  .bookshelf-grid,
+  .health-details-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -891,6 +1310,17 @@ dialog.workbench-dialog::backdrop {
 
   .panel-card {
     padding: 15px;
+  }
+
+  .health-card-compact,
+  .archive-card-compact {
+    padding: 12px 14px;
+  }
+
+  .info-popover-body {
+    position: static;
+    margin-top: 8px;
+    width: 100%;
   }
 
   dialog.workbench-dialog {

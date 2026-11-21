@@ -327,6 +327,9 @@ class HorizonsWebAPI:
                         "topic": i["topic"],
                         "summary": i["summary"],
                         "heat_score": i["heat_score"],
+                        "raw_heat_score": i.get("raw_heat_score", i["heat_score"]),
+                        "last_reinforced_at": i.get("last_reinforced_at", 0.0),
+                        "half_life_days": eng.half_life_days,
                         "expires_at": i["expires_at"],
                         "status": i["status"],
                     }

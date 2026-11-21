@@ -1,51 +1,66 @@
-# 群间见闻 · Dynamics Horizons (`astrbot_plugin_dynamics_horizons`)
+<div align="center">
 
-> 发布候选：`v0.2.0-rc.5`。升级说明与验证边界见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+<img src="logo.png" width="156" alt="群间见闻 · Dynamics Horizons" />
 
-群间系列伴生插件，负责**角色隔离的外部信息源订阅、连载书架管理、空闲清醒窗口自主挑拣精读，以及双模型独立审查**。
+# 群间见闻 · Dynamics Horizons
 
-## 主动分享
+**群间系列角色外部信息源与连载书架：空闲清醒时自主精读，经独立审查沉淀阅读手记、暂存兴趣与分群待讨论话题。**
 
-`proactive_enabled` 控制见闻主动分享。开启后，`proactive_sessions` 留空覆盖所有已接管的群聊和私聊，填写完整 UMO 则只在名单内生效。分享候选要求同一角色实例、同一会话与同一成员已有至少两轮双向同话题交流，并遵循退订、冷却和群间共享发送额度。
+![Version](https://img.shields.io/badge/Version-v0.2.0--rc.6-4338CA?style=flat-square)
+![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.29.4%2C%3C5-0369A1?style=flat-square)
+![Series](https://img.shields.io/badge/Series-%E7%BE%A4%E9%97%B4%E7%B3%BB%E5%88%97-6D28D9?style=flat-square)
+![QQ Group](https://img.shields.io/badge/QQ%E7%BE%A4-203363132-0284C7?style=flat-square)
+[![License](https://img.shields.io/badge/License-MIT-047857?style=flat-square)](LICENSE)
 
-## v0.2.0-beta.2 恢复加固
+[核心能力](#核心能力) · [系列联动](#与群间系列的联动) · [快速开始](#快速开始) · [群间系列生态](#群间系列生态) · [文档与许可](#进阶文档与许可)
 
-支持 `allow_same_provider_for_review=true`：分析与审核可选择同一模型，但分别调用、使用独立指令与空历史上下文。默认仍要求不同 Provider。
+</div>
 
-提案、阅读连续性和首次审核排队在同一事务提交；启动时补齐历史孤立待审任务。角色睡眠或状态暂不可用时延期审核，不消耗失败重试次数。
+---
 
-## v0.2.0-beta.1 私有修复版
+![群间见闻 · Dynamics Horizons 核心架构](docs/images/overview.svg)
 
-- 阅读任务、逐章实际进度、审核证据和审查历史持久化；无手记阅读仍推进，待审不会重复阅读，后章不会代替前章完成。
-- 审查通过后才形成可用于群聊的知识；撤销同步移除兴趣贡献、问题、未发送候选与世界书签。临时错误按 1/5/30 分钟重试，搁置和人工待审不自动重试。
-- 群聊反馈后台核验最终送达文本与成员参与证据；候选本身不算聊过。退订与话题偏好按角色/完整 UMO/成员隔离。
-- 每角色每日默认 5 次精读尝试、50 次模型调用；失败与核验计费调用也计入，额度在发起前持久预占。
-- 候选按来源轮转，90 天旧候选与超过 5,000 活跃上限的无引用内容只归档、不删除；管理页支持查询、导出、置顶和恢复。
-- 管理页显示依赖/模型/作息阻塞、队列重试、来源证据、真实书架进度与审核撤销。
-- OPDS 默认只向原书库同源请求携带凭据；额外下载源需要显式 HTTPS origin 白名单。Feed 未入库条目持久排队，304 不会丢掉积压条目。
-- 未识别身份、不可用人设与世界状态均暂停；同步回复投影仍为纯内存且不包含裸链接。
+## 核心能力
 
-所有迁移保留旧记录，不能核验的旧阅读进度标为待核查。代码回滚时保留新增数据，旧版见闻保持停用。
+- **按角色隔离的四类只读信息源**（`identity = [persona_id, instance_id]`）：
+  - **B 站只读源（`bilibili`）**：关注 UP 投稿/图文、热门榜单与可选只读推荐流，支持官方 AI 总结、字幕、简介及视频画面多模态提取，零写操作。
+  - **电子书连载源（`ebook`）**：中文维基文库、Gutendex 公版书、OPDS 目录及本地 `.epub` / `.txt` 逐章切片追读，持久化真实阅读进度与书架状态。
+  - **标准订阅源（`feed`）**：RSS 2.0、Atom 1.0、JSON Feed 1.1（支持 ETag / If-Modified-Since 与 304 积压保护）。
+  - **管理员投喂（`manual`）**：粘贴剪报文本或提取单篇公开文章正文。
+- **沙箱防注入与三阶段审查**：外部内容严格标记为 `external_media`，清洗 HTML、裸外链、广告联系词与提示词注入；遵循 **挑拣 → 精读内化 → 独立审查模型复检** 三步流转，守住角色固定设定红线（默认要求独立审查 Provider，亦可选 `allow_same_provider_for_review=true` 以空历史独立调用）。
+- **全局阅读底本 + 分群独立核销**：阅读手记与指数衰减的暂存兴趣归属角色实例全局；待讨论话题按完整 UMO 独立核销，严防跨群串话。
+- **稳健运行与网络安全**：每日精读与模型调用额度持久预占、临时错误分级退避重试；内置 Fake-IP（Clash/Mihomo `198.18.0.0/15`）安全 DoH 解析与重定向校验。
 
-## v0.1.1 网络兼容修复
+## 与群间系列的联动
 
-当系统 DNS 将公网域名解析为 Clash/Mihomo 的 `198.18.0.0/15` Fake-IP 时，使用固定 HTTPS 地址 `1.1.1.1` / `1.0.0.1` 查询 Cloudflare DNS 的真实 A 记录（需要能够访问其 443 端口）。只向备用解析器发送域名，不发送订阅路径、Cookie 或密码；缓存遵守 DNS TTL，最长 60 秒。解析失败时保持阻断。
+- **群间 · Chat Dynamics**：通过纯内存同步接口 `get_horizons_context` 提供见闻上下文（回复热路径零 SQLite / 网络 / 模型 I/O，输出绝不含裸外链）；开启 `proactive_enabled` 后，仅在同角色、同会话、同成员已有至少两轮双向同话题交流时生成受控主动分享候选，遵循退订、冷却与共享额度。
+- **群间世界 · Dynamics World**：双向感知角色清醒/睡眠/暂停状态（睡眠期间延期审核与精读），并将案头阅读进度与书签同步至 3D 小屋书架与书桌。
 
-HTTP 连接使用经过校验的真实地址，保留原域名的 Host/SNI 和 TLS 证书验证。直接输入的 Fake-IP、私网与云元数据地址仍受原有规则限制；重定向逐跳验证，连接阶段再次检查地址以阻止 DNS 重绑定。显式启用的私有 OPDS 仍可访问管理员指定的内网书库。
+## 快速开始
 
-## 核心特性
+1. 在 AstrBot（`>=4.29.4,<5`）安装本插件，并配合 **群间 · Chat Dynamics**（可选搭配 **群间世界**）。
+2. 在插件配置中指定分析模型与独立审查模型（均需普通聊天模型），按需设置每日精读预算与 `proactive_enabled` / `proactive_sessions`。
+3. 打开 **「群间见闻」** Web 面板：添加角色专属的信息源或上传本地电子书，在面板查看作息阻塞、真实书架进度、待审提案、来源证据与审核撤销。
 
-1. **按角色隔离的四类只读信息源 (`identity = [persona_id, instance_id]`)**
-   - **B 站只读源 (`bilibili`)**：关注 UP 投稿/图文、热门榜单、可选只读推荐流（官方 AI 总结 → CC/AI 字幕 → 视频简介降级提取，零写操作）。
-   - **电子书连载源 (`ebook`)**：中文维基文库、Gutendex 公版书、OPDS 目录协议，以及本地上传 `.epub` / `.txt` 切片连载追读（支持在读/读完/中途弃书）。
-   - **标准订阅源 (`feed`)**：RSS 2.0、Atom 1.0、JSON Feed 1.1（支持 ETag / If-Modified-Since 缓存与退避）。
-   - **管理员投喂 (`manual`)**：粘贴剪报文本或提取单篇公开文章正文。
-2. **沙箱防注入清洗 + 三阶段双模型审查**
-   - 外部媒介严格标记为 `fact_kind = "external_media"`，剥离 HTML、裸外链、广告联系词与提示词注入指令。
-   - **阶段 1（挑拣）** → **阶段 2（精读内化）** → **阶段 3（独立审查模型复检）**，严守固定核心人格红线，绝不改写角色卡设定。
-3. **全局底本 + 带衰减暂存兴趣 + 分群 (`umo`) 独立核销**
-   - `reading_logs` 与 `staged_interests`（指数半衰期自然冷却）归属角色实例全局；
-   - `discussion_questions` 通过 `question_umo_state` 按各群会话独立核销，严防跨群串话泄露。
-4. **跨插件零阻塞联动**
-   - 向 **群间 (`astrbot_plugin_chat_dynamics`)** 提供纯内存同步接口 `get_horizons_context`（回复热路径零 SQLite / 网络 / 模型 I/O，输出绝不含裸 HTTP/HTTPS 外链）与受控共同话题主动分享候选；
-   - 与 **群间世界 (`astrbot_plugin_dynamics_world`)** 双向感知作息/暂停状态，并同步案头阅读书签至 3D 小屋书架与书桌。
+---
+
+## 群间系列生态
+
+| 插件 | 仓库与标识 | 核心定位 |
+| --- | --- | --- |
+| **群间 · Chat Dynamics** | [`astrbot_plugin_chat_dynamics`](https://github.com/ysyhlly/astrbot_plugin_chat_dynamics) | 核心对话调度层：碎发聚合、话题路由、参与决策与节奏交付 |
+| **群间世界 · Dynamics World** | [`astrbot_plugin_dynamics_world`](https://github.com/ysyhlly/astrbot_plugin_dynamics_world) | 角色卡、世界书、双地图天气、持续生活与 3D 实况小屋 |
+| **群间记忆 · Dynamics Memory** | [`astrbot_plugin_dynamics_memory`](https://github.com/ysyhlly/astrbot_plugin_dynamics_memory) | 长期记忆、混合召回、2D/3D 图谱与原文证据冲突审查 |
+| **群间学习 · Dynamics Learning** | [`astrbot_plugin_dynamics_learning`](https://github.com/ysyhlly/astrbot_plugin_dynamics_learning) | 固定性格红线下的成员资料、黑话好感与可回滚审查学习 |
+| **群间见闻 · Dynamics Horizons**（当前） | [`astrbot_plugin_dynamics_horizons`](https://github.com/ysyhlly/astrbot_plugin_dynamics_horizons) | 角色隔离外部信息源与书架、自主精读与分群待讨论话题 |
+| **群间游戏 · Dynamics Games** | [`astrbot_plugin_dynamics_games`](https://github.com/ysyhlly/astrbot_plugin_dynamics_games) | 共读/约局/接龙/挑战/共创协作与四大群聊娱乐引擎 |
+| **群间史记 · Dynamics Chronicle** | [`astrbot_plugin_group_chronicle`](https://github.com/ysyhlly/astrbot_plugin_group_chronicle) | 原文依据的长期群史卷册、人物传记与群文化梗沿革 |
+| **群间视觉 · Visual Media** | [`astrbot_plugin_visual_media`](https://github.com/ysyhlly/astrbot_plugin_visual_media) | 表情收集检索、多模态生图改图与角色视觉形象管理 |
+
+---
+
+## 进阶文档与许可
+
+- [发布说明与验证边界](RELEASE_NOTES.md) · [更新日志](CHANGELOG.md)
+- 交流与反馈：项目反馈群兼聊天群 QQ `203363132`
+- 本项目基于 [MIT License](LICENSE) 开源。

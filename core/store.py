@@ -9,13 +9,16 @@ import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .contract import (
     BOOK_STATUSES,
     INTENT_STATUSES,
+    PLUGIN_ID,
     PROPOSAL_STATES,
+    SHANGHAI_TZ,
     SOURCE_KINDS,
     TERMINAL_INTENT_STATUSES,
     clean_text,
@@ -2244,12 +2247,40 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             for item in items:
                 by_identity.setdefault(item["identity"], []).append(item["log_id"])
             reflections_by_id_and_log: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            questions_by_id_and_log: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            now_stamp = time.time()
             for ident_key, lids in by_identity.items():
                 grouped = self._list_discussion_reflections_for_logs(ident_key, lids)
                 for lid, refs in grouped.items():
                     reflections_by_id_and_log[(ident_key, lid)] = refs
+                if lids:
+                    ph = ",".join("?" for _ in lids)
+                    q_rows = self.db.execute(
+                        f"""
+                        SELECT question_id, log_id, topic, question, status, expires_at
+                        FROM discussion_questions
+                        WHERE identity=? AND log_id IN ({ph}) AND status='active' AND expires_at>?
+                        ORDER BY created_at DESC
+                        """,
+                        [ident_key, *lids, now_stamp],
+                    ).fetchall()
+                    for qr in q_rows:
+                        questions_by_id_and_log.setdefault(
+                            (ident_key, str(qr["log_id"])), []
+                        ).append(
+                            {
+                                "question_id": qr["question_id"],
+                                "topic": qr["topic"],
+                                "question": qr["question"],
+                                "status": qr["status"],
+                                "expires_at": float(qr["expires_at"]),
+                            }
+                        )
             for item in items:
                 item["discussion_reflections"] = reflections_by_id_and_log.get(
+                    (item["identity"], item["log_id"]), []
+                )
+                item["questions"] = questions_by_id_and_log.get(
                     (item["identity"], item["log_id"]), []
                 )
         return {
@@ -3010,11 +3041,25 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         self,
         identity: str = "",
         *,
+        allow_all: bool = False,
         now: float | None = None,
         half_life_days: float = 6.0,
     ) -> dict[str, Any]:
         stamp = float(now if now is not None else time.time())
-        norm = normalize_identity(identity) if identity else ""
+        norm = normalize_identity(identity) if str(identity or "").strip() else ""
+        if not norm and not allow_all:
+            return {
+                "sources": 0,
+                "sources_total": 0,
+                "sources_enabled": 0,
+                "candidates_unread": 0,
+                "logs_total": 0,
+                "books_reading": 0,
+                "active_interests": 0,
+                "pending_questions": 0,
+                "pending_reviews": 0,
+                "recent_title": "",
+            }
         id_clause = " AND identity=?" if norm else ""
         id_params = (norm,) if norm else ()
         with self.lock:
@@ -3202,5 +3247,418 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         return {
             "built_at": stamp,
             "by_identity": by_identity,
-            "summary": self.summary_counts(now=stamp, half_life_days=half_life_days),
+            "summary": self.summary_counts(
+                allow_all=True, now=stamp, half_life_days=half_life_days
+            ),
         }
+
+    # ------------------------------------------------------------------
+    # Read-Only Cross-Plugin Series Hooks Helpers (v2.0)
+    # ------------------------------------------------------------------
+
+    def count_today_logs_and_latest(
+        self,
+        identity: str = "",
+        now: float | None = None,
+        *,
+        allow_all: bool = False,
+    ) -> tuple[int, float]:
+        """Return (active logs created today in Asia/Shanghai, latest log created_at)."""
+        stamp = float(now if now is not None else time.time())
+        start, end = shanghai_day_bounds(stamp)
+        norm = normalize_identity(identity) if str(identity or "").strip() else ""
+        if not norm and not allow_all:
+            return 0, 0.0
+        id_clause = " AND identity=?" if norm else ""
+        id_params = (norm,) if norm else ()
+        with self.lock:
+            today_count = self.db.execute(
+                f"SELECT COUNT(*) FROM reading_logs WHERE status='active' AND created_at>=? AND created_at<?{id_clause}",
+                (start, end, *id_params),
+            ).fetchone()[0]
+            latest_row = self.db.execute(
+                f"SELECT MAX(created_at) FROM reading_logs WHERE status='active'{id_clause}",
+                id_params,
+            ).fetchone()
+        latest_ts = float(latest_row[0] or 0.0) if latest_row else 0.0
+        return int(today_count or 0), latest_ts
+
+    def get_scope_binding(self, umo: str) -> dict[str, Any] | None:
+        clean = str(umo or "").strip()
+        if not clean:
+            return None
+        with self.lock:
+            row = self.db.execute(
+                "SELECT umo, identity, managed, updated_at FROM scope_bindings WHERE umo=?",
+                (clean,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "umo": str(row["umo"]),
+            "identity": str(row["identity"]),
+            "managed": bool(row["managed"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def count_scope_activity_today(
+        self,
+        umo: str,
+        identity: str = "",
+        now: float | None = None,
+        *,
+        allow_all: bool = False,
+    ) -> int:
+        stamp = float(now if now is not None else time.time())
+        start, end = shanghai_day_bounds(stamp)
+        clean_umo = str(umo or "").strip()
+        norm = normalize_identity(identity) if str(identity or "").strip() else ""
+        total = 0
+        with self.lock:
+            if clean_umo:
+                total += int(
+                    self.db.execute(
+                        "SELECT COUNT(*) FROM question_umo_state WHERE umo=? AND status='discussed' AND discussed_at>=? AND discussed_at<?",
+                        (clean_umo, start, end),
+                    ).fetchone()[0]
+                    or 0
+                )
+                total += int(
+                    self.db.execute(
+                        "SELECT COUNT(*) FROM discussion_reflections WHERE umo=? AND status='active' AND occurred_at>=? AND occurred_at<?",
+                        (clean_umo, start, end),
+                    ).fetchone()[0]
+                    or 0
+                )
+            if norm:
+                total += int(
+                    self.db.execute(
+                        "SELECT COUNT(*) FROM reading_logs WHERE identity=? AND status='active' AND created_at>=? AND created_at<?",
+                        (norm, start, end),
+                    ).fetchone()[0]
+                    or 0
+                )
+            elif allow_all:
+                total += int(
+                    self.db.execute(
+                        "SELECT COUNT(*) FROM reading_logs WHERE status='active' AND created_at>=? AND created_at<?",
+                        (start, end),
+                    ).fetchone()[0]
+                    or 0
+                )
+        return total
+
+    def search_items_readonly(
+        self,
+        query: str,
+        *,
+        identity: str = "",
+        allow_all: bool = False,
+        limit: int = 8,
+        half_life_days: float = 6.0,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read-only search across active interests, reading logs, books, sources, and questions."""
+        q_raw = str(query or "").strip()
+        if not q_raw:
+            return []
+        q_low = q_raw.casefold()
+        lim = max(1, min(50, int(limit or 8)))
+        stamp = float(now if now is not None else time.time())
+        norm = normalize_identity(identity) if str(identity or "").strip() else ""
+        if not norm and not allow_all:
+            return []
+        blocked_cache: dict[str, list[str]] = {}
+
+        def _is_blocked(ident_key: str, text_blob: str) -> bool:
+            if ident_key not in blocked_cache:
+                blocked_cache[ident_key] = [
+                    b.casefold() for b in self.list_blocked_topics(ident_key)
+                ]
+            low = text_blob.casefold()
+            return any(b and b in low for b in blocked_cache[ident_key])
+
+        results: list[dict[str, Any]] = []
+
+        # 1. Active staged interests
+        interests = self.list_interests(
+            norm, active_only=True, half_life_days=half_life_days, now=stamp
+        )
+        for item in interests:
+            if len(results) >= lim:
+                return results
+            topic = strip_raw_urls(str(item.get("topic") or "")).strip()
+            summary = strip_raw_urls(str(item.get("summary") or "")).strip()
+            ident_key = str(item.get("identity") or "")
+            blob = f"{topic} {summary}"
+            if q_low not in blob.casefold() or _is_blocked(ident_key, blob):
+                continue
+            heat_val = float(item.get("heat_score") or 0.0)
+            heat_pct = (
+                min(100, round(heat_val * 100))
+                if heat_val <= 2.0001
+                else min(100, round(heat_val))
+            )
+            results.append(
+                {
+                    "kind": "interest",
+                    "title": topic[:80] or "暂存兴趣",
+                    "subtitle": f"暂存兴趣 · 热度 {heat_pct}% · {summary[:64]}".rstrip(
+                        " ·"
+                    ),
+                    "plugin_id": PLUGIN_ID,
+                    "page": "horizons",
+                    "deep_link": {
+                        "tab": "overview",
+                        "identity": ident_key,
+                        "interest_id": str(item.get("interest_id") or ""),
+                    },
+                }
+            )
+
+        # 2. Reading journal entries (active, URL-free)
+        if len(results) < lim:
+            id_clause = " AND identity=?" if norm else ""
+            id_params = (norm,) if norm else ()
+            with self.lock:
+                log_rows = self.db.execute(
+                    f"SELECT log_id, identity, source_kind, citation_json, digest, reflection FROM reading_logs WHERE status='active'{id_clause} ORDER BY created_at DESC LIMIT 80",
+                    id_params,
+                ).fetchall()
+            for r in log_rows:
+                if len(results) >= lim:
+                    return results
+                cit = sanitize_citation(json.loads(r["citation_json"] or "{}"))
+                title = strip_raw_urls(str(cit.get("title") or "")).strip()
+                creator = strip_raw_urls(str(cit.get("creator") or "")).strip()
+                digest = strip_raw_urls(str(r["digest"] or "")).strip()
+                refl = strip_raw_urls(str(r["reflection"] or "")).strip()
+                ident_key = str(r["identity"] or "")
+                blob = f"{title} {creator} {digest} {refl}"
+                if q_low not in blob.casefold() or _is_blocked(ident_key, blob):
+                    continue
+                excerpt = (refl or digest)[:72]
+                sub_parts = ["阅读手账"]
+                if creator:
+                    sub_parts.append(creator[:24])
+                if excerpt:
+                    sub_parts.append(excerpt)
+                results.append(
+                    {
+                        "kind": "reading_log",
+                        "title": title[:80] or "阅读手账",
+                        "subtitle": " · ".join(sub_parts),
+                        "plugin_id": PLUGIN_ID,
+                        "page": "horizons",
+                        "deep_link": {
+                            "tab": "logs",
+                            "identity": ident_key,
+                            "log_id": str(r["log_id"]),
+                        },
+                    }
+                )
+
+        # 3. Bookshelf books
+        if len(results) < lim:
+            for book in self.list_books(norm):
+                if len(results) >= lim:
+                    return results
+                title = strip_raw_urls(str(book.get("title") or "")).strip()
+                creator = strip_raw_urls(str(book.get("creator") or "")).strip()
+                refl = strip_raw_urls(str(book.get("last_reflection") or "")).strip()
+                blob = f"{title} {creator} {refl}"
+                if q_low not in blob.casefold():
+                    continue
+                cursor = int(book.get("chapter_cursor") or 0)
+                total = int(book.get("total_chapters") or 0)
+                prog = f"第 {cursor}/{total} 章" if total > 0 else f"第 {cursor} 章"
+                sub_parts = ["连载书架"]
+                if creator:
+                    sub_parts.append(creator[:24])
+                sub_parts.append(prog)
+                results.append(
+                    {
+                        "kind": "book",
+                        "title": title[:80] or "连载书目",
+                        "subtitle": " · ".join(sub_parts),
+                        "plugin_id": PLUGIN_ID,
+                        "page": "horizons",
+                        "deep_link": {
+                            "tab": "sources",
+                            "identity": str(book.get("identity") or ""),
+                            "book_id": str(book.get("book_id") or ""),
+                        },
+                    }
+                )
+
+        # 4. Subscribed sources (never expose raw or masked secrets)
+        if len(results) < lim:
+            kind_names = {
+                "bilibili": "B站只读源",
+                "ebook": "电子书源",
+                "feed": "标准订阅",
+                "manual": "手动投喂",
+            }
+            for src in self.list_sources(norm, mask=True):
+                if len(results) >= lim:
+                    return results
+                name = strip_raw_urls(str(src.get("name") or "")).strip()
+                sk = str(src.get("source_kind") or "")
+                kind_label = kind_names.get(sk, sk)
+                blob = f"{name} {sk} {kind_label}"
+                if q_low not in blob.casefold():
+                    continue
+                status_text = "已启用" if src.get("enabled") else "已停用"
+                results.append(
+                    {
+                        "kind": "source",
+                        "title": name[:80] or "信息源",
+                        "subtitle": f"信息源 · {kind_label} · {status_text}",
+                        "plugin_id": PLUGIN_ID,
+                        "page": "horizons",
+                        "deep_link": {
+                            "tab": "sources",
+                            "identity": str(src.get("identity") or ""),
+                            "source_id": str(src.get("source_id") or ""),
+                        },
+                    }
+                )
+
+        # 5. Active pending discussion questions
+        if len(results) < lim:
+            id_clause = " AND identity=?" if norm else ""
+            id_params = (norm,) if norm else ()
+            with self.lock:
+                q_rows = self.db.execute(
+                    f"SELECT question_id, identity, topic, question FROM discussion_questions WHERE status='active' AND expires_at>?{id_clause} ORDER BY created_at DESC LIMIT 40",
+                    (stamp, *id_params),
+                ).fetchall()
+            for qr in q_rows:
+                if len(results) >= lim:
+                    return results
+                q_topic = strip_raw_urls(str(qr["topic"] or "")).strip()
+                q_text = strip_raw_urls(str(qr["question"] or "")).strip()
+                ident_key = str(qr["identity"] or "")
+                blob = f"{q_topic} {q_text}"
+                if q_low not in blob.casefold() or _is_blocked(ident_key, blob):
+                    continue
+                results.append(
+                    {
+                        "kind": "question",
+                        "title": q_text[:80] or q_topic[:80],
+                        "subtitle": f"待讨论问题 · {q_topic[:32]}" if q_topic else "待讨论问题",
+                        "plugin_id": PLUGIN_ID,
+                        "page": "horizons",
+                        "deep_link": {
+                            "tab": "overview",
+                            "identity": ident_key,
+                            "question_id": str(qr["question_id"]),
+                        },
+                    }
+                )
+
+        return results[:lim]
+
+    def list_journal_events_readonly(
+        self,
+        *,
+        identity: str = "",
+        allow_all: bool = False,
+        start_ts: float,
+        end_ts: float,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Read-only reading & interest events within [start_ts, end_ts) for World's Living Journal."""
+        lim = max(1, min(100, int(limit or 20)))
+        norm = normalize_identity(identity) if str(identity or "").strip() else ""
+        if not norm and not allow_all:
+            return []
+        id_clause = " AND identity=?" if norm else ""
+        id_params = (norm,) if norm else ()
+        blocked_cache: dict[str, list[str]] = {}
+
+        def _is_blocked(ident_key: str, text_blob: str) -> bool:
+            if ident_key not in blocked_cache:
+                blocked_cache[ident_key] = [
+                    b.casefold() for b in self.list_blocked_topics(ident_key)
+                ]
+            low = text_blob.casefold()
+            return any(b and b in low for b in blocked_cache[ident_key])
+
+        raw_events: list[tuple[float, dict[str, Any]]] = []
+        with self.lock:
+            log_rows = self.db.execute(
+                f"""
+                SELECT log_id, identity, source_kind, citation_json, digest, reflection, created_at
+                FROM reading_logs
+                WHERE status='active' AND created_at>=? AND created_at<?{id_clause}
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (start_ts, end_ts, *id_params, lim),
+            ).fetchall()
+            int_rows = self.db.execute(
+                f"""
+                SELECT interest_id, identity, topic, summary, last_reinforced_at
+                FROM staged_interests
+                WHERE status='active' AND last_reinforced_at>=? AND last_reinforced_at<?{id_clause}
+                ORDER BY last_reinforced_at DESC LIMIT ?
+                """,
+                (start_ts, end_ts, *id_params, lim),
+            ).fetchall()
+
+        for r in log_rows:
+            cit = sanitize_citation(json.loads(r["citation_json"] or "{}"))
+            title = strip_raw_urls(str(cit.get("title") or "")).strip() or "外部读物"
+            digest = strip_raw_urls(str(r["digest"] or "")).strip()
+            refl = strip_raw_urls(str(r["reflection"] or "")).strip()
+            ident_key = str(r["identity"] or "")
+            if _is_blocked(ident_key, f"{title} {digest}"):
+                continue
+            ts = float(r["created_at"] or 0.0)
+            iso_ts = datetime.fromtimestamp(ts, SHANGHAI_TZ).isoformat()
+            raw_events.append(
+                (
+                    ts,
+                    {
+                        "id": f"log:{r['log_id']}",
+                        "category": "horizons",
+                        "source_label": "群间见闻",
+                        "tone": "accent",
+                        "occurred_at": iso_ts,
+                        "title": f"精读《{title[:48]}》",
+                        "subtitle": (refl or digest)[:120],
+                        "target_plugin": PLUGIN_ID,
+                        "target_route": "horizons",
+                        "target_id": f"logs:{r['log_id']}",
+                    },
+                )
+            )
+
+        for r in int_rows:
+            topic = strip_raw_urls(str(r["topic"] or "")).strip()
+            summary = strip_raw_urls(str(r["summary"] or "")).strip()
+            ident_key = str(r["identity"] or "")
+            if not topic or _is_blocked(ident_key, f"{topic} {summary}"):
+                continue
+            ts = float(r["last_reinforced_at"] or 0.0)
+            iso_ts = datetime.fromtimestamp(ts, SHANGHAI_TZ).isoformat()
+            raw_events.append(
+                (
+                    ts,
+                    {
+                        "id": f"interest:{r['interest_id']}",
+                        "category": "horizons",
+                        "source_label": "群间见闻",
+                        "tone": "warm",
+                        "occurred_at": iso_ts,
+                        "title": f"萌发兴趣 · {topic[:40]}",
+                        "subtitle": summary[:120],
+                        "target_plugin": PLUGIN_ID,
+                        "target_route": "horizons",
+                        "target_id": f"overview:{r['interest_id']}",
+                    },
+                )
+            )
+
+        raw_events.sort(key=lambda pair: pair[0], reverse=True)
+        return [ev for _, ev in raw_events[:lim]]

@@ -195,6 +195,18 @@ function normalizeHeatPercent(raw) {
   return Math.min(100, Math.round(num));
 }
 
+function formatRemainingDecay(expiresAt, status) {
+  if (status === 'cooled') return tr('已冷却');
+  if (status === 'revoked') return tr('已撤回');
+  const exp = Number(expiresAt);
+  if (!Number.isFinite(exp) || exp <= 0) return '';
+  const diffSec = exp - (Date.now() / 1000);
+  if (diffSec <= 0) return tr('渐弱中');
+  if (diffSec < 3600) return tr('不足 1 小时');
+  if (diffSec < 86400) return `剩 ${Math.max(1, Math.round(diffSec / 3600))} 小时`;
+  return `剩 ${Math.max(1, Math.ceil(diffSec / 86400))} 天`;
+}
+
 function isMaskedSecret(val) {
   const s = String(val || '').trim();
   return Boolean(s && (s.includes('*') || s.includes('••') || s === '[REDACTED]'));
@@ -426,7 +438,7 @@ function renderOverview(overview) {
     kpiGrid.append(quotaCard, poolCard, interestCard, questionCard, modelCard);
   }
 
-  // Staged Interests
+  // Staged Interests with visual half-life decay progress bars
   const interests = Array.isArray(overview?.staged_interests) ? overview.staged_interests : [];
   const intCount = $('#interests-count-pill');
   if (intCount) intCount.textContent = String(interests.length);
@@ -437,12 +449,13 @@ function renderOverview(overview) {
       intList.append(el('div', 'empty-state', '当前角色暂无活跃暂存兴趣。角色在空闲清醒时阅读后将在此沉淀阶段性兴趣。'));
     } else {
       for (const item of interests) {
-        const card = el('article', 'item-card');
+        const card = el('article', 'item-card interest-card');
         const head = el('div', 'item-head');
         const titleWrap = el('div', 'item-title-group');
         titleWrap.append(el('h4', 'item-title', item.topic || '未命名话题'));
         const statusText = item.status === 'cooled' ? '已冷却' : item.status === 'revoked' ? '已撤回' : '活跃中';
-        titleWrap.append(el('span', `pill ${item.status === 'active' || !item.status ? 'accent' : ''}`, statusText));
+        const isActive = item.status === 'active' || !item.status;
+        titleWrap.append(el('span', `pill ${isActive ? 'warm' : ''}`, statusText));
 
         const actions = el('div', 'item-actions');
         actions.append(
@@ -464,18 +477,40 @@ function renderOverview(overview) {
         head.append(titleWrap, actions);
 
         const heatPct = normalizeHeatPercent(item.heat_score);
-        const heatRow = el('div', 'heat-row');
-        const track = el('div', 'meter-track');
-        const fill = el('div', 'meter-fill');
+        const toneCls = heatPct >= 70 ? 'is-hot' : heatPct < 40 ? 'is-fading' : '';
+        const remainText = formatRemainingDecay(item.expires_at, item.status);
+        const metricParts = [`热度 ${heatPct}%`];
+        if (remainText) metricParts.push(remainText);
+
+        const decayWrap = el('div', 'decay-bar-wrap');
+        const decayHeader = el('div', 'decay-header');
+        decayHeader.append(
+          el('span', 'decay-label', msg('半衰期衰减')),
+          el('span', `decay-metric ${toneCls}`.trim(), metricParts.join(' · ')),
+        );
+        const track = el('div', 'decay-track');
+        track.setAttribute('role', 'progressbar');
+        track.setAttribute('aria-label', `${item.topic || '兴趣'} 半衰期热度`);
+        track.setAttribute('aria-valuemin', '0');
+        track.setAttribute('aria-valuemax', '100');
+        track.setAttribute('aria-valuenow', String(heatPct));
+        const fill = el('div', `decay-fill ${toneCls}`.trim());
         fill.style.width = `${heatPct}%`;
-        track.append(fill);
-        heatRow.append(el('span', '', '兴趣热度'), track, el('span', '', `${heatPct}%`));
+        const midpoint = el('span', 'decay-midpoint');
+        midpoint.setAttribute('aria-hidden', 'true');
+        track.append(fill, midpoint);
+        decayWrap.append(decayHeader, track);
 
         card.append(head);
         if (item.summary) card.append(el('p', 'item-body', item.summary));
-        card.append(heatRow);
+        card.append(decayWrap);
         if (item.expires_at) {
-          card.append(el('div', 'item-meta', `自然衰减到期：${formatTime(item.expires_at)}`));
+          const metaRow = el('div', 'item-meta');
+          metaRow.append(el('span', '', `自然衰减到期：${formatTime(item.expires_at)}`));
+          if (item.half_life_days) {
+            metaRow.append(el('span', '', `半衰期 ${Number(item.half_life_days)} 天`));
+          }
+          card.append(metaRow);
         }
         intList.append(card);
       }
@@ -817,6 +852,11 @@ function renderLogs() {
     btn.setAttribute('aria-pressed', String((btn.dataset.logKind || '') === source_kind));
   }
 
+  const overviewQuestions = Array.isArray(state.overview?.discussion_questions)
+    ? state.overview.discussion_questions
+    : [];
+  const validKinds = new Set(['bilibili', 'ebook', 'feed', 'manual']);
+
   const list = $('#logs-list');
   if (list) {
     list.replaceChildren();
@@ -824,11 +864,12 @@ function renderLogs() {
       list.append(el('div', 'empty-state', '当前筛选下暂无阅读手账记录。'));
     } else {
       for (const item of items) {
-        const card = el('article', 'item-card');
+        const safeKind = validKinds.has(item.source_kind) ? item.source_kind : 'manual';
+        const card = el('article', `item-card journal-card kind-${safeKind}`);
         const head = el('div', 'item-head');
         const left = el('div', 'item-title-group');
         left.append(
-          el('span', 'pill accent', KIND_LABELS[item.source_kind] || item.source_kind || '见闻'),
+          el('span', `pill ${safeKind === 'bilibili' ? 'warm' : safeKind === 'feed' ? 'info' : 'accent'}`, KIND_LABELS[item.source_kind] || item.source_kind || '见闻'),
           el('span', 'citation-badge', formatCitationText(item.citation, item.source_kind)),
           ...buildWatchBadges(item),
         );
@@ -858,6 +899,23 @@ function renderLogs() {
         dual.append(digestPane, reflectionPane);
 
         card.append(head, dual);
+
+        // Pending discussion question chips linked to this journal entry
+        const attachedQs = Array.isArray(item.questions) && item.questions.length
+          ? item.questions
+          : overviewQuestions.filter(q => q.log_id && item.log_id && q.log_id === item.log_id);
+        if (attachedQs.length) {
+          const qStrip = el('div', 'journal-questions-strip');
+          for (const q of attachedQs.slice(0, 3)) {
+            const qText = typeof q === 'object' ? String(q.question || q.text || '').trim() : String(q || '').trim();
+            if (!qText) continue;
+            const chip = el('span', 'question-chip');
+            chip.append(el('span', 'question-chip-prefix', '待聊：'), el('span', '', qText));
+            qStrip.append(chip);
+          }
+          if (qStrip.childNodes.length) card.append(qStrip);
+        }
+
         const visualObs = buildVisualObservationsBlock(item);
         if (visualObs) card.append(visualObs);
         const discussionNotes = (item.discussion_reflections || []).slice(0, 5);
@@ -1542,13 +1600,71 @@ async function handleEbookUpload() {
 
 const HEALTH_LABELS = {disabled:'插件已停用',analysis_provider_missing:'请配置分析模型',review_provider_missing:'请配置审查模型',independent_review_provider_required:'分析与审查需要不同模型',chat_dynamics_missing:'未接入群间',chat_dynamics_bridge_missing:'群间见闻联动模块缺失',world_state_unavailable:'世界状态暂不可用',world_paused:'角色生活已暂停',world_asleep:'角色正在睡眠',world_busy:'角色正在忙碌',world_in_transit:'角色正在旅途中',quiet_hours:'当前为静默时段',character_profile_missing:'缺少有效角色设定',world_bookmark_capability_missing:'世界书签接口缺失'};
 function renderHealth(h) {
-  const box=$('#health-panel'); if (!box) return;
-  box.replaceChildren(el('h3','',msg('运行状态与恢复')));
-  if (!h) { box.append(el('p','',msg('等待状态信息'))); return; }
-  for (const reason of h.blockers || []) box.append(el('p','pill warn',msg(HEALTH_LABELS[reason] || reason)));
-  const d=h.diagnostics || {};
-  box.append(el('p','',msg('今日模型调用 {0}/{1} · 已归档候选 {2} · 存储 {3} MB',d.model_calls_today||0,h.model_call_quota,d.archived_candidates||0,(Number(d.storage_bytes||0)/1048576).toFixed(1))));
-  box.append(el('p','',msg('分析：{0}；审查：{1}',h.analysis_provider||msg('未配置'),h.review_provider||msg('未配置'))));
+  const box = $('#health-panel');
+  if (!box) return;
+  if (!h) {
+    const emptyWrap = el('div', 'health-summary-bar');
+    const left = el('div', 'health-summary-left');
+    left.append(
+      el('span', 'health-summary-title', msg('运行健康')),
+      el('span', 'health-summary-meta', msg('等待状态信息')),
+    );
+    emptyWrap.append(left);
+    box.replaceChildren(emptyWrap);
+    return;
+  }
+
+  const d = h.diagnostics || {};
+  const blockers = Array.isArray(h.blockers) ? h.blockers : [];
+  const activeReviewJobs = (d.review_jobs || []).filter(j => j.kind !== 'done');
+  const pendingCorrections = Array.isArray(d.corrections) ? d.corrections : [];
+  const storageMb = (Number(d.storage_bytes || 0) / 1048576).toFixed(1);
+  const quota = Number(h.model_call_quota) || 50;
+  const callsToday = Number(d.model_calls_today) || 0;
+  const storageOver = Number(d.storage_bytes || 0) > (h.storage_warning_mb || 512) * 1048576;
+
+  const disclosure = el('details', 'health-disclosure');
+  if (h.last_error || pendingCorrections.length > 0 || activeReviewJobs.length > 0 || storageOver) {
+    disclosure.open = true;
+  }
+
+  // Compact summary row (matches prototype!)
+  const summary = el('summary', 'health-summary-bar');
+  const left = el('div', 'health-summary-left');
+  left.append(el('span', 'health-summary-title', msg('运行健康')));
+  left.append(
+    el(
+      'span',
+      `pill ${callsToday >= quota ? 'warn' : 'accent'}`,
+      `今日模型 ${callsToday}/${quota}`,
+    ),
+  );
+  for (const reason of blockers) {
+    left.append(el('span', 'pill warn', msg(HEALTH_LABELS[reason] || reason)));
+  }
+
+  const policyShort = h.review_context_policy === 'merged_self_review'
+    ? '同模型合并自审'
+    : h.review_context_policy === 'independent_calls'
+      ? '同模型独立双调用'
+      : '双模型独立审查';
+  const metaParts = [`存储 ${storageMb} MB`, policyShort];
+  if (Number(d.archived_candidates) > 0) metaParts.push(`已归档 ${d.archived_candidates}`);
+  if (h.next_digest_at) metaParts.push(`下次检查 ${formatTime(h.next_digest_at)}`);
+  left.append(el('span', 'health-summary-meta', metaParts.join(' · ')));
+
+  const toggle = el('span', 'health-toggle-label', msg('展开诊断详情'));
+  summary.append(left, toggle);
+
+  // Collapsible diagnostic details body
+  const body = el('div', 'health-details-body');
+  const grid = el('div', 'health-details-grid');
+
+  const modelBox = el('div', 'health-detail-box');
+  modelBox.append(
+    el('strong', '', msg('模型与审查策略')),
+    el('p', '', msg('分析：{0}；审查：{1}', h.analysis_provider || msg('未配置'), h.review_provider || msg('未配置'))),
+  );
   if ('video_provider' in h || 'video_provider_explicit' in h || 'video_provider_fallback' in h) {
     const explicit = String(h.video_provider_explicit || '').trim();
     const effective = String(h.video_provider || '').trim();
@@ -1563,111 +1679,182 @@ function renderHealth(h) {
     }
     const stt = String(h.video_audio_stt_provider || '').trim();
     const lineText = stt ? `视频精读：${videoLabel}；音频转写：${stt}` : `视频精读：${videoLabel}`;
-    box.append(el('p', 'health-meta-line', lineText));
+    modelBox.append(el('p', 'health-meta-line', lineText));
   }
-  if(h.review_context_policy==='independent_calls') box.append(el('p','',msg('审查采用独立调用，不继承分析对话的历史上下文。')));
-  box.append(el('p','',msg('下次采集：{0}；下次阅读检查：{1}',formatTime(h.next_poll_at),formatTime(h.next_digest_at))));
+  if (h.review_context_policy === 'independent_calls') {
+    modelBox.append(el('p', '', msg('审查采用独立调用，不继承分析对话的历史上下文。')));
+  } else {
+    modelBox.append(el('p', '', msg('分析与审查模型相互隔离，不继承群聊历史上下文。')));
+  }
+
+  const schedBox = el('div', 'health-detail-box');
   const sharingScope = {
     disabled: statusMsg('sharingDisabled'),
     all_managed_chats: statusMsg('sharingAllChats'),
     all_managed_groups: msg('主动分享：所有已接管群；仅向有真实共同话题证据且未退订的成员分享'),
     explicit: statusMsg('sharingSelectedChats'),
   };
-  box.append(el('p', '', sharingScope[h.proactive_scope] || sharingScope.disabled));
+  schedBox.append(
+    el('strong', '', msg('调度与主动分享')),
+    el('p', '', msg('下次采集：{0}；下次阅读检查：{1}', formatTime(h.next_poll_at), formatTime(h.next_digest_at))),
+    el('p', '', msg('今日模型调用 {0}/{1} · 已归档候选 {2} · 存储 {3} MB', callsToday, quota, d.archived_candidates || 0, storageMb)),
+    el('p', '', sharingScope[h.proactive_scope] || sharingScope.disabled),
+  );
+
+  grid.append(modelBox, schedBox);
+  body.append(grid);
+
   if (h.last_error) {
-    if (readingCharacterChanged(h)) box.append(el('p', '', statusMsg('characterChanged')));
-    const details = el('details', 'item-card');
-    details.append(
+    if (readingCharacterChanged(h)) body.append(el('p', 'health-meta-line', statusMsg('characterChanged')));
+    const errDetails = el('details', 'item-card');
+    errDetails.append(
       el('summary', '', statusMsg('diagnostics')),
       el('code', '', h.last_error),
     );
-    box.append(details);
+    body.append(errDetails);
   }
-  if (d.storage_bytes > (h.storage_warning_mb || 512)*1048576) box.append(el('p','pill warn','存储超过告警阈值；只归档，不自动删除，可导出后人工管理。'));
+  if (storageOver) {
+    body.append(el('p', 'pill warn', '存储超过告警阈值；只归档，不自动删除，可导出后人工管理。'));
+  }
   if (d.feedback_jobs?.length) {
-    const reasons = {verified:'已核实讨论',not_recorded:'未形成共同话题',insufficient_evidence:'原话依据不足',
-      unrelated:'未讨论候选话题',no_verified_opening:'缺少已核实的分享',model_failure:'模型调用失败',
-      invalid_result:'模型结果格式错误',storage_failure:'写入失败',processing_failure:'处理失败',timeout:'超时',
-      quota_wait:'等待额度',legacy:'未记录原因'};
-    const statuses = {held:'已挂起',done:'已完成',pending:'等待处理',running:'处理中'};
-    const section = el('details','item-card');
-    section.append(el('summary','',msg('讨论反馈')));
+    const reasons = {
+      verified: '已核实讨论', not_recorded: '未形成共同话题', insufficient_evidence: '原话依据不足',
+      unrelated: '未讨论候选话题', no_verified_opening: '缺少已核实的分享', model_failure: '模型调用失败',
+      invalid_result: '模型结果格式错误', storage_failure: '写入失败', processing_failure: '处理失败', timeout: '超时',
+      quota_wait: '等待额度', legacy: '未记录原因',
+    };
+    const statuses = { held: '已挂起', done: '已完成', pending: '等待处理', running: '处理中' };
+    const section = el('details', 'item-card');
+    section.append(el('summary', '', msg('讨论反馈')));
     for (const group of d.feedback_jobs) {
-      section.append(el('p','item-meta', [msg(statuses[group.status] || '未知状态'),
-        msg(reasons[group.outcome] || '未记录原因'), String(group.count)].join(' · ')));
+      section.append(el('p', 'item-meta', [
+        msg(statuses[group.status] || '未知状态'),
+        msg(reasons[group.outcome] || '未记录原因'),
+        String(group.count),
+      ].join(' · ')));
     }
-    box.append(section);
+    body.append(section);
   }
-  for (const job of d.review_jobs || []) {
-    if (job.kind==='done') continue;
-    const line=el('div','item-actions',`${job.kind} · 重试 ${job.attempts} · ${formatTime(job.next_at)} ${job.last_error || ''}`);
+  for (const job of activeReviewJobs) {
+    const line = el('div', 'item-actions', `${job.kind} · 重试 ${job.attempts} · ${formatTime(job.next_at)} ${job.last_error || ''}`);
     if (job.review_reason !== 'source_changed') {
       line.append(actionButton(msg('重试审核'), async () => {
         await apiPost('reviews', {
-          op: 'retry_review', proposal_id: job.proposal_id,
-          identity: job.identity || state.identity, revision: job.revision,
+          op: 'retry_review',
+          proposal_id: job.proposal_id,
+          identity: job.identity || state.identity,
+          revision: job.revision,
         });
         notify('已将提案加入审核队列。', 'success');
         await loadOverview({ silent: true });
       }));
     }
-    box.append(line);
+    body.append(line);
   }
-  for (const job of d.world_pending || []) box.append(el('p','item-meta',`书签同步 ${job.operation} · ${job.attempts} 次 · ${job.last_error || '待处理'}`));
-  for (const correction of d.corrections || []) {
-    const line=el('div','item-card',`${correction.umo} / ${correction.member_id}：${correction.statement}`);
+  for (const job of d.world_pending || []) {
+    body.append(el('p', 'item-meta', `书签同步 ${job.operation} · ${job.attempts} 次 · ${job.last_error || '待处理'}`));
+  }
+  for (const correction of pendingCorrections) {
+    const line = el('div', 'item-card', `${correction.umo} / ${correction.member_id}：${correction.statement}`);
     for (const [label, resolution] of [['确认并撤销原手记', 'revoke'], ['驳回纠错', 'dismiss']]) {
       line.append(actionButton(label, async () => {
         await apiPost('reviews', {
-          op: 'resolve_correction', correction_id: correction.correction_id,
-          identity: correction.identity || state.identity, resolution,
+          op: 'resolve_correction',
+          correction_id: correction.correction_id,
+          identity: correction.identity || state.identity,
+          resolution,
         });
         await loadOverview({ silent: true });
       }));
     }
-    box.append(line);
+    body.append(line);
   }
+
+  disclosure.append(summary, body);
+  box.replaceChildren(disclosure);
 }
-let archivePage=1, archiveMode=true;
+let archivePage = 1, archiveMode = true;
 function renderArchiveControls() {
-  const box=$('#archive-panel'); if (!box || box.dataset.ready===state.identity) return;
-  box.dataset.ready=state.identity; box.replaceChildren(el('h3','',msg('候选与归档')));
-  const input=el('input');setText(input,msg('按标题或摘要查询'),'placeholder');setText(input,msg('候选查询'),'aria-label');
-  const results=el('div');const actions=el('div','item-actions');
+  const box = $('#archive-panel');
+  if (!box || box.dataset.ready === state.identity) return;
+  box.dataset.ready = state.identity;
+
+  const disclosure = el('details', 'archive-disclosure');
+  const summary = el('summary', 'archive-summary-bar');
+  const summaryLeft = el('div', 'health-summary-left');
+  summaryLeft.append(
+    el('span', 'health-summary-title', msg('候选与归档')),
+    el('span', 'health-summary-meta', msg('检索活跃候选、历史归档或导出 JSON')),
+  );
+  summary.append(summaryLeft, el('span', 'health-toggle-label', msg('展开检索')));
+
+  const body = el('div', 'archive-body');
+  const input = el('input');
+  setText(input, msg('按标题或摘要查询'), 'placeholder');
+  setText(input, msg('候选查询'), 'aria-label');
+  const results = el('div', 'stack-list');
+  const actions = el('div', 'item-actions');
   const identity = state.identity;
   let maxPage = 1;
   async function load(page = archivePage) {
     const valid = nextTicket('archive');
-    const data=await apiGet('sources',{identity,candidates:'1',archived:archiveMode?'1':'0',page,query:input.value});
+    const data = await apiGet('sources', { identity, candidates: '1', archived: archiveMode ? '1' : '0', page, query: input.value });
     if (!valid()) return;
     archivePage = Number(data.page) || page;
     maxPage = Math.max(1, Math.ceil(data.total / data.page_size));
     previousPage.disabled = archivePage <= 1;
     nextPage.disabled = archivePage >= maxPage;
-    results.replaceChildren(el('p','',msg('第 {0} / {1} 页 · 共 {2} 条',archivePage,maxPage,data.total)));
+    results.replaceChildren(el('p', 'page-info', msg('第 {0} / {1} 页 · 共 {2} 条', archivePage, maxPage, data.total)));
     for (const item of data.items || []) {
-      const row=el('details','item-card');row.append(el('summary','',item.title));row.append(el('p','item-body',item.full_text || item.summary));
-      row.append(actionButton(item.pinned?'取消置顶':'置顶',async()=>{await apiPost('reviews',{op:'candidate_update',identity,candidate_id:item.candidate_id,pinned:!item.pinned});await load();}));
-      row.append(actionButton(item.archived?'恢复至活跃池':'归档',async()=>{await apiPost('reviews',{op:'candidate_update',identity,candidate_id:item.candidate_id,archived:!item.archived});await load();}));results.append(row);
+      const row = el('details', 'item-card');
+      row.append(el('summary', '', item.title));
+      row.append(el('p', 'item-body', item.full_text || item.summary));
+      const rowActions = el('div', 'item-actions');
+      rowActions.append(
+        actionButton(item.pinned ? '取消置顶' : '置顶', async () => {
+          await apiPost('reviews', { op: 'candidate_update', identity, candidate_id: item.candidate_id, pinned: !item.pinned });
+          await load();
+        }),
+        actionButton(item.archived ? '恢复至活跃池' : '归档', async () => {
+          await apiPost('reviews', { op: 'candidate_update', identity, candidate_id: item.candidate_id, archived: !item.archived });
+          await load();
+        }),
+      );
+      row.append(rowActions);
+      results.append(row);
     }
     return data;
   }
   const previousPage = actionButton(msg('上一页'), () => load(archivePage - 1), 'wb-button', () => archivePage <= 1);
   const nextPage = actionButton(msg('下一页'), () => load(archivePage + 1), 'wb-button', () => archivePage >= maxPage);
-  actions.append(actionButton(msg('查询归档'),async()=>{archiveMode=true;archivePage=1;await load();}),actionButton(msg('查看活跃候选'),async()=>{archiveMode=false;archivePage=1;await load();}),previousPage,nextPage,actionButton(msg('导出查询结果'),async()=>{
-    const valid = nextTicket('archiveExport');
-    const archived = archiveMode ? '1' : '0';
-    const query = input.value;
-    const items = new Map();
-    for (let page = 1; ; page += 1) {
-      const data = await apiGet('sources', {identity, candidates: '1', archived, page, query});
-      if (!valid()) return;
-      if (Number(data.page) !== page || !data.items.length) break;
-      for (const item of data.items) items.set(item.candidate_id, item);
-      if (page >= Math.ceil(data.total / data.page_size)) break;
-    }
-    const url=URL.createObjectURL(new Blob([JSON.stringify([...items.values()],null,2)],{type:'application/json'}));const a=el('a');a.href=url;a.download='horizons-candidates.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
-  }));box.append(input,actions,results);
+  actions.append(
+    actionButton(msg('查询归档'), async () => { archiveMode = true; archivePage = 1; await load(); }),
+    actionButton(msg('查看活跃候选'), async () => { archiveMode = false; archivePage = 1; await load(); }),
+    previousPage,
+    nextPage,
+    actionButton(msg('导出查询结果'), async () => {
+      const valid = nextTicket('archiveExport');
+      const archived = archiveMode ? '1' : '0';
+      const query = input.value;
+      const items = new Map();
+      for (let page = 1; ; page += 1) {
+        const data = await apiGet('sources', { identity, candidates: '1', archived, page, query });
+        if (!valid()) return;
+        if (Number(data.page) !== page || !data.items.length) break;
+        for (const item of data.items) items.set(item.candidate_id, item);
+        if (page >= Math.ceil(data.total / data.page_size)) break;
+      }
+      const url = URL.createObjectURL(new Blob([JSON.stringify([...items.values()], null, 2)], { type: 'application/json' }));
+      const a = el('a');
+      a.href = url;
+      a.download = 'horizons-candidates.json';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }),
+  );
+  body.append(input, actions, results);
+  disclosure.append(summary, body);
+  box.replaceChildren(disclosure);
 }
 
 /* ===== Event Wiring & Bootstrap ===== */
@@ -1837,13 +2024,59 @@ function bindEvents() {
       submitBlockTopic();
     }
   });
+
+  // Close compact (i) info popovers on outside click or Escape
+  document.addEventListener('click', ev => {
+    for (const pop of $$('.info-popover[open]')) {
+      if (!pop.contains(ev.target)) pop.open = false;
+    }
+  });
+  document.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape') {
+      for (const pop of $$('.info-popover[open]')) pop.open = false;
+    }
+  });
+
+  // Handle same-plugin Ctrl+K federated search deep links from series-panels.js v2
+  window.addEventListener('dynamics-cmdk-deeplink', ev => {
+    const item = ev?.detail || {};
+    const dl = item.deep_link;
+    const validTabs = new Set(['overview', 'sources', 'logs', 'reviews']);
+    let targetTab = '';
+    let targetIdentity = '';
+    if (dl && typeof dl === 'object') {
+      if (typeof dl.tab === 'string' && validTabs.has(dl.tab)) targetTab = dl.tab;
+      if (typeof dl.identity === 'string' && dl.identity.trim()) targetIdentity = dl.identity.trim();
+    } else if (typeof dl === 'string') {
+      const prefix = dl.split(':', 1)[0];
+      if (validTabs.has(prefix)) targetTab = prefix;
+    }
+    if (!targetTab && typeof item.target_id === 'string') {
+      const prefix = item.target_id.split(':', 1)[0];
+      if (validTabs.has(prefix)) targetTab = prefix;
+    }
+    if (targetIdentity && targetIdentity !== state.identity) {
+      changePersona(targetIdentity);
+    }
+    if (targetTab && targetTab !== state.tab) {
+      switchTab(targetTab);
+    }
+  });
 }
 
 async function init() {
   initTheme();
   bindEvents();
+  const params = new URLSearchParams(location.search);
+  const reqIdentity = params.get('identity');
+  if (reqIdentity) state.identity = reqIdentity;
+  const reqTab = params.get('tab');
+  const validTabs = new Set(['overview', 'sources', 'logs', 'reviews']);
   try {
     await loadOverview();
+    if (reqTab && validTabs.has(reqTab) && reqTab !== 'overview') {
+      await switchTab(reqTab);
+    }
   } catch (err) {
     notify(err?.message || tr('请从 AstrBot 控制台打开'), 'error');
   }
