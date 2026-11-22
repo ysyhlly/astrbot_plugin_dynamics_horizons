@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 
+from ..series_panels import is_series_group_excluded
 from .contract import (
     chat_umo_kind,
     encode_json,
@@ -45,6 +46,8 @@ def enqueue(engine, event):
     ).strip()
     if not umo or engine.sessions and umo not in engine.sessions:
         return {"accepted": False}
+    if is_series_group_excluded(getattr(engine, "context", None), umo=umo):
+        return {"accepted": False, "reason": "excluded_by_core"}
     if scope.get("umo") and scope["umo"] != umo:
         return {"accepted": False, "reason": "scope_mismatch"}
     ident = (

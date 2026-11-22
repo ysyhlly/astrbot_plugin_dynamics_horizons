@@ -6,11 +6,11 @@ import hashlib
 import json
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 PLUGIN_ID = "astrbot_plugin_dynamics_horizons"
-PLUGIN_VERSION = "0.2.0-rc.6"
+PLUGIN_VERSION = "0.2.0-rc.7"
 SCHEMA_VERSION = 1
 
 SOURCE_KINDS = ("bilibili", "ebook", "feed", "manual")
@@ -209,27 +209,31 @@ def parse_quiet_hours(spec: str) -> tuple[int, int] | None:
     return (start, end)
 
 
-def is_in_quiet_hours(timestamp: float, spec: str = "00:00-08:00") -> bool:
+def is_in_quiet_hours(
+    timestamp: float, spec: str = "00:00-08:00", *, tz=None
+) -> bool:
     parsed = parse_quiet_hours(spec)
     if parsed is None:
         return False
     start, end = parsed
-    local = datetime.fromtimestamp(float(timestamp), SHANGHAI_TZ)
+    local = datetime.fromtimestamp(float(timestamp), tz or SHANGHAI_TZ)
     minute_of_day = local.hour * 60 + local.minute
     if start < end:
         return start <= minute_of_day < end
     return minute_of_day >= start or minute_of_day < end
 
 
-def shanghai_day_key(timestamp: float) -> str:
-    return datetime.fromtimestamp(float(timestamp), SHANGHAI_TZ).strftime("%Y-%m-%d")
+def shanghai_day_key(timestamp: float, *, tz=None) -> str:
+    return datetime.fromtimestamp(float(timestamp), tz or SHANGHAI_TZ).strftime(
+        "%Y-%m-%d"
+    )
 
 
-def shanghai_day_bounds(timestamp: float) -> tuple[float, float]:
-    local = datetime.fromtimestamp(float(timestamp), SHANGHAI_TZ)
+def shanghai_day_bounds(timestamp: float, *, tz=None) -> tuple[float, float]:
+    local = datetime.fromtimestamp(float(timestamp), tz or SHANGHAI_TZ)
     start = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_ts = start.timestamp()
-    return start_ts, start_ts + 86400.0
+    end = start + timedelta(days=1)
+    return start.timestamp(), end.timestamp()
 
 
 def compute_decayed_heat(

@@ -32,7 +32,6 @@ from .core.contract import (
     PLUGIN_ID,
     PLUGIN_VERSION,
     SCHEMA_VERSION,
-    SHANGHAI_TZ,
     decode_model_object,
     encode_json,
     normalize_identity,
@@ -44,7 +43,15 @@ from .core.io import run_io
 from .core.projection import _empty_result
 from .core.store import HorizonsStore
 from .core.web_api import HorizonsWebAPI
-from .series_panels import get_series_defaults, inherit_provider
+from .series_panels import (
+    get_series_defaults,
+    is_provider_budget_busy_error,
+    is_series_group_excluded,
+    is_series_in_quiet_hours,
+    resolve_series_provider,
+    resolve_series_timezone,
+    series_llm_call,
+)
 
 
 class _BindingChangedError(ValueError):
@@ -529,8 +536,9 @@ class Main(Star):
                 float(eng.last_digest_at or 0.0),
                 float(eng.last_poll_at or 0.0),
             )
+            tz = resolve_series_timezone(getattr(self, "context", None))
             updated_at = (
-                datetime.fromtimestamp(latest_ts, SHANGHAI_TZ).isoformat()
+                datetime.fromtimestamp(latest_ts, tz).isoformat()
                 if latest_ts > 0
                 else ""
             )
@@ -559,9 +567,15 @@ class Main(Star):
                 }
             eng = self.engine
             now = eng.clock()
+            tz = eng.timezone
+            excluded_by_core = bool(
+                clean_umo and is_series_group_excluded(self.context, umo=clean_umo)
+            )
             plugin_enabled = bool(self.config.get("enabled", True))
             sessions = eng.sessions
-            if not clean_umo:
+            if excluded_by_core:
+                scope_enabled = False
+            elif not clean_umo:
                 scope_enabled = plugin_enabled
             elif sessions:
                 scope_enabled = plugin_enabled and (clean_umo in sessions)
@@ -578,7 +592,7 @@ class Main(Star):
                 today_logs = 0
             else:
                 activity_today = eng.store.count_scope_activity_today(
-                    clean_umo, identity=identity, allow_all=allow_all, now=now
+                    clean_umo, identity=identity, allow_all=allow_all, now=now, tz=tz
                 )
                 counts = eng.store.summary_counts(
                     identity,
@@ -587,10 +601,12 @@ class Main(Star):
                     half_life_days=eng.half_life_days,
                 )
                 today_logs, _ = eng.store.count_today_logs_and_latest(
-                    identity, now=now, allow_all=allow_all
+                    identity, now=now, allow_all=allow_all, tz=tz
                 )
 
-            if not plugin_enabled:
+            if excluded_by_core:
+                summary_text = "主控排除（群间见闻已静默跳过）"
+            elif not plugin_enabled:
                 summary_text = "插件已停用"
             elif not scope_enabled:
                 summary_text = "未在当前会话白名单内"
@@ -605,7 +621,7 @@ class Main(Star):
                     parts.append("主动分享开启")
                 summary_text = " · ".join(parts)
 
-            return {
+            result = {
                 "enabled": scope_enabled,
                 "supported": False,
                 "persona_id": persona_id,
@@ -613,6 +629,9 @@ class Main(Star):
                 "summary": summary_text,
                 "version": int(eng.projection.generation),
             }
+            if excluded_by_core:
+                result["excluded_by_core"] = True
+            return result
         except Exception:
             return {
                 "enabled": None,
@@ -683,22 +702,23 @@ class Main(Star):
                 return []
 
             now = eng.clock()
+            tz = eng.timezone
             raw_date = str(date or "today").strip().lower()
             if not raw_date or raw_date == "today":
-                start_ts, end_ts = shanghai_day_bounds(now)
+                start_ts, end_ts = shanghai_day_bounds(now, tz=tz)
             elif raw_date == "yesterday":
-                start_ts, end_ts = shanghai_day_bounds(now - 86400.0)
+                start_ts, end_ts = shanghai_day_bounds(now - 86400.0, tz=tz)
             elif raw_date in {"all", "recent"}:
                 start_ts, end_ts = now - 7 * 86400.0, now + 60.0
             else:
                 try:
                     parsed = datetime.strptime(raw_date[:10], "%Y-%m-%d").replace(
-                        tzinfo=SHANGHAI_TZ
+                        tzinfo=tz
                     )
                     start_ts = parsed.timestamp()
                     end_ts = start_ts + 86400.0
                 except ValueError:
-                    start_ts, end_ts = shanghai_day_bounds(now)
+                    start_ts, end_ts = shanghai_day_bounds(now, tz=tz)
 
             identity, allow_all = self._resolve_query_identity_readonly(
                 persona=str(persona or "").strip(), scope=clean_scope
@@ -715,6 +735,7 @@ class Main(Star):
                 start_ts=start_ts,
                 end_ts=end_ts,
                 limit=lim,
+                tz=tz,
             )
         except Exception:
             return []
@@ -735,6 +756,15 @@ class Main(Star):
         """Pure in-memory lookup; performs ZERO SQLite, disk, network, or LLM I/O."""
         if self.closed or not self.ready or self.engine is None:
             return _empty_result("not_ready")
+        scope_umo = ""
+        if isinstance(scope, str):
+            scope_umo = scope.strip()
+        elif isinstance(scope, dict):
+            scope_umo = str(scope.get("umo") or "").strip()
+        if not scope_umo and isinstance(character_scope, dict):
+            scope_umo = str(character_scope.get("umo") or "").strip()
+        if scope_umo and is_series_group_excluded(self.context, umo=scope_umo):
+            return _empty_result("excluded_by_core")
         return self.engine.projection.query(
             enabled=bool(self.config.get("enabled", True)),
             ready=bool(self.ready and not self.closed),
@@ -775,11 +805,13 @@ class Main(Star):
     # ------------------------------------------------------------------
 
     def horizons_outreach_allowed(self, umo: str) -> bool:
+        clean_umo = str(umo or "")
         return bool(
             not self.closed
             and self.ready
             and self.engine
-            and self.engine.outreach_allowed(str(umo or ""))
+            and not is_series_group_excluded(self.context, umo=clean_umo)
+            and self.engine.outreach_allowed(clean_umo)
         )
 
     def list_due_intents(self, now: float | None = None) -> list[dict[str, Any]]:
@@ -788,6 +820,7 @@ class Main(Star):
             or not self.ready
             or self.engine is None
             or not self.config.get("enabled", True)
+            or is_series_in_quiet_hours(self.context)
         ):
             return []
         stamp = float(now) if isinstance(now, (int, float)) else self.engine.clock()
@@ -795,6 +828,7 @@ class Main(Star):
             stamp,
             proactive_sessions=self.engine.effective_proactive_sessions(),
             quiet_hours=self.engine.quiet_hours,
+            tz=self.engine.timezone,
         )
 
     def get_intent(self, intent_id: str) -> dict[str, Any]:
@@ -842,7 +876,12 @@ class Main(Star):
         if role == "video_provider":
             return self._effective_provider("analysis_provider")
         if role == "analysis_provider":
-            return inherit_provider("", self.context, role="reply")
+            return resolve_series_provider(
+                self.context,
+                "",
+                fallback_provider=HorizonsEngine._host_default_provider_id(self.context),
+                role="reply",
+            )
         if role == "review_provider":
             defaults = get_series_defaults(self.context)
             decision_p = str(defaults.get("decision_provider") or "").strip()
@@ -852,7 +891,14 @@ class Main(Star):
             ):
                 return decision_p
             if allow_same:
-                return inherit_provider("", self.context, role="reply")
+                return resolve_series_provider(
+                    self.context,
+                    "",
+                    fallback_provider=HorizonsEngine._host_default_provider_id(
+                        self.context
+                    ),
+                    role="reply",
+                )
         return ""
 
     def _assert_binding_current(self, role: str, provider_id: str, provider: Any) -> None:
@@ -925,20 +971,34 @@ class Main(Star):
                     )
                     async with asyncio.timeout(effective_timeout):
                         if _resolve_genai_generate_fn(provider) is not None:
-                            content = await _invoke_genai_native_video(
-                                provider,
-                                instruction=instruction,
-                                payload=payload,
-                                video_bytes=video_bytes,
-                                mime_type=mime_type,
+                            content = await series_llm_call(
+                                self.context,
+                                provider_id,
+                                PLUGIN_ID,
+                                f"horizons_{role}_video",
+                                lambda: _invoke_genai_native_video(
+                                    provider,
+                                    instruction=instruction,
+                                    payload=payload,
+                                    video_bytes=video_bytes,
+                                    mime_type=mime_type,
+                                ),
+                                acquire_timeout=min(15.0, float(effective_timeout)),
                             )
                         else:
-                            content = await _invoke_openai_gemini_native_video(
-                                provider,
-                                instruction=instruction,
-                                payload=payload,
-                                video_bytes=video_bytes,
-                                mime_type=mime_type,
+                            content = await series_llm_call(
+                                self.context,
+                                provider_id,
+                                PLUGIN_ID,
+                                f"horizons_{role}_video",
+                                lambda: _invoke_openai_gemini_native_video(
+                                    provider,
+                                    instruction=instruction,
+                                    payload=payload,
+                                    video_bytes=video_bytes,
+                                    mime_type=mime_type,
+                                ),
+                                acquire_timeout=min(15.0, float(effective_timeout)),
                             )
                     self._assert_binding_current(role, provider_id, provider)
                     return decode_model_object(content)
@@ -947,6 +1007,8 @@ class Main(Star):
                 except _BindingChangedError as exc:
                     raise ValueError(str(exc)) from None
                 except Exception as exc:
+                    if is_provider_budget_busy_error(exc):
+                        raise
                     logger.warning(
                         "[DynamicsHorizons] Native video channel failed (%s); attempting keyframe fallback",
                         type(exc).__name__,
@@ -1077,10 +1139,24 @@ class Main(Star):
         if image_urls:
             call_kwargs["image_urls"] = image_urls
             async with asyncio.timeout(effective_timeout):
-                response = await provider.text_chat(**call_kwargs)
+                response = await series_llm_call(
+                    self.context,
+                    provider_id,
+                    PLUGIN_ID,
+                    f"horizons_{role}",
+                    lambda: provider.text_chat(**call_kwargs),
+                    acquire_timeout=min(15.0, float(effective_timeout)),
+                )
         else:
             async with asyncio.timeout(base_timeout):
-                response = await provider.text_chat(**call_kwargs)
+                response = await series_llm_call(
+                    self.context,
+                    provider_id,
+                    PLUGIN_ID,
+                    f"horizons_{role}",
+                    lambda: provider.text_chat(**call_kwargs),
+                    acquire_timeout=min(15.0, float(base_timeout)),
+                )
         try:
             self._assert_binding_current(role, provider_id, provider)
         except _BindingChangedError as exc:

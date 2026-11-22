@@ -1,5 +1,11 @@
 # 更新日志
 
+## v0.2.0-rc.7 — 2026-11-22
+
+- 接入全系列共享 `ProviderBudget` 并发池与遥测上报（覆盖 `main.py` 与 `core/engine.py` 精读/审查调用），遇队列繁忙可平滑延后。
+- 下沉主控共享配置（SSOT）：替换硬编码时区为共享时区解析；默认模型支持主控 `reply_provider` 兜底；全面联动 `exclude_groups` 排除护栏及 `quiet_hours` 定时主动播报抑制。
+- 同步按语言拆包的 `series-messages.js` 轻加载器（`series-messages-{en,ja,ru}.js` 按需懒加载）及统一 `series_panels.py`。
+
 ## v0.2.0-rc.6 — 2026-11-21
 
 - 升级群间系列面板 v2：新增跨插件只读状态摘要、群控矩阵状态、联邦搜索与世界生活手账钩子，并同步新版共享面板 UI Kit 与品牌视觉资源。

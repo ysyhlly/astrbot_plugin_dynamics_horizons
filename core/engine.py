@@ -14,9 +14,17 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
-from ..series_panels import get_series_defaults, inherit_provider, inherit_umos
+from ..series_panels import (
+    get_series_defaults,
+    inherit_umos,
+    is_provider_budget_busy_error,
+    resolve_series_provider,
+    resolve_series_timezone,
+    series_llm_call,
+)
 from .contract import (
     PERSONALITY_REDLINE,
+    PLUGIN_ID,
     REVIEW_MODES,
     SOURCE_KINDS,
     compact_json,
@@ -650,10 +658,17 @@ class HorizonsEngine(EngineLifecycle):
                     if callable(get_text):
                         raw = await get_text(audio_path)
                         return str(raw or "").strip()
-                    resp = await text_chat(
-                        prompt="请客观转写这段音频中的主要人声内容，保持简洁准确，不要添加额外评论或猜测。",
-                        audio_urls=[audio_path],
-                        contexts=[],
+                    resp = await series_llm_call(
+                        self.context,
+                        stt_id,
+                        PLUGIN_ID,
+                        "horizons_audio_stt",
+                        lambda: text_chat(
+                            prompt="请客观转写这段音频中的主要人声内容，保持简洁准确，不要添加额外评论或猜测。",
+                            audio_urls=[audio_path],
+                            contexts=[],
+                        ),
+                        acquire_timeout=min(15.0, float(timeout_sec)),
                     )
                     return str(getattr(resp, "completion_text", "") or "").strip()
             except Exception:
@@ -685,6 +700,8 @@ class HorizonsEngine(EngineLifecycle):
 
     @staticmethod
     def _is_non_fallback_error(exc: Exception) -> bool:
+        if is_provider_budget_busy_error(exc):
+            return True
         msg = str(exc)
         return any(marker in msg for marker in _NON_FALLBACK_ERROR_MARKERS)
 
@@ -767,6 +784,33 @@ class HorizonsEngine(EngineLifecycle):
                 compact["media_meta"] = compact_meta
         return compact
 
+    @staticmethod
+    def _host_default_provider_id(context: Any) -> str:
+        if context is None:
+            return ""
+        getter = getattr(context, "get_using_provider", None)
+        if not callable(getter):
+            return ""
+        try:
+            prov = getter()
+        except Exception:
+            return ""
+        if prov is None:
+            return ""
+        meta = getattr(prov, "meta", None)
+        if callable(meta):
+            try:
+                meta = meta()
+            except Exception:
+                meta = None
+        meta_id = getattr(meta, "id", None) if meta is not None else None
+        pid = meta_id or getattr(prov, "provider_id", None) or getattr(prov, "id", None)
+        return str(pid or "").strip()
+
+    @property
+    def timezone(self):
+        return resolve_series_timezone(self.context)
+
     def effective_provider(self, role: str) -> str:
         explicit = str(self.config.get(role, "") or "").strip()
         if explicit:
@@ -778,7 +822,12 @@ class HorizonsEngine(EngineLifecycle):
         if self.context is None:
             return ""
         if role == "analysis_provider":
-            return inherit_provider("", self.context, role="reply")
+            return resolve_series_provider(
+                self.context,
+                "",
+                fallback_provider=self._host_default_provider_id(self.context),
+                role="reply",
+            )
         if role == "review_provider":
             defaults = get_series_defaults(self.context)
             decision_p = str(defaults.get("decision_provider") or "").strip()
@@ -788,7 +837,12 @@ class HorizonsEngine(EngineLifecycle):
             ):
                 return decision_p
             if allow_same:
-                return inherit_provider("", self.context, role="reply")
+                return resolve_series_provider(
+                    self.context,
+                    "",
+                    fallback_provider=self._host_default_provider_id(self.context),
+                    role="reply",
+                )
         return ""
 
     @property
@@ -1177,11 +1231,13 @@ class HorizonsEngine(EngineLifecycle):
             }
 
         # 1. Wake & World Perception Gate
+        tz = self.timezone
         wake = await self.world_bridge.inspect_wake_and_profile(
             norm_id,
             now=now,
             quiet_hours=self.quiet_hours,
             sessions=self.sessions,
+            tz=tz,
         )
         if not wake["awake"]:
             return {
@@ -1193,7 +1249,7 @@ class HorizonsEngine(EngineLifecycle):
             }
 
         # 2. Daily Quota Gate
-        used_today = await run_io(self.store.count_today_digests, norm_id, now)
+        used_today = await run_io(self.store.count_today_digests, norm_id, now, tz=tz)
         remaining = max(0, self.daily_quota - used_today)
         if remaining <= 0:
             return {
@@ -2330,6 +2386,7 @@ class HorizonsEngine(EngineLifecycle):
                 now=self.clock(),
                 quiet_hours=self.quiet_hours,
                 sessions=self.sessions,
+                tz=self.timezone,
             )
 
         if not character_profile.get("awake") or not character_profile.get(
@@ -2407,9 +2464,20 @@ class HorizonsEngine(EngineLifecycle):
         except Exception as exc:
             self.review_status = f"error:{type(exc).__name__}"
             self.last_error = str(exc)[:200]
+            if is_provider_budget_busy_error(exc):
+                now_ts = self.clock()
+                await run_io(
+                    self.store.defer_review,
+                    proposal_id,
+                    now_ts,
+                    "provider_budget_busy",
+                    expected_revision=captured_revision,
+                    delay=120.0,
+                )
+                return proposal
             if "quota_reached" in str(exc):
                 now_ts = self.clock()
-                _, next_day = shanghai_day_bounds(now_ts)
+                _, next_day = shanghai_day_bounds(now_ts, tz=self.timezone)
                 await run_io(
                     self.store.defer_review,
                     proposal_id,

@@ -2290,9 +2290,11 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             "total": int(total),
         }
 
-    def count_today_digests(self, identity: str, now: float | None = None) -> int:
+    def count_today_digests(
+        self, identity: str, now: float | None = None, *, tz=None
+    ) -> int:
         stamp = float(now if now is not None else time.time())
-        start, end = shanghai_day_bounds(stamp)
+        start, end = shanghai_day_bounds(stamp, tz=tz)
         with self.lock:
             n = self.db.execute(
                 "SELECT count(*) FROM reading_attempts WHERE identity=? AND created_at>=? AND created_at<?",
@@ -2801,9 +2803,10 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         *,
         proactive_sessions: list[str] | None = None,
         quiet_hours: str = "00:00-08:00",
+        tz=None,
     ) -> list[dict[str, Any]]:
         stamp = float(now if now is not None else time.time())
-        if is_in_quiet_hours(stamp, quiet_hours):
+        if is_in_quiet_hours(stamp, quiet_hours, tz=tz):
             return []
         allowed = {
             str(u).strip() for u in (proactive_sessions or []) if str(u or "").strip()
@@ -3262,10 +3265,11 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         now: float | None = None,
         *,
         allow_all: bool = False,
+        tz=None,
     ) -> tuple[int, float]:
-        """Return (active logs created today in Asia/Shanghai, latest log created_at)."""
+        """Return (active logs created today in configured timezone, latest log created_at)."""
         stamp = float(now if now is not None else time.time())
-        start, end = shanghai_day_bounds(stamp)
+        start, end = shanghai_day_bounds(stamp, tz=tz)
         norm = normalize_identity(identity) if str(identity or "").strip() else ""
         if not norm and not allow_all:
             return 0, 0.0
@@ -3308,9 +3312,10 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         now: float | None = None,
         *,
         allow_all: bool = False,
+        tz=None,
     ) -> int:
         stamp = float(now if now is not None else time.time())
-        start, end = shanghai_day_bounds(stamp)
+        start, end = shanghai_day_bounds(stamp, tz=tz)
         clean_umo = str(umo or "").strip()
         norm = normalize_identity(identity) if str(identity or "").strip() else ""
         total = 0
@@ -3567,8 +3572,10 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         start_ts: float,
         end_ts: float,
         limit: int = 20,
+        tz=None,
     ) -> list[dict[str, Any]]:
         """Read-only reading & interest events within [start_ts, end_ts) for World's Living Journal."""
+        event_tz = tz or SHANGHAI_TZ
         lim = max(1, min(100, int(limit or 20)))
         norm = normalize_identity(identity) if str(identity or "").strip() else ""
         if not norm and not allow_all:
@@ -3615,7 +3622,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             if _is_blocked(ident_key, f"{title} {digest}"):
                 continue
             ts = float(r["created_at"] or 0.0)
-            iso_ts = datetime.fromtimestamp(ts, SHANGHAI_TZ).isoformat()
+            iso_ts = datetime.fromtimestamp(ts, event_tz).isoformat()
             raw_events.append(
                 (
                     ts,
@@ -3641,7 +3648,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             if not topic or _is_blocked(ident_key, f"{topic} {summary}"):
                 continue
             ts = float(r["last_reinforced_at"] or 0.0)
-            iso_ts = datetime.fromtimestamp(ts, SHANGHAI_TZ).isoformat()
+            iso_ts = datetime.fromtimestamp(ts, event_tz).isoformat()
             raw_events.append(
                 (
                     ts,

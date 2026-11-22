@@ -8,6 +8,7 @@ import inspect
 import time
 from typing import Any
 
+from ..series_panels import is_series_in_quiet_hours, resolve_series_timezone
 from .contract import (
     is_in_quiet_hours,
     make_identity,
@@ -260,6 +261,7 @@ class WorldBridge:
         now: float | None = None,
         quiet_hours: str = "00:00-08:00",
         sessions: list[str] | None = None,
+        tz: Any = None,
     ) -> dict[str, Any]:
         norm_id = normalize_identity(identity)
         persona_id, _ = unpack_identity(norm_id)
@@ -474,8 +476,11 @@ class WorldBridge:
                 },
             }
 
-        # Fallback: AstrBot host persona + configured quiet_hours
-        in_quiet = is_in_quiet_hours(stamp, quiet_hours)
+        # Fallback: AstrBot host persona + configured quiet_hours (or shared quiet hours)
+        eff_tz = tz or resolve_series_timezone(self.context)
+        in_quiet = is_in_quiet_hours(stamp, quiet_hours, tz=eff_tz) or is_series_in_quiet_hours(
+            self.context
+        )
         host_prompt = ""
         for hp in self._host_personas():
             if hp["persona_id"] == persona_id or hp["identity"] == norm_id:

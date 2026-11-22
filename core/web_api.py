@@ -274,7 +274,7 @@ class HorizonsWebAPI:
                 half_life_days=eng.half_life_days,
             )
             daily_used = await run_io(
-                eng.store.count_today_digests, active_identity, now
+                eng.store.count_today_digests, active_identity, now, tz=eng.timezone
             )
             interests = await run_io(
                 eng.store.list_interests,
@@ -296,6 +296,7 @@ class HorizonsWebAPI:
                 now=now,
                 quiet_hours=eng.quiet_hours,
                 sessions=eng.sessions,
+                tz=eng.timezone,
             )
 
             return {

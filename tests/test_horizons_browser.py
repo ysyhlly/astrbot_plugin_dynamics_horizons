@@ -644,7 +644,9 @@ def test_theme_language_and_zero_overflow_all_tabs(server, width, theme):
 
         # Switch UI language via series companion bar without altering record body text
         page.locator("select[data-series-language]").select_option("en")
-        assert "Overview & Interests" in page.locator("#tab-overview").inner_text()
+        playwright.expect(page.locator("#tab-overview")).to_contain_text(
+            "Overview & Interests"
+        )
         assert "古建筑木构榫卯" in page.locator("#interests-list").inner_text()
 
         assert not page_errors and not console_errors

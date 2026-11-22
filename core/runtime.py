@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 
+from ..series_panels import is_series_group_excluded
 from .contract import chat_umo_kind, make_identity
 from .io import run_io
 
@@ -163,6 +164,7 @@ class EngineLifecycle:
             scope == "disabled"
             or not kind
             or (managed_sessions and umo not in managed_sessions)
+            or is_series_group_excluded(getattr(self, "context", None), umo=umo)
         ):
             return False
         if scope == "all_managed_groups":
