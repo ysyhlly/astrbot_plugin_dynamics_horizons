@@ -106,6 +106,7 @@ async def poll_source(
     cursor: dict[str, Any] | None = None,
     *,
     timeout: float = 20.0,
+    shared_cookie: str = "",
 ) -> dict[str, Any]:
     """Poll an external source and distinguish successful results from failures."""
     if not isinstance(source, Mapping):
@@ -118,7 +119,9 @@ async def poll_source(
     effective_timeout = max(1.0, float(timeout or 20.0))
 
     if kind == "bilibili":
-        res = await poll_bilibili_source(source, cur, timeout=effective_timeout)
+        res = await poll_bilibili_source(
+            source, cur, timeout=effective_timeout, shared_cookie=shared_cookie
+        )
     elif kind == "ebook":
         res = await poll_ebook_source(source, cur, timeout=effective_timeout)
     elif kind == "feed":

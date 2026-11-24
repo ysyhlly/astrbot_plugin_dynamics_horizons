@@ -13,7 +13,7 @@ ensure_current(
         ("core.runtime", "EngineLifecycle", "proactive_scope"),
         ("core.world_bridge", "WorldBridge", "_group_wake_scope_v2"),
     ],
-    version="0.2.0-beta.2.reliability.1.expression.1.allchats.1.bili.3.vision.1",
+    version="0.2.0-rc.8",
 )
 
 import asyncio
@@ -28,6 +28,7 @@ from typing import Any
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Context, Star, StarTools
 
+from .adapters.video_media import cleanup_stale_temp_dirs
 from .core.contract import (
     PLUGIN_ID,
     PLUGIN_VERSION,
@@ -44,6 +45,7 @@ from .core.projection import _empty_result
 from .core.store import HorizonsStore
 from .core.web_api import HorizonsWebAPI
 from .series_panels import (
+    find_provider_silently,
     get_series_defaults,
     is_provider_budget_busy_error,
     is_series_group_excluded,
@@ -52,6 +54,12 @@ from .series_panels import (
     resolve_series_timezone,
     series_llm_call,
 )
+
+_OPENAI_INLINE_VIDEO_MAX_BYTES = 8 * 1024 * 1024  # 8 MB cap for base64 inline proxy payloads
+
+
+def _encode_base64_ascii(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
 
 
 class _BindingChangedError(ValueError):
@@ -218,13 +226,17 @@ async def _invoke_openai_gemini_native_video(
     video_bytes: bytes,
     mime_type: str,
 ) -> str:
+    if len(video_bytes) > _OPENAI_INLINE_VIDEO_MAX_BYTES:
+        raise ValueError(
+            f"openai_inline_video_exceeds_limit:{len(video_bytes)}>{_OPENAI_INLINE_VIDEO_MAX_BYTES}"
+        )
     get_model = getattr(provider, "get_model", None)
     model = (
         str(get_model() or "")
         if callable(get_model)
         else str(getattr(provider, "model_name", "") or "")
     )
-    b64 = base64.b64encode(video_bytes).decode("ascii")
+    b64 = await asyncio.to_thread(_encode_base64_ascii, video_bytes)
     messages = [
         {"role": "system", "content": instruction},
         {
@@ -278,6 +290,34 @@ def _filter_image_urls(urls: Any) -> list[str]:
         if len(out) >= 16:
             break
     return out
+
+
+def extract_persona_system_prompt(
+    instruction: str | None,
+    data: Any,
+) -> tuple[str, Any]:
+    """Promote stable ``character.core_profile`` from dynamic user JSON into ``system_prompt``.
+
+    Returns ``(effective_instruction, cleaned_data)`` without mutating caller inputs.
+    """
+    base = str(instruction or "")
+    if not isinstance(data, dict):
+        return base, data
+    char = data.get("character")
+    if not isinstance(char, dict) or "core_profile" not in char:
+        return base, data
+    raw_profile = str(char.get("core_profile") or "").strip()[:1500]
+    cleaned_char = {k: v for k, v in char.items() if k != "core_profile"}
+    cleaned_data = {**data, "character": cleaned_char}
+    if not raw_profile or raw_profile in base:
+        return base, cleaned_data
+    name = str(char.get("name") or "").strip()
+    header = (
+        f"【角色固定核心设定】\n角色名：{name}\n"
+        if name
+        else "【角色固定核心设定】\n"
+    )
+    return f"{header}{raw_profile}\n\n【任务说明】\n{base}", cleaned_data
 
 
 def build_cache_anchor_contexts(
@@ -337,6 +377,7 @@ class Main(Star):
         from .series_panels import register_series_panels
 
         register_series_panels(self, PLUGIN_ID)
+        await run_io(cleanup_stale_temp_dirs)
         data_dir = self._resolve_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
         db_path = data_dir / "horizons.sqlite3"
@@ -370,6 +411,7 @@ class Main(Star):
             await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks.clear()
         if self.engine is not None:
+            self.engine.clear_media_checkpoints()
             async with self.engine.lock:
                 await run_io(self.engine.store.close)
 
@@ -488,7 +530,7 @@ class Main(Star):
                     allow_all=True, now=now, half_life_days=eng.half_life_days
                 )
             today_logs, latest_log_ts = eng.store.count_today_logs_and_latest(
-                now=now, allow_all=True
+                now=now, allow_all=True, tz=eng.timezone
             )
             pending_reviews = int(summary.get("pending_reviews", 0) or 0)
             active_interests = int(summary.get("active_interests", 0) or 0)
@@ -550,6 +592,224 @@ class Main(Star):
             return {
                 "badge": {"count": 0, "tone": "muted", "label": "暂不可用"},
                 "pulse": {"headline": "群间见闻状态读取异常", "updated_at": ""},
+            }
+
+    def get_series_health(self) -> dict[str, Any]:
+        """Synchronous, read-only health diagnostics for series_panels.read_plugin_health."""
+        try:
+            plugin_enabled = bool(self.config.get("enabled", True))
+            eng = self.engine
+            is_ready = bool(self.ready and not self.closed and eng is not None)
+            review_mode = (
+                eng.review_mode
+                if eng is not None
+                else str(self.config.get("review_mode", "llm") or "llm").strip()
+            )
+            allow_same_review = bool(
+                self.config.get("allow_same_provider_for_review", False)
+            )
+            issues: list[str] = []
+            providers: list[dict[str, str]] = []
+
+            if self.closed:
+                issues.append("plugin_closed")
+            elif not is_ready:
+                issues.append("engine_not_ready")
+
+            analysis_pid = self._effective_provider("analysis_provider")
+            review_pid = self._effective_provider("review_provider")
+            video_explicit = str(self.config.get("video_provider", "") or "").strip()
+            video_pid = self._effective_provider("video_provider")
+            stt_pid = self._effective_provider("video_audio_stt_provider")
+
+            def _check_chat_provider(
+                role: str,
+                pid: str,
+                *,
+                required: bool,
+                detail_ok: str = "available",
+                detail_empty: str = "not_configured",
+                empty_status: str = "missing",
+            ) -> None:
+                if not pid:
+                    providers.append(
+                        {
+                            "role": role,
+                            "provider_id": "",
+                            "status": empty_status,
+                            "detail": detail_empty,
+                        }
+                    )
+                    if required and plugin_enabled:
+                        issues.append(f"{role}_provider_missing")
+                    return
+                prov = find_provider_silently(self.context, pid)
+                if prov is None:
+                    providers.append(
+                        {
+                            "role": role,
+                            "provider_id": pid,
+                            "status": "missing",
+                            "detail": "provider_not_found",
+                        }
+                    )
+                    if plugin_enabled:
+                        issues.append(f"{role}_provider_not_found:{pid}")
+                    return
+                if (
+                    not callable(getattr(prov, "text_chat", None))
+                    or getattr(prov, "is_native_decision_provider", False)
+                    or getattr(prov, "is_systemone_provider", False)
+                ):
+                    providers.append(
+                        {
+                            "role": role,
+                            "provider_id": pid,
+                            "status": "invalid",
+                            "detail": "unsupported_chat_provider",
+                        }
+                    )
+                    if plugin_enabled:
+                        issues.append(f"{role}_provider_invalid:{pid}")
+                    return
+                providers.append(
+                    {
+                        "role": role,
+                        "provider_id": pid,
+                        "status": "ok",
+                        "detail": detail_ok,
+                    }
+                )
+
+            _check_chat_provider("analysis", analysis_pid, required=True)
+            _check_chat_provider(
+                "review",
+                review_pid,
+                required=(review_mode != "human"),
+                detail_empty=(
+                    "human_review_mode" if review_mode == "human" else "not_configured"
+                ),
+                empty_status="disabled" if review_mode == "human" else "missing",
+            )
+            _check_chat_provider(
+                "video",
+                video_pid,
+                required=bool(video_explicit),
+                detail_ok=("available" if video_explicit else "fallback_to_analysis"),
+                detail_empty="fallback_to_analysis",
+                empty_status="unconfigured",
+            )
+
+            if not stt_pid:
+                providers.append(
+                    {
+                        "role": "stt",
+                        "provider_id": "",
+                        "status": "unconfigured",
+                        "detail": "optional",
+                    }
+                )
+            else:
+                stt_prov = find_provider_silently(self.context, stt_pid)
+                if stt_prov is None:
+                    providers.append(
+                        {
+                            "role": "stt",
+                            "provider_id": stt_pid,
+                            "status": "missing",
+                            "detail": "provider_not_found",
+                        }
+                    )
+                    if plugin_enabled:
+                        issues.append(f"stt_provider_not_found:{stt_pid}")
+                elif not callable(getattr(stt_prov, "get_text", None)) and not callable(
+                    getattr(stt_prov, "text_chat", None)
+                ):
+                    providers.append(
+                        {
+                            "role": "stt",
+                            "provider_id": stt_pid,
+                            "status": "invalid",
+                            "detail": "unsupported_stt_provider",
+                        }
+                    )
+                    if plugin_enabled:
+                        issues.append(f"stt_provider_invalid:{stt_pid}")
+                else:
+                    providers.append(
+                        {
+                            "role": "stt",
+                            "provider_id": stt_pid,
+                            "status": "ok",
+                            "detail": (
+                                "native_stt"
+                                if callable(getattr(stt_prov, "get_text", None))
+                                else "audio_chat_stt"
+                            ),
+                        }
+                    )
+
+            if (
+                plugin_enabled
+                and review_mode != "human"
+                and not allow_same_review
+                and analysis_pid
+                and analysis_pid == review_pid
+            ):
+                issues.append("independent_review_provider_required")
+
+            summary = eng.projection.summary() if eng is not None else {}
+            now_ts = float(eng.clock()) if eng is not None else 0.0
+            active_cooldowns = 0
+            if eng is not None:
+                for dom, until in dict(
+                    getattr(eng, "_domain_cooldowns", {}) or {}
+                ).items():
+                    if float(until or 0.0) > now_ts:
+                        active_cooldowns += 1
+                        if plugin_enabled:
+                            issues.append(f"domain_cooldown:{dom}")
+                if eng.last_error and plugin_enabled:
+                    issues.append(f"last_error:{str(eng.last_error)[:120]}")
+
+            metrics = {
+                "enabled": plugin_enabled,
+                "review_mode": review_mode,
+                "sources": int(summary.get("sources", 0) or 0),
+                "active_interests": int(summary.get("active_interests", 0) or 0),
+                "pending_reviews": int(summary.get("pending_reviews", 0) or 0),
+                "active_domain_cooldowns": active_cooldowns,
+                "media_checkpoints": len(
+                    getattr(eng, "_media_checkpoints", {}) or {}
+                )
+                if eng is not None
+                else 0,
+                "projection_generation": int(
+                    getattr(eng.projection, "generation", 0) or 0
+                )
+                if eng is not None
+                else 0,
+                "last_poll_at": float(getattr(eng, "last_poll_at", 0.0) or 0.0)
+                if eng is not None
+                else 0.0,
+                "last_digest_at": float(getattr(eng, "last_digest_at", 0.0) or 0.0)
+                if eng is not None
+                else 0.0,
+            }
+            return {
+                "ready": is_ready,
+                "degraded": bool(not is_ready or (plugin_enabled and issues)),
+                "providers": providers,
+                "issues": issues,
+                "metrics": metrics,
+            }
+        except Exception as exc:
+            return {
+                "ready": False,
+                "degraded": True,
+                "providers": [],
+                "issues": [f"health_error:{type(exc).__name__}"],
+                "metrics": {},
             }
 
     def get_series_scope_status(self, umo: str) -> dict[str, Any]:
@@ -936,7 +1196,10 @@ class Main(Star):
         ):
             raise ValueError("所选模型不可用或不是普通聊天模型")
         base_timeout = max(5, min(180, int(self.config.get("model_timeout", 60) or 60)))
-        payload = encode_json(data)
+        effective_instruction, effective_data = extract_persona_system_prompt(
+            instruction, data
+        )
+        payload = encode_json(effective_data)
         if len(payload) > 140_000:
             raise ValueError("阅读材料超出单次模型输入预算")
 
@@ -965,12 +1228,18 @@ class Main(Star):
                 max_mb = max(
                     1, min(50, int(self.config.get("video_native_max_mb", 15) or 15))
                 )
+                use_genai = _resolve_genai_generate_fn(provider) is not None
+                read_max_bytes = (
+                    max_mb * 1024 * 1024
+                    if use_genai
+                    else min(max_mb * 1024 * 1024, _OPENAI_INLINE_VIDEO_MAX_BYTES)
+                )
                 try:
                     video_bytes, mime_type = await asyncio.to_thread(
-                        _read_video_bytes, native_video_path, max_mb * 1024 * 1024
+                        _read_video_bytes, native_video_path, read_max_bytes
                     )
                     async with asyncio.timeout(effective_timeout):
-                        if _resolve_genai_generate_fn(provider) is not None:
+                        if use_genai:
                             content = await series_llm_call(
                                 self.context,
                                 provider_id,
@@ -978,7 +1247,7 @@ class Main(Star):
                                 f"horizons_{role}_video",
                                 lambda: _invoke_genai_native_video(
                                     provider,
-                                    instruction=instruction,
+                                    instruction=effective_instruction,
                                     payload=payload,
                                     video_bytes=video_bytes,
                                     mime_type=mime_type,
@@ -993,7 +1262,7 @@ class Main(Star):
                                 f"horizons_{role}_video",
                                 lambda: _invoke_openai_gemini_native_video(
                                     provider,
-                                    instruction=instruction,
+                                    instruction=effective_instruction,
                                     payload=payload,
                                     video_bytes=video_bytes,
                                     mime_type=mime_type,
@@ -1045,8 +1314,8 @@ class Main(Star):
                             media["fallback_used"] = True
                             media["effective_frame_count"] = len(fallback_urls)
                         image_urls = fallback_urls
-                        if fallback_labels and isinstance(data, dict):
-                            fb_data = dict(data)
+                        if fallback_labels and isinstance(effective_data, dict):
+                            fb_data = dict(effective_data)
                             meta = dict(fb_data.get("metadata") or {})
                             meta["watch_mode"] = (
                                 "keyframes_subtitle"
@@ -1100,8 +1369,8 @@ class Main(Star):
                     if media is not None:
                         media["fallback_used"] = True
                         media["effective_frame_count"] = len(fallback_urls)
-                    if fallback_labels and isinstance(data, dict):
-                        fb_data = dict(data)
+                    if fallback_labels and isinstance(effective_data, dict):
+                        fb_data = dict(effective_data)
                         meta = dict(fb_data.get("metadata") or {})
                         meta["watch_mode"] = (
                             "keyframes_subtitle"
@@ -1128,11 +1397,11 @@ class Main(Star):
 
         # Channel B: Universal Keyframes VLM via image_urls (or standard text chat)
         anchor_contexts = build_cache_anchor_contexts(
-            instruction, task="dynamics_horizons"
+            effective_instruction, task="dynamics_horizons"
         )
         call_kwargs: dict[str, Any] = {
             "prompt": payload,
-            "system_prompt": instruction,
+            "system_prompt": effective_instruction,
         }
         if _accepts_kwarg(provider.text_chat, "contexts"):
             call_kwargs["contexts"] = anchor_contexts

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 PLUGIN_ID = "astrbot_plugin_dynamics_horizons"
-PLUGIN_VERSION = "0.2.0-rc.7"
+PLUGIN_VERSION = "0.2.0-rc.8"
 SCHEMA_VERSION = 1
 
 SOURCE_KINDS = ("bilibili", "ebook", "feed", "manual")

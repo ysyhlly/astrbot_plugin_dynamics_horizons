@@ -300,7 +300,7 @@ class HorizonsWebAPI:
             )
 
             return {
-                "health": await run_io(eng.health, active_identity, wake),
+                "health": await eng.health_async(active_identity, wake),
                 "enabled": bool(self.plugin.config.get("enabled", True)),
                 "ready": bool(self.plugin.ready and not self.plugin.closed),
                 "review_mode": eng.review_mode,

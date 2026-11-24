@@ -7,14 +7,20 @@ import contextlib
 import importlib
 import inspect
 import io
+import os
 import random
+import re
 import time
 import zipfile
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
+from astrbot.api import logger
+
 from ..series_panels import (
+    find_provider_silently,
     get_series_defaults,
     inherit_umos,
     is_provider_budget_busy_error,
@@ -36,7 +42,11 @@ from .contract import (
 from .io import run_io
 from .lifecycle import SourcePollConflict, check_review_target
 from .projection import ProjectionCache
-from .runtime import EngineLifecycle
+from .runtime import (
+    EngineLifecycle,
+    busy_retry_after,
+    provider_circuit_remaining,
+)
 from .sanitize import (
     contains_raw_url,
     detect_ad_or_contact_spam,
@@ -70,11 +80,59 @@ except Exception:  # pragma: no cover
     search_public_ebooks = None
 
 try:
-    from ..adapters.ssrf import http_session_scope
+    from ..adapters.ssrf import http_session_scope, redact_error_text
 except Exception:  # pragma: no cover
     @contextlib.asynccontextmanager
     async def http_session_scope():
         yield {}
+
+    def redact_error_text(text: Any, secrets=()) -> str:
+        return str(text or "")[:160]
+
+
+try:
+    from ..adapters.video_media import cleanup_media_bundle
+except Exception:  # pragma: no cover
+    def cleanup_media_bundle(bundle: Any) -> None:
+        if isinstance(bundle, dict):
+            fn = bundle.get("cleanup")
+            if callable(fn):
+                with contextlib.suppress(Exception):
+                    fn()
+
+
+_MEDIA_CHECKPOINT_TTL_SECONDS = 7200.0  # 2 hours
+_MEDIA_CHECKPOINT_MAX_ENTRIES = 16
+_STT_KEY_REDACT_RE = re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b")
+
+
+def _redact_stt_error(exc: BaseException) -> str:
+    raw = f"{type(exc).__name__}: {exc}"
+    cleaned = redact_error_text(raw)
+    cleaned = _STT_KEY_REDACT_RE.sub("[REDACTED]", cleaned)
+    cleaned = strip_raw_urls(cleaned)
+    return cleaned[:160] or type(exc).__name__
+
+
+def build_persona_system_prompt(
+    base_instruction: str,
+    *,
+    character_name: str = "",
+    core_profile: str = "",
+    max_profile_chars: int = 1500,
+) -> str:
+    """Place stable per-persona core profile ahead of stage rules for prefix caching."""
+    base = str(base_instruction or "")
+    profile = str(core_profile or "").strip()[:max_profile_chars]
+    if not profile:
+        return base
+    name = str(character_name or "").strip()
+    header = (
+        f"【角色固定核心设定】\n角色名：{name}\n"
+        if name
+        else "【角色固定核心设定】\n"
+    )
+    return f"{header}{profile}\n\n【任务说明】\n{base}"
 
 
 STAGE1_TRIAGE_PROMPT = (
@@ -374,8 +432,12 @@ class HorizonsEngine(EngineLifecycle):
         self.projection = ProjectionCache()
         self.world_bridge = WorldBridge(context, self.projection)
         self.lock = asyncio.Lock()
+        self._identity_locks: dict[str, asyncio.Lock] = {}
+        self._maintenance_lock = asyncio.Lock()
         self.polling_sources: set[str] = set()
         self._domain_cooldowns: dict[str, float] = {}
+        self._load_persisted_domain_cooldowns()
+        self._media_checkpoints: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.closed = False
 
         self.last_poll_at: float = 0.0
@@ -385,6 +447,184 @@ class HorizonsEngine(EngineLifecycle):
         self.last_error: str = ""
         self.next_poll_at = self.clock() + 5
         self.next_digest_at = self.clock() + 12
+
+    def identity_lock(self, identity: str) -> asyncio.Lock:
+        """Return a per-identity asyncio.Lock to isolate digest cycles across personas."""
+        norm = normalize_identity(identity) if identity else "__global__"
+        lock = self._identity_locks.get(norm)
+        if lock is None:
+            if len(self._identity_locks) >= 256:
+                stale = [
+                    k for k, lk in self._identity_locks.items() if not lk.locked()
+                ]
+                for k in stale[:64]:
+                    self._identity_locks.pop(k, None)
+            lock = asyncio.Lock()
+            self._identity_locks[norm] = lock
+        return lock
+
+    def _load_persisted_domain_cooldowns(self) -> None:
+        loader = getattr(self.store, "load_domain_cooldowns", None)
+        if not callable(loader):
+            return
+        try:
+            loaded = loader()
+            if isinstance(loaded, dict):
+                for dom, until in loaded.items():
+                    val = float(until or 0.0)
+                    if dom and val > 0:
+                        self._domain_cooldowns[str(dom)] = max(
+                            self._domain_cooldowns.get(str(dom), 0.0), val
+                        )
+        except Exception:
+            return
+
+    async def _set_domain_cooldown(self, domain: str, cooldown_until: float) -> None:
+        clean = str(domain or "").strip().lower()
+        if not clean:
+            return
+        until = max(
+            self._domain_cooldowns.get(clean, 0.0), float(cooldown_until or 0.0)
+        )
+        self._domain_cooldowns[clean] = until
+        saver = getattr(self.store, "set_domain_cooldown", None)
+        if callable(saver):
+            with contextlib.suppress(Exception):
+                await run_io(saver, clean, until, self.clock())
+
+    async def _clear_domain_cooldown(self, domain: str) -> None:
+        clean = str(domain or "").strip().lower()
+        if not clean:
+            return
+        self._domain_cooldowns.pop(clean, None)
+        clearer = getattr(self.store, "clear_domain_cooldown", None)
+        if callable(clearer):
+            with contextlib.suppress(Exception):
+                await run_io(clearer, clean)
+
+    @staticmethod
+    def _media_checkpoint_key(identity: str, unit_obj: dict[str, Any]) -> str:
+        ident = normalize_identity(identity)
+        item_ref = str(
+            unit_obj.get("candidate_id")
+            or unit_obj.get("bvid")
+            or unit_obj.get("external_id")
+            or ""
+        ).strip()
+        if not item_ref:
+            return ""
+        return f"{ident}:{item_ref}"
+
+    @staticmethod
+    def _cleanup_checkpoint_entry(entry: dict[str, Any] | None) -> None:
+        if not isinstance(entry, dict):
+            return
+        mb = entry.get("media_bundle")
+        if isinstance(mb, dict):
+            cleanup_media_bundle(mb)
+
+    def prune_media_checkpoints(self, *, now: float | None = None) -> int:
+        stamp = float(now if now is not None else self.clock())
+        removed = 0
+        for key in list(self._media_checkpoints.keys()):
+            entry = self._media_checkpoints.get(key)
+            if not isinstance(entry, dict) or float(entry.get("expires_at") or 0.0) <= stamp:
+                popped = self._media_checkpoints.pop(key, None)
+                self._cleanup_checkpoint_entry(popped)
+                removed += 1
+        while len(self._media_checkpoints) > _MEDIA_CHECKPOINT_MAX_ENTRIES:
+            _, oldest = self._media_checkpoints.popitem(last=False)
+            self._cleanup_checkpoint_entry(oldest)
+            removed += 1
+        return removed
+
+    def clear_media_checkpoints(self) -> int:
+        removed = len(self._media_checkpoints)
+        while self._media_checkpoints:
+            _, entry = self._media_checkpoints.popitem(last=False)
+            self._cleanup_checkpoint_entry(entry)
+        return removed
+
+    def active_media_checkpoint_dirs(self) -> tuple[str, ...]:
+        dirs: list[str] = []
+        for entry in self._media_checkpoints.values():
+            mb = entry.get("media_bundle") if isinstance(entry, dict) else None
+            td = str(mb.get("temp_dir") or "").strip() if isinstance(mb, dict) else ""
+            if td:
+                dirs.append(td)
+        return tuple(dirs)
+
+    def _get_valid_media_checkpoint(
+        self, key: str, *, now: float
+    ) -> dict[str, Any] | None:
+        self.prune_media_checkpoints(now=now)
+        if not key:
+            return None
+        entry = self._media_checkpoints.get(key)
+        if not isinstance(entry, dict):
+            return None
+        if float(entry.get("expires_at") or 0.0) <= now:
+            popped = self._media_checkpoints.pop(key, None)
+            self._cleanup_checkpoint_entry(popped)
+            return None
+        mb = entry.get("media_bundle")
+        if isinstance(mb, dict):
+            native_path = str(mb.get("native_video_path") or "").strip()
+            if native_path and not os.path.isfile(native_path):
+                popped = self._media_checkpoints.pop(key, None)
+                self._cleanup_checkpoint_entry(popped)
+                return None
+            frame_paths = list(
+                mb.get("frame_paths") or mb.get("videoshot_paths") or []
+            )
+            if frame_paths and not all(
+                isinstance(p, str) and os.path.isfile(p) for p in frame_paths
+            ):
+                popped = self._media_checkpoints.pop(key, None)
+                self._cleanup_checkpoint_entry(popped)
+                return None
+        self._media_checkpoints.move_to_end(key)
+        return entry
+
+    def _save_media_checkpoint(
+        self, key: str, entry: dict[str, Any], *, now: float
+    ) -> None:
+        if not key:
+            return
+        self.prune_media_checkpoints(now=now)
+        existing = self._media_checkpoints.pop(key, None)
+        if (
+            existing is not None
+            and existing.get("media_bundle") is not entry.get("media_bundle")
+        ):
+            self._cleanup_checkpoint_entry(existing)
+        while len(self._media_checkpoints) >= _MEDIA_CHECKPOINT_MAX_ENTRIES:
+            _, oldest = self._media_checkpoints.popitem(last=False)
+            self._cleanup_checkpoint_entry(oldest)
+        self._media_checkpoints[key] = entry
+
+    def _discard_media_checkpoint(
+        self, key: str, *, cleanup: bool = True, current_bundle: Any = None
+    ) -> None:
+        if not key:
+            return
+        entry = self._media_checkpoints.pop(key, None)
+        if cleanup and entry is not None:
+            if current_bundle is not None and entry.get("media_bundle") is current_bundle:
+                return
+            self._cleanup_checkpoint_entry(entry)
+
+    @staticmethod
+    def _is_transient_reading_failure(exc: BaseException) -> bool:
+        if is_provider_budget_busy_error(exc):
+            return True
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError)):
+            return True
+        low = str(exc or "").lower()
+        return any(
+            tok in low
+            for tok in ("provider_budget_busy", "timeout", "timed out", "rate limit")
+        )
 
     # ------------------------------------------------------------------
     # Dynamic Adapter Resolution (supports live adapters + unit test monkeypatching)
@@ -419,8 +659,23 @@ class HorizonsEngine(EngineLifecycle):
         cursor: dict[str, Any] | None,
         *,
         timeout: float = 20.0,
+        shared_cookie: str = "",
     ) -> dict[str, Any]:
         fn = self._resolve_adapter_fn("poll_source", _fallback_poll_source)
+        if shared_cookie:
+            try:
+                sig = inspect.signature(fn)
+                params = sig.parameters
+                has_varkw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+                )
+            except (TypeError, ValueError):
+                params = {}
+                has_varkw = False
+            if has_varkw or "shared_cookie" in params:
+                return await fn(
+                    source, cursor, timeout=timeout, shared_cookie=shared_cookie
+                )
         return await fn(source, cursor, timeout=timeout)
 
     async def fetch_item_content_adapter(
@@ -638,8 +893,9 @@ class HorizonsEngine(EngineLifecycle):
         stt_id = self.effective_provider("video_audio_stt_provider")
         if not stt_id or self.context is None:
             return None
-        getter = getattr(self.context, "get_provider_by_id", None)
-        provider = getter(stt_id) if callable(getter) else None
+        if provider_circuit_remaining(self.context, stt_id) > 0.0:
+            return None
+        provider = find_provider_silently(self.context, stt_id)
         if provider is None:
             return None
         get_text = getattr(provider, "get_text", None)
@@ -656,8 +912,22 @@ class HorizonsEngine(EngineLifecycle):
             try:
                 async with asyncio.timeout(timeout_sec):
                     if callable(get_text):
-                        raw = await get_text(audio_path)
-                        return str(raw or "").strip()
+                        raw = await series_llm_call(
+                            self.context,
+                            stt_id,
+                            PLUGIN_ID,
+                            "horizons_audio_stt",
+                            lambda: get_text(audio_path),
+                            acquire_timeout=min(15.0, float(timeout_sec)),
+                        )
+                        text = str(raw or "").strip()
+                        logger.debug(
+                            "[DynamicsHorizons] Audio STT native get_text done (provider=%s, duration_sec=%s, chars=%d)",
+                            stt_id,
+                            int(duration_sec or 0),
+                            len(text),
+                        )
+                        return text
                     resp = await series_llm_call(
                         self.context,
                         stt_id,
@@ -670,8 +940,23 @@ class HorizonsEngine(EngineLifecycle):
                         ),
                         acquire_timeout=min(15.0, float(timeout_sec)),
                     )
-                    return str(getattr(resp, "completion_text", "") or "").strip()
-            except Exception:
+                    text = str(getattr(resp, "completion_text", "") or "").strip()
+                    logger.debug(
+                        "[DynamicsHorizons] Audio STT text_chat done (provider=%s, duration_sec=%s, chars=%d)",
+                        stt_id,
+                        int(duration_sec or 0),
+                        len(text),
+                    )
+                    return text
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[DynamicsHorizons] Audio STT failed (provider=%s, duration_sec=%s, error=%s)",
+                    stt_id,
+                    int(duration_sec or 0),
+                    _redact_stt_error(exc),
+                )
                 return ""
 
         return _transcribe
@@ -971,6 +1256,27 @@ class HorizonsEngine(EngineLifecycle):
 
     async def _poll_source(self, src: dict[str, Any]) -> dict[str, Any]:
         try:
+            shared_cookie = (
+                sanitize_readonly_bilibili_cookie(
+                    str(self.config.get("bilibili_shared_cookie", "") or "")
+                )
+                if src.get("source_kind") == "bilibili"
+                else ""
+            )
+            poll_kwargs: dict[str, Any] = {"timeout": 20.0}
+            if shared_cookie:
+                try:
+                    sig = inspect.signature(self.poll_source_adapter)
+                    params = sig.parameters
+                    has_varkw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD
+                        for p in params.values()
+                    )
+                except (TypeError, ValueError):
+                    params = {}
+                    has_varkw = False
+                if has_varkw or "shared_cookie" in params:
+                    poll_kwargs["shared_cookie"] = shared_cookie
             async with http_session_scope():
                 res = await self.poll_source_adapter(
                     {
@@ -982,7 +1288,7 @@ class HorizonsEngine(EngineLifecycle):
                         "config": src["config"],
                     },
                     src.get("cursor") or {},
-                    timeout=20.0,
+                    **poll_kwargs,
                 )
             outcome = res.get("outcome", "success")
             items = list(res.get("items") or []) if isinstance(res.get("items"), list) else []
@@ -1027,11 +1333,9 @@ class HorizonsEngine(EngineLifecycle):
                 next_cursor["pending_items"] = []
             if src.get("source_kind") == "bilibili":
                 if status.startswith(("risk_control_backoff", "partial_risk_control_backoff", "rate_limited", "partial_rate_limited")) and cooldown_until > 0:
-                    self._domain_cooldowns["bilibili"] = max(
-                        self._domain_cooldowns.get("bilibili", 0.0), cooldown_until
-                    )
+                    await self._set_domain_cooldown("bilibili", cooldown_until)
                 elif outcome == "success":
-                    self._domain_cooldowns.pop("bilibili", None)
+                    await self._clear_domain_cooldown("bilibili")
 
             inserted = await run_io(
                 self.store.commit_poll,
@@ -1169,49 +1473,75 @@ class HorizonsEngine(EngineLifecycle):
         if self.closed or not self.config.get("enabled", True):
             return {"status": "disabled", "proposals_created": 0, "approved": 0}
 
-        async with self.lock:
-            now = self.clock()
-            await run_io(self.store.settle_decay, now, self.half_life_days)
-            personas = self.world_bridge.discover_personas(self.store, self.sessions)
-            if identity:
-                target_identities = [normalize_identity(identity)]
-            else:
-                target_identities = [p["identity"] for p in personas]
+        analysis_pid = self.effective_provider("analysis_provider")
+        circuit_rem = provider_circuit_remaining(self.context, analysis_pid)
+        if circuit_rem > 0.0:
+            self.last_error = f"budget_circuit_open:{analysis_pid}"[:200]
+            return {
+                "status": "deferred",
+                "skip_reason": "budget_circuit_open",
+                "retry_after": circuit_rem,
+                "proposals_created": 0,
+                "approved": 0,
+                "results": [],
+            }
 
-            per_identity_results: list[dict[str, Any]] = []
-            total_created = 0
-            total_approved = 0
+        now = self.clock()
+        await run_io(self.store.settle_decay, now, self.half_life_days)
+        personas = self.world_bridge.discover_personas(self.store, self.sessions)
+        if identity:
+            target_identities = [normalize_identity(identity)]
+        else:
+            target_identities = [p["identity"] for p in personas]
 
-            for ident in target_identities:
+        per_identity_results: list[dict[str, Any]] = []
+        total_created = 0
+        total_approved = 0
+
+        for ident in target_identities:
+            if self.closed:
+                break
+            budget_busy = False
+            async with self.identity_lock(ident):
                 if self.closed:
                     break
                 try:
                     res = await self._digest_for_identity(ident)
                 except Exception as exc:
                     self.last_error = type(exc).__name__ + ":" + str(exc)[:160]
-                    with self.store.lock, self.store.db:
-                        self.store.db.execute(
-                            "UPDATE reading_tasks SET status='failed' WHERE identity=? AND status='running'",
-                            (ident,),
-                        )
-                    res = {
-                        "identity": ident,
-                        "status": "error",
-                        "skip_reason": self.last_error,
-                    }
-                per_identity_results.append(res)
-                total_created += int(res.get("proposals_created", 0))
-                total_approved += int(res.get("approved", 0))
+                    await run_io(self.store.fail_running_tasks, ident, self.clock())
+                    if is_provider_budget_busy_error(exc):
+                        budget_busy = True
+                        res = {
+                            "identity": ident,
+                            "status": "error",
+                            "deferred": True,
+                            "skip_reason": self.last_error,
+                            "retry_after": busy_retry_after(exc, default_min=120.0),
+                            "proposals_created": 0,
+                            "approved": 0,
+                        }
+                    else:
+                        res = {
+                            "identity": ident,
+                            "status": "error",
+                            "skip_reason": self.last_error,
+                        }
+            per_identity_results.append(res)
+            total_created += int(res.get("proposals_created", 0))
+            total_approved += int(res.get("approved", 0))
+            if budget_busy:
+                break
 
-            await self.refresh_projection()
-            first = per_identity_results[0] if len(per_identity_results) == 1 else {}
-            return {
-                "status": first.get("status", "ok"),
-                "skip_reason": first.get("skip_reason", ""),
-                "proposals_created": total_created,
-                "approved": total_approved,
-                "results": per_identity_results,
-            }
+        await self.refresh_projection()
+        first = per_identity_results[0] if len(per_identity_results) == 1 else {}
+        return {
+            "status": first.get("status", "ok"),
+            "skip_reason": first.get("skip_reason", ""),
+            "proposals_created": total_created,
+            "approved": total_approved,
+            "results": per_identity_results,
+        }
 
     async def _digest_for_identity(self, identity: str) -> dict[str, Any]:
         norm_id = normalize_identity(identity)
@@ -1265,12 +1595,16 @@ class HorizonsEngine(EngineLifecycle):
         all_reading_books = await run_io(
             self.store.list_books, norm_id, status="reading"
         )
-        reading_books = [
-            b
-            for b in all_reading_books
-            if (b["total_chapters"] == 0 or b["chapter_cursor"] < b["total_chapters"])
-            and self.store.chapter_available(b["book_id"], b["chapter_cursor"])
-        ][:4]
+        reading_books: list[dict[str, Any]] = []
+        for b in all_reading_books:
+            if b["total_chapters"] != 0 and b["chapter_cursor"] >= b["total_chapters"]:
+                continue
+            if await run_io(
+                self.store.chapter_available, b["book_id"], b["chapter_cursor"]
+            ):
+                reading_books.append(b)
+                if len(reading_books) >= 4:
+                    break
 
         if not candidates and not reading_books:
             return {
@@ -1492,7 +1826,6 @@ class HorizonsEngine(EngineLifecycle):
             "max_picks": max_picks,
             "character": {
                 "name": wake.get("character_name", ""),
-                "core_profile": str(wake.get("character_prompt") or "")[:1200],
                 "preferences": wake.get("preferences", [])[:6],
             },
             "active_interests": [
@@ -1507,9 +1840,14 @@ class HorizonsEngine(EngineLifecycle):
             "reading_books": book_briefs,
             "untrusted_candidates_block": f"<untrusted_candidates_json>{compact_json(briefs)}</untrusted_candidates_json>",
         }
+        system_prompt = build_persona_system_prompt(
+            STAGE1_TRIAGE_PROMPT,
+            character_name=str(wake.get("character_name") or ""),
+            core_profile=str(wake.get("character_prompt") or ""),
+        )
         raw = await self.call_model(
             "analysis_provider",
-            STAGE1_TRIAGE_PROMPT,
+            system_prompt,
             payload,
             identity=self.wake_identity(wake),
         )
@@ -1582,8 +1920,32 @@ class HorizonsEngine(EngineLifecycle):
         full_text = ""
         media_bundle: dict[str, Any] | None = None
         fetched: dict[str, Any] | None = None
+        checkpoint_key = ""
+        checkpoint_hit: dict[str, Any] | None = None
+        retain_media_bundle = False
 
         try:
+            if not reuse_task_id:
+                pre_now = self.clock()
+                pre_tz = self.timezone
+                if not await run_io(
+                    self.store.has_reading_quota,
+                    identity,
+                    self.daily_quota,
+                    pre_now,
+                    tz=pre_tz,
+                ):
+                    return None, None
+                if not await run_io(
+                    self.store.has_model_call_quota,
+                    identity,
+                    max(1, int(self.config.get("daily_model_call_quota", 50))),
+                    pre_now,
+                    lane="reading",
+                    tz=pre_tz,
+                ):
+                    return None, None
+
             if unit_kind == "book":
                 book_id = unit_obj["book_id"]
                 source_kind = "ebook"
@@ -1659,6 +2021,7 @@ class HorizonsEngine(EngineLifecycle):
                 chapter_label = unit_obj["chapter_label"]
                 raw_url = unit_obj["raw_url"]
                 full_text = unit_obj["full_text"]
+                checkpoint_key = self._media_checkpoint_key(identity, unit_obj)
                 needs_ephemeral_video_refetch = (
                     source_kind == "bilibili"
                     and not self._is_bilibili_dynamic_candidate(unit_obj)
@@ -1670,228 +2033,260 @@ class HorizonsEngine(EngineLifecycle):
                     or not full_text
                     or needs_ephemeral_video_refetch
                 ):
-                    src = await run_io(
-                        self.store.get_source, unit_obj["source_id"], mask=False
+                    checkpoint_hit = self._get_valid_media_checkpoint(
+                        checkpoint_key, now=self.clock()
                     )
-                    if src is not None:
-                        now_ts = self.clock()
-                        domain_cd = (
-                            self._domain_cooldowns.get("bilibili", 0.0)
-                            if source_kind == "bilibili"
-                            else 0.0
+                    if checkpoint_hit is not None:
+                        cp_bundle = checkpoint_hit.get("media_bundle")
+                        if isinstance(cp_bundle, dict):
+                            media_bundle = cp_bundle
+                        cp_text = str(checkpoint_hit.get("full_text") or "")
+                        if cp_text:
+                            full_text = cp_text
+                        cp_origin = str(checkpoint_hit.get("content_origin") or "")
+                        if cp_origin:
+                            unit_obj["content_origin"] = cp_origin
+                        cp_label = str(checkpoint_hit.get("chapter_label") or "")
+                        if cp_label:
+                            chapter_label = cp_label
+                        fetched = {
+                            "full_text": full_text,
+                            "content_origin": cp_origin,
+                            "chapter_label": chapter_label,
+                            "total_chapters": checkpoint_hit.get("total_chapters"),
+                            "media_bundle": media_bundle,
+                        }
+                    else:
+                        src = await run_io(
+                            self.store.get_source, unit_obj["source_id"], mask=False
                         )
-                        if (
-                            source_kind == "bilibili"
-                            and max(float(src.get("cooldown_until") or 0.0), domain_cd)
-                            > now_ts
-                        ):
-                            return None, None
-                        is_pre_dynamic = (
-                            source_kind == "bilibili"
-                            and self._is_bilibili_dynamic_candidate(unit_obj)
-                        )
-                        fallback_cookies = None
-                        media_options = None
-                        audio_transcriber = None
-                        fetch_timeout = 25.0
-                        if source_kind == "bilibili" and not is_pre_dynamic:
-                            fallback_cookies = (
-                                await self._collect_bilibili_fallback_cookies(
-                                    identity, src["source_id"]
-                                )
-                            )
-                            media_options = self._build_video_media_options()
-                            audio_transcriber = self._build_audio_transcriber()
-                            fetch_timeout = max(
-                                45.0,
-                                float(self.config.get("model_timeout", 60) or 60),
-                            )
-                        try:
-                            async with http_session_scope():
-                                if (
-                                    fallback_cookies is not None
-                                    or media_options is not None
-                                    or audio_transcriber is not None
-                                ):
-                                    fetch_kwargs: dict[str, Any] = {
-                                        "timeout": fetch_timeout
-                                    }
-                                    try:
-                                        sig = inspect.signature(
-                                            self.fetch_item_content_adapter
-                                        )
-                                        params = sig.parameters
-                                        has_varkw = any(
-                                            p.kind == inspect.Parameter.VAR_KEYWORD
-                                            for p in params.values()
-                                        )
-                                    except (TypeError, ValueError):
-                                        params = {}
-                                        has_varkw = False
-                                    if fallback_cookies is not None and (
-                                        has_varkw or "fallback_cookies" in params
-                                    ):
-                                        fetch_kwargs["fallback_cookies"] = (
-                                            fallback_cookies
-                                        )
-                                    if media_options is not None and (
-                                        has_varkw or "media_options" in params
-                                    ):
-                                        fetch_kwargs["media_options"] = media_options
-                                    if audio_transcriber is not None and (
-                                        has_varkw or "audio_transcriber" in params
-                                    ):
-                                        fetch_kwargs["audio_transcriber"] = (
-                                            audio_transcriber
-                                        )
-                                    fetched = await self.fetch_item_content_adapter(
-                                        src, unit_obj, **fetch_kwargs
-                                    )
-                                else:
-                                    fetched = await self.fetch_item_content_adapter(
-                                        src, unit_obj, timeout=fetch_timeout
-                                    )
-                        except Exception as exc:
-                            from ..adapters.bilibili import BilibiliRiskControlError
-                            from ..adapters.ssrf import AdapterRateLimitError
-
-                            if isinstance(
-                                exc, (BilibiliRiskControlError, AdapterRateLimitError)
-                            ):
-                                cur = dict(src.get("cursor") or {})
-                                step = int(cur.get("backoff_step") or 0) + 1
-                                cur["backoff_step"] = step
-                                base_cd = float(
-                                    getattr(exc, "cooldown_seconds", 0.0)
-                                    or getattr(exc, "retry_after", 0.0)
-                                    or 1800.0
-                                )
-                                wait_s = min(
-                                    7200.0, base_cd * (1.5 ** min(step - 1, 3))
-                                )
-                                cooldown_until = now_ts + wait_s
-                                status_kind = (
-                                    "rate_limited"
-                                    if isinstance(exc, AdapterRateLimitError)
-                                    else "risk_control_backoff"
-                                )
-                                err_msg = (
-                                    strip_raw_urls(str(exc))[:180]
-                                    or type(exc).__name__
-                                )
-                                await run_io(
-                                    self.store.update_source_poll_state,
-                                    src["source_id"],
-                                    next_cursor=cur,
-                                    cooldown_until=cooldown_until,
-                                    status=f"{status_kind}: stage2:{err_msg}",
-                                    last_error=f"stage2:{err_msg}",
-                                    now=now_ts,
-                                    expected_source=src,
-                                )
-                                if source_kind == "bilibili":
-                                    self._domain_cooldowns["bilibili"] = max(
-                                        self._domain_cooldowns.get("bilibili", 0.0),
-                                        cooldown_until,
-                                    )
-                                return None, None
-                            raise
-                        if isinstance(fetched, dict):
-                            raw_mb = fetched.get("media_bundle")
-                            if isinstance(raw_mb, dict):
-                                media_bundle = raw_mb
-                            fetched_origin = str(
-                                fetched.get("content_origin")
-                                or (media_bundle or {}).get("content_origin")
-                                or ""
-                            )
-                            if fetched_origin:
-                                unit_obj["content_origin"] = fetched_origin
-
-                        is_bili_video_fetched = (
-                            source_kind == "bilibili"
-                            and not self._is_bilibili_dynamic_candidate(
-                                unit_obj, fetched, media_bundle
-                            )
-                        )
-                        # "宁缺毋滥" degradation gate for Bilibili videos:
-                        # Never fabricate a reading log from title+description alone.
-                        if is_bili_video_fetched and media_bundle is not None:
-                            has_visual_fb = bool(media_bundle.get("has_visual"))
-                            has_sub_fb = bool(media_bundle.get("has_subtitle"))
-                            has_audio_fb = bool(
-                                media_bundle.get("has_audio_transcript")
+                        if src is not None:
+                            now_ts = self.clock()
+                            domain_cd = (
+                                self._domain_cooldowns.get("bilibili", 0.0)
+                                if source_kind == "bilibili"
+                                else 0.0
                             )
                             if (
-                                not has_visual_fb
-                                and not has_sub_fb
-                                and not has_audio_fb
+                                source_kind == "bilibili"
+                                and max(float(src.get("cooldown_until") or 0.0), domain_cd)
+                                > now_ts
                             ):
-                                reason = strip_raw_urls(
-                                    str(
-                                        media_bundle.get("skip_reason")
-                                        or media_bundle.get("error_detail")
-                                        or media_bundle.get("content_origin")
-                                        or "no_visual_or_subtitle"
+                                return None, None
+                            is_pre_dynamic = (
+                                source_kind == "bilibili"
+                                and self._is_bilibili_dynamic_candidate(unit_obj)
+                            )
+                            fallback_cookies = None
+                            media_options = None
+                            audio_transcriber = None
+                            fetch_timeout = 25.0
+                            if source_kind == "bilibili" and not is_pre_dynamic:
+                                video_pid = self.effective_provider("video_provider")
+                                if (
+                                    provider_circuit_remaining(self.context, video_pid)
+                                    > 0.0
+                                ):
+                                    self.last_error = (
+                                        f"budget_circuit_open:{video_pid}"[:180]
                                     )
-                                )[:160]
-                                if media_bundle.get("is_transient_error"):
-                                    self.last_error = f"video_deferred:{reason}"[:180]
-                                    with contextlib.suppress(Exception):
-                                        await run_io(
-                                            self.store.update_source_poll_state,
-                                            src["source_id"],
-                                            cooldown_until=now_ts + 300.0,
-                                            status=f"video_deferred:{reason}"[:120],
-                                            last_error=f"video_deferred:{reason}"[:180],
-                                            now=now_ts,
-                                            expected_source=src,
+                                    return None, None
+                                fallback_cookies = (
+                                    await self._collect_bilibili_fallback_cookies(
+                                        identity, src["source_id"]
+                                    )
+                                )
+                                media_options = self._build_video_media_options()
+                                audio_transcriber = self._build_audio_transcriber()
+                                fetch_timeout = max(
+                                    45.0,
+                                    float(self.config.get("model_timeout", 60) or 60),
+                                )
+                            try:
+                                async with http_session_scope():
+                                    if (
+                                        fallback_cookies is not None
+                                        or media_options is not None
+                                        or audio_transcriber is not None
+                                    ):
+                                        fetch_kwargs: dict[str, Any] = {
+                                            "timeout": fetch_timeout
+                                        }
+                                        try:
+                                            sig = inspect.signature(
+                                                self.fetch_item_content_adapter
+                                            )
+                                            params = sig.parameters
+                                            has_varkw = any(
+                                                p.kind == inspect.Parameter.VAR_KEYWORD
+                                                for p in params.values()
+                                            )
+                                        except (TypeError, ValueError):
+                                            params = {}
+                                            has_varkw = False
+                                        if fallback_cookies is not None and (
+                                            has_varkw or "fallback_cookies" in params
+                                        ):
+                                            fetch_kwargs["fallback_cookies"] = (
+                                                fallback_cookies
+                                            )
+                                        if media_options is not None and (
+                                            has_varkw or "media_options" in params
+                                        ):
+                                            fetch_kwargs["media_options"] = media_options
+                                        if audio_transcriber is not None and (
+                                            has_varkw or "audio_transcriber" in params
+                                        ):
+                                            fetch_kwargs["audio_transcriber"] = (
+                                                audio_transcriber
+                                            )
+                                        fetched = await self.fetch_item_content_adapter(
+                                            src, unit_obj, **fetch_kwargs
+                                        )
+                                    else:
+                                        fetched = await self.fetch_item_content_adapter(
+                                            src, unit_obj, timeout=fetch_timeout
+                                        )
+                            except Exception as exc:
+                                from ..adapters.bilibili import BilibiliRiskControlError
+                                from ..adapters.ssrf import AdapterRateLimitError
+
+                                if isinstance(
+                                    exc, (BilibiliRiskControlError, AdapterRateLimitError)
+                                ):
+                                    cur = dict(src.get("cursor") or {})
+                                    step = int(cur.get("backoff_step") or 0) + 1
+                                    cur["backoff_step"] = step
+                                    base_cd = float(
+                                        getattr(exc, "cooldown_seconds", 0.0)
+                                        or getattr(exc, "retry_after", 0.0)
+                                        or 1800.0
+                                    )
+                                    wait_s = min(
+                                        7200.0, base_cd * (1.5 ** min(step - 1, 3))
+                                    )
+                                    cooldown_until = now_ts + wait_s
+                                    status_kind = (
+                                        "rate_limited"
+                                        if isinstance(exc, AdapterRateLimitError)
+                                        else "risk_control_backoff"
+                                    )
+                                    err_msg = (
+                                        strip_raw_urls(str(exc))[:180]
+                                        or type(exc).__name__
+                                    )
+                                    await run_io(
+                                        self.store.update_source_poll_state,
+                                        src["source_id"],
+                                        next_cursor=cur,
+                                        cooldown_until=cooldown_until,
+                                        status=f"{status_kind}: stage2:{err_msg}",
+                                        last_error=f"stage2:{err_msg}",
+                                        now=now_ts,
+                                        expected_source=src,
+                                    )
+                                    if source_kind == "bilibili":
+                                        await self._set_domain_cooldown(
+                                            "bilibili", cooldown_until
                                         )
                                     return None, None
+                                raise
+                            if isinstance(fetched, dict):
+                                raw_mb = fetched.get("media_bundle")
+                                if isinstance(raw_mb, dict):
+                                    media_bundle = raw_mb
+                                fetched_origin = str(
+                                    fetched.get("content_origin")
+                                    or (media_bundle or {}).get("content_origin")
+                                    or ""
+                                )
+                                if fetched_origin:
+                                    unit_obj["content_origin"] = fetched_origin
+
+                            is_bili_video_fetched = (
+                                source_kind == "bilibili"
+                                and not self._is_bilibili_dynamic_candidate(
+                                    unit_obj, fetched, media_bundle
+                                )
+                            )
+                            # "宁缺毋滥" degradation gate for Bilibili videos:
+                            # Never fabricate a reading log from title+description alone.
+                            if is_bili_video_fetched and media_bundle is not None:
+                                has_visual_fb = bool(media_bundle.get("has_visual"))
+                                has_sub_fb = bool(media_bundle.get("has_subtitle"))
+                                has_audio_fb = bool(
+                                    media_bundle.get("has_audio_transcript")
+                                )
+                                if (
+                                    not has_visual_fb
+                                    and not has_sub_fb
+                                    and not has_audio_fb
+                                ):
+                                    reason = strip_raw_urls(
+                                        str(
+                                            media_bundle.get("skip_reason")
+                                            or media_bundle.get("error_detail")
+                                            or media_bundle.get("content_origin")
+                                            or "no_visual_or_subtitle"
+                                        )
+                                    )[:160]
+                                    if media_bundle.get("is_transient_error"):
+                                        self.last_error = f"video_deferred:{reason}"[:180]
+                                        with contextlib.suppress(Exception):
+                                            await run_io(
+                                                self.store.update_source_poll_state,
+                                                src["source_id"],
+                                                cooldown_until=now_ts + 300.0,
+                                                status=f"video_deferred:{reason}"[:120],
+                                                last_error=f"video_deferred:{reason}"[:180],
+                                                now=now_ts,
+                                                expected_source=src,
+                                            )
+                                        return None, None
+                                    if candidate_id:
+                                        await run_io(
+                                            self.store.set_candidate_status,
+                                            candidate_id,
+                                            "skipped",
+                                            reason=reason or "video_unavailable",
+                                        )
+                                    return None, None
+                            elif (
+                                is_bili_video_fetched
+                                and isinstance(fetched, dict)
+                                and str(fetched.get("content_origin") or "")
+                                in {
+                                    "bilibili_description",
+                                    "bilibili_metadata_only",
+                                    "bilibili_unavailable_permanent",
+                                }
+                            ):
                                 if candidate_id:
                                     await run_io(
                                         self.store.set_candidate_status,
                                         candidate_id,
                                         "skipped",
-                                        reason=reason or "video_unavailable",
+                                        reason=str(fetched.get("content_origin") or ""),
                                     )
                                 return None, None
-                        elif (
-                            is_bili_video_fetched
-                            and isinstance(fetched, dict)
-                            and str(fetched.get("content_origin") or "")
-                            in {
-                                "bilibili_description",
-                                "bilibili_metadata_only",
-                                "bilibili_unavailable_permanent",
-                            }
-                        ):
-                            if candidate_id:
-                                await run_io(
-                                    self.store.set_candidate_status,
-                                    candidate_id,
-                                    "skipped",
-                                    reason=str(fetched.get("content_origin") or ""),
-                                )
-                            return None, None
 
-                        if isinstance(fetched, dict) and fetched.get("full_text"):
-                            updated_cand = await run_io(
-                                self.store.update_candidate_content,
-                                candidate_id,
-                                full_text=str(fetched["full_text"]),
-                                chapter_label=str(
-                                    fetched.get("chapter_label") or chapter_label
-                                ),
-                                total_chapters=fetched.get("total_chapters"),
-                                content_origin=str(
-                                    fetched.get("content_origin") or "unknown"
-                                ),
-                                max_chars=6000 if is_bili_video_fetched else 4000,
-                            )
-                            if updated_cand is not None:
-                                full_text = updated_cand["full_text"]
-                                chapter_label = updated_cand["chapter_label"]
+                            if isinstance(fetched, dict) and fetched.get("full_text"):
+                                updated_cand = await run_io(
+                                    self.store.update_candidate_content,
+                                    candidate_id,
+                                    full_text=str(fetched["full_text"]),
+                                    chapter_label=str(
+                                        fetched.get("chapter_label") or chapter_label
+                                    ),
+                                    total_chapters=fetched.get("total_chapters"),
+                                    content_origin=str(
+                                        fetched.get("content_origin") or "unknown"
+                                    ),
+                                    max_chars=6000 if is_bili_video_fetched else 4000,
+                                )
+                                if updated_cand is not None:
+                                    full_text = updated_cand["full_text"]
+                                    chapter_label = updated_cand["chapter_label"]
                 if not full_text:
                     full_text = unit_obj.get("summary") or ""
 
@@ -1935,6 +2330,12 @@ class HorizonsEngine(EngineLifecycle):
             import hashlib
 
             stage2_role = "video_provider" if is_bili_video else "analysis_provider"
+            stage2_pid = self.effective_provider(stage2_role)
+            if provider_circuit_remaining(self.context, stage2_pid) > 0.0:
+                self.last_error = f"budget_circuit_open:{stage2_pid}"[:180]
+                if checkpoint_hit is not None:
+                    retain_media_bundle = True
+                return None, None
             effective_self_review = bool(
                 include_self_review and self._can_merge_self_review(stage2_role)
             )
@@ -1985,6 +2386,7 @@ class HorizonsEngine(EngineLifecycle):
                     evidence,
                     self.daily_quota,
                     self.clock(),
+                    tz=self.timezone,
                 )
                 if not task_id:
                     return None, None
@@ -2034,7 +2436,6 @@ class HorizonsEngine(EngineLifecycle):
             payload = {
                 "character": {
                     "name": wake.get("character_name", ""),
-                    "core_profile": str(wake.get("character_prompt") or "")[:1500],
                     "preferences": wake.get("preferences", [])[:6],
                 },
                 "active_interests": [
@@ -2056,6 +2457,11 @@ class HorizonsEngine(EngineLifecycle):
             )
             if is_video_multimodal:
                 system_prompt = system_prompt + VIDEO_STAGE2_VISUAL_ADDENDUM
+            system_prompt = build_persona_system_prompt(
+                system_prompt,
+                character_name=str(wake.get("character_name") or ""),
+                core_profile=str(wake.get("character_prompt") or ""),
+            )
             try:
                 payload["reading_context"] = (
                     await run_io(self.store.continuity, book_id, chapter_index or 0)
@@ -2080,6 +2486,56 @@ class HorizonsEngine(EngineLifecycle):
             except Exception as exc:
                 self.analysis_status = f"error:{type(exc).__name__}"
                 self.last_error = str(exc)[:200]
+                if self._is_transient_reading_failure(exc):
+                    await asyncio.shield(
+                        run_io(
+                            self.store.refund_reading_attempt, task_id, self.clock()
+                        )
+                    )
+                    if (
+                        checkpoint_key
+                        and isinstance(media_bundle, dict)
+                        and (
+                            media_bundle.get("has_visual")
+                            or media_bundle.get("has_audio_transcript")
+                            or media_bundle.get("frames")
+                            or media_bundle.get("frame_paths")
+                            or media_bundle.get("native_video_path")
+                        )
+                    ):
+                        cp_now = self.clock()
+                        expires_at = (
+                            float(checkpoint_hit["expires_at"])
+                            if checkpoint_hit is not None
+                            else cp_now + _MEDIA_CHECKPOINT_TTL_SECONDS
+                        )
+                        if expires_at > cp_now:
+                            self._save_media_checkpoint(
+                                checkpoint_key,
+                                {
+                                    "created_at": (
+                                        float(checkpoint_hit["created_at"])
+                                        if checkpoint_hit is not None
+                                        else cp_now
+                                    ),
+                                    "expires_at": expires_at,
+                                    "full_text": full_text,
+                                    "content_origin": str(
+                                        unit_obj.get("content_origin")
+                                        or media_bundle.get("content_origin")
+                                        or ""
+                                    ),
+                                    "chapter_label": chapter_label,
+                                    "total_chapters": (
+                                        fetched.get("total_chapters")
+                                        if isinstance(fetched, dict)
+                                        else None
+                                    ),
+                                    "media_bundle": media_bundle,
+                                },
+                                now=cp_now,
+                            )
+                            retain_media_bundle = True
                 if (
                     allow_parse_fallback
                     and isinstance(exc, (ValueError, TypeError))
@@ -2270,11 +2726,16 @@ class HorizonsEngine(EngineLifecycle):
             )
             return proposal, inline_review
         finally:
-            if isinstance(media_bundle, dict):
-                cleanup_fn = media_bundle.get("cleanup")
-                if callable(cleanup_fn):
-                    with contextlib.suppress(Exception):
-                        cleanup_fn()
+            if not retain_media_bundle:
+                if checkpoint_key:
+                    self._discard_media_checkpoint(
+                        checkpoint_key, cleanup=True, current_bundle=media_bundle
+                    )
+                if isinstance(media_bundle, dict):
+                    cleanup_fn = media_bundle.get("cleanup")
+                    if callable(cleanup_fn):
+                        with contextlib.suppress(Exception):
+                            cleanup_fn()
 
     @staticmethod
     def _deterministic_proposal_risks(
@@ -2389,6 +2850,7 @@ class HorizonsEngine(EngineLifecycle):
                 tz=self.timezone,
             )
 
+        self._last_review_budget_busy_retry_after = 0.0
         if not character_profile.get("awake") or not character_profile.get(
             "character_prompt"
         ):
@@ -2398,6 +2860,7 @@ class HorizonsEngine(EngineLifecycle):
                 self.clock(),
                 character_profile.get("skip_reason") or "character_unavailable",
                 expected_revision=captured_revision,
+                backoff=False,
             )
             self.review_status = "awaiting_character"
             return proposal
@@ -2416,13 +2879,30 @@ class HorizonsEngine(EngineLifecycle):
             if inline_review is not None and self._can_merge_self_review(stage2_role)
             else None
         )
+        if validated_inline is None:
+            review_circuit_rem = provider_circuit_remaining(
+                self.context, review_provider_id
+            )
+            if review_circuit_rem > 0.0:
+                wait_s = max(review_circuit_rem, 120.0)
+                self._last_review_budget_busy_retry_after = wait_s
+                self.review_status = "deferred:budget_circuit_open"
+                self.last_error = f"budget_circuit_open:{review_provider_id}"[:200]
+                await run_io(
+                    self.store.defer_review,
+                    proposal_id,
+                    self.clock(),
+                    "provider_budget_busy",
+                    expected_revision=captured_revision,
+                    delay=120.0,
+                    min_delay=wait_s,
+                    backoff=True,
+                )
+                return proposal
         review_input = {
             "continuity_evidence": continuity_evidence,
             "character": {
                 "name": character_profile.get("character_name", ""),
-                "core_profile": str(character_profile.get("character_prompt") or "")[
-                    :1500
-                ],
             },
             "blocked_topics": blocked[:30],
             "source_evidence": self._compact_review_source_evidence(
@@ -2439,6 +2919,11 @@ class HorizonsEngine(EngineLifecycle):
                 "questions": proposal["questions"],
             },
         }
+        review_system_prompt = build_persona_system_prompt(
+            STAGE3_REVIEW_PROMPT,
+            character_name=str(character_profile.get("character_name") or ""),
+            core_profile=str(character_profile.get("character_prompt") or ""),
+        )
         try:
             if not character_profile.get("awake") or not character_profile.get(
                 "character_prompt"
@@ -2449,7 +2934,7 @@ class HorizonsEngine(EngineLifecycle):
             else:
                 raw = await self.call_model(
                     "review_provider",
-                    STAGE3_REVIEW_PROMPT,
+                    review_system_prompt,
                     review_input,
                     identity=identity,
                 )
@@ -2466,6 +2951,8 @@ class HorizonsEngine(EngineLifecycle):
             self.last_error = str(exc)[:200]
             if is_provider_budget_busy_error(exc):
                 now_ts = self.clock()
+                retry_after = busy_retry_after(exc, default_min=120.0)
+                self._last_review_budget_busy_retry_after = retry_after
                 await run_io(
                     self.store.defer_review,
                     proposal_id,
@@ -2473,6 +2960,8 @@ class HorizonsEngine(EngineLifecycle):
                     "provider_budget_busy",
                     expected_revision=captured_revision,
                     delay=120.0,
+                    min_delay=retry_after,
+                    backoff=True,
                 )
                 return proposal
             if "quota_reached" in str(exc):
@@ -2485,6 +2974,7 @@ class HorizonsEngine(EngineLifecycle):
                     str(exc)[:180],
                     expected_revision=captured_revision,
                     delay=max(300.0, next_day + 60.0 - now_ts),
+                    backoff=False,
                 )
                 return proposal
             return await run_io(
@@ -2575,6 +3065,7 @@ class HorizonsEngine(EngineLifecycle):
         expected_revision: int | None = None,
         expected_identity: str = "",
     ) -> dict[str, Any]:
+        proactive_sessions = await self.effective_proactive_sessions_async()
         committed = await run_io(
             self.store.approve_proposal_atomic,
             proposal_id,
@@ -2583,7 +3074,7 @@ class HorizonsEngine(EngineLifecycle):
             risks=risks,
             half_life_days=self.half_life_days,
             question_ttl_hours=self.question_ttl_hours,
-            proactive_sessions=self.effective_proactive_sessions(),
+            proactive_sessions=proactive_sessions,
             expected_revision=expected_revision,
             expected_identity=expected_identity,
             now=self.clock(),

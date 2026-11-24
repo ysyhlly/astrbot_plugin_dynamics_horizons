@@ -128,11 +128,13 @@ async def test_dh1_distinct_review_provider_uses_two_calls_and_compact_review_pa
         # Distinct review_provider => exactly 2 calls (1 merged analysis + 1 independent review)
         assert len(calls) == 2
         assert calls[0][0] == "analysis_provider"
-        assert calls[0][1] == STAGE12_MERGED_DIGEST_PROMPT
+        assert calls[0][1].endswith(STAGE12_MERGED_DIGEST_PROMPT)
+        assert "core_profile" not in calls[0][2]["character"]
         assert "UNIQUE_LONG_RAW_SENTINEL_987654321" in calls[0][2]["untrusted_media"]
 
         assert calls[1][0] == "review_provider"
-        assert calls[1][1] == STAGE3_REVIEW_PROMPT
+        assert calls[1][1].endswith(STAGE3_REVIEW_PROMPT)
+        assert "core_profile" not in calls[1][2]["character"]
         review_payload = calls[1][2]
         review_json = json.dumps(review_payload, ensure_ascii=False)
         # Compact review payload MUST NOT duplicate the full raw source text or raw_url
@@ -189,7 +191,7 @@ async def test_dh1_same_provider_merged_self_review_uses_one_call(tmp_path: Path
         assert res["approved"] == 1
         assert len(calls) == 1
         assert calls[0][0] == "analysis_provider"
-        assert calls[0][1] == STAGE123_MERGED_DIGEST_REVIEW_PROMPT
+        assert calls[0][1].endswith(STAGE123_MERGED_DIGEST_REVIEW_PROMPT)
         assert _count_model_calls(store) == 1
         assert _count_model_calls(store, "success") == 1
         assert eng.health(IDENT)["review_context_policy"] == "merged_self_review"
@@ -229,8 +231,8 @@ async def test_dh1_same_provider_with_merge_disabled_keeps_separate_review_call(
         res = await eng.run_digest_cycle(identity=IDENT)
         assert res["approved"] == 1
         assert len(calls) == 2
-        assert calls[0][1] == STAGE12_MERGED_DIGEST_PROMPT
-        assert calls[1][1] == STAGE3_REVIEW_PROMPT
+        assert calls[0][1].endswith(STAGE12_MERGED_DIGEST_PROMPT)
+        assert calls[1][1].endswith(STAGE3_REVIEW_PROMPT)
         assert "text" not in calls[1][2]["source_evidence"]
         assert _count_model_calls(store) == 2
         assert eng.health(IDENT)["review_context_policy"] == "independent_calls"
@@ -280,7 +282,7 @@ async def test_dh1_preserves_human_review_modes_with_same_provider_merge(
             if mode == "human"
             else STAGE123_MERGED_DIGEST_REVIEW_PROMPT
         )
-        assert calls[0][1] == expected_prompt
+        assert calls[0][1].endswith(expected_prompt)
         props = store.list_proposals(identity=IDENT)["items"]
         assert len(props) == 1
         assert props[0]["state"] == "pending_review"
@@ -340,7 +342,7 @@ async def test_dh1_invalid_inline_self_review_falls_back_to_separate_review(
         assert len(calls) == 2
         assert calls[0][0] == "analysis_provider"
         assert calls[1][0] == "review_provider"
-        assert calls[1][1] == STAGE3_REVIEW_PROMPT
+        assert calls[1][1].endswith(STAGE3_REVIEW_PROMPT)
         assert _count_model_calls(store) == 2
     finally:
         store.close()
@@ -440,17 +442,17 @@ async def test_dh1_merged_parse_failure_falls_back_to_two_step_path_and_preserve
 
     async def model(role: str, instruction: str, payload: dict):
         calls.append((role, instruction, payload))
-        if instruction == STAGE12_MERGED_DIGEST_PROMPT:
+        if instruction.endswith(STAGE12_MERGED_DIGEST_PROMPT):
             # Simulate a parse/schema failure on the merged call
             raise ValueError("模型返回内容不是合法 JSON 对象")
-        if instruction == STAGE1_TRIAGE_PROMPT:
+        if instruction.endswith(STAGE1_TRIAGE_PROMPT):
             return {
                 "selected_candidate_ids": [cid],
                 "continue_book_ids": [],
                 "drop_book_ids": [],
                 "skip_candidate_ids": [],
             }
-        if instruction == STAGE2_DEEP_READ_PROMPT:
+        if instruction.endswith(STAGE2_DEEP_READ_PROMPT):
             return {
                 "worth_recording": True,
                 "digest": "回退两步后提取的宋代点茶摘要。",
@@ -467,12 +469,15 @@ async def test_dh1_merged_parse_failure_falls_back_to_two_step_path_and_preserve
         assert res["status"] == "ok"
         assert res["proposals_created"] == 1
         assert res["approved"] == 1
-        assert [c[1] for c in calls] == [
+        expected_stages = [
             STAGE12_MERGED_DIGEST_PROMPT,
             STAGE1_TRIAGE_PROMPT,
             STAGE2_DEEP_READ_PROMPT,
             STAGE3_REVIEW_PROMPT,
         ]
+        assert len(calls) == len(expected_stages)
+        for (_, got_sys, _), expected_stage in zip(calls, expected_stages):
+            assert got_sys.endswith(expected_stage)
         # Model call quota accurately records all 4 actual calls (1 failed + 3 succeeded)
         assert _count_model_calls(store) == 4
         assert _count_model_calls(store, "failed") == 1
@@ -529,7 +534,9 @@ async def test_dh1_static_system_prompts_across_different_items(tmp_path: Path):
 
         assert len(analysis_prompts) == 2
         assert len(review_prompts) == 2
-        assert analysis_prompts[0] == analysis_prompts[1] == STAGE12_MERGED_DIGEST_PROMPT
-        assert review_prompts[0] == review_prompts[1] == STAGE3_REVIEW_PROMPT
+        assert analysis_prompts[0] == analysis_prompts[1]
+        assert analysis_prompts[0].endswith(STAGE12_MERGED_DIGEST_PROMPT)
+        assert review_prompts[0] == review_prompts[1]
+        assert review_prompts[0].endswith(STAGE3_REVIEW_PROMPT)
     finally:
         store.close()

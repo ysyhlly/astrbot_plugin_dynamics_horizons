@@ -1,5 +1,10 @@
 # 更新日志
 
+## v0.2.0-rc.8 — 2026-11-24
+
+- 全面接入 `provider_circuit_remaining()` 预检（覆盖定期精读、反馈队列、摘要、STT 与视频拉取），遇熔断立即中断批次延期，`_retry_job` 遇熔断不消耗重试次数且不误打进死信，`defer_review` 改为渐进退避。
+- 有字幕视频自适应降至 4-6 帧 640px 抽帧节省视觉 Token，将稳定 `character.core_profile` 移入 `system_prompt` 跨过缓存门槛；同步最新 `series_panels.py`。
+
 ## v0.2.0-rc.7 — 2026-11-22
 
 - 接入全系列共享 `ProviderBudget` 并发池与遥测上报（覆盖 `main.py` 与 `core/engine.py` 精读/审查调用），遇队列繁忙可平滑延后。

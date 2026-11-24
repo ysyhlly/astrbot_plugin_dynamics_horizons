@@ -7,19 +7,25 @@ and guaranteed to keep all temporary artifacts inside a dedicated per-fetch temp
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import io
 import math
 import os
 import re
 import shutil
 import tempfile
+import threading
+import time
+import weakref
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+from astrbot.api import logger
 
 from . import ssrf as ssrf_mod
 from .ssrf import (
@@ -36,6 +42,15 @@ from .ssrf import (
 BILI_VIDEOSHOT_URL = "https://api.bilibili.com/x/player/videoshot"
 _TEMP_PREFIX = "horizons_bili_"
 _RANGE_CHUNK_BYTES = 4 * 1024 * 1024
+_MIN_FREE_DISK_BYTES = 512 * 1024 * 1024  # 512 MB minimum free space before download
+_STALE_TEMP_TTL_SECONDS = 3600.0  # 1 hour stale temp dir cleanup threshold
+_MEDIA_SEMAPHORES: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = weakref.WeakKeyDictionary()
+_MEDIA_SEMAPHORE_LOCK = threading.Lock()
+_IN_MEDIA_SEMAPHORE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "horizons_in_media_semaphore", default=False
+)
 _PTS_TIME_RE = re.compile(r"pts_time:(\d+(?:\.\d+)?)")
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)", re.IGNORECASE)
 _REPEATED_CHAR_RE = re.compile(r"^(.)\1{2,}$")
@@ -62,7 +77,9 @@ DEFAULT_MEDIA_OPTIONS: dict[str, Any] = {
     "native_max_mb": 15.0,
     "medium_max_duration_sec": 2700,
     "max_frames": 12,
+    "subtitle_max_frames": 6,
     "frame_max_width": 960,
+    "subtitle_frame_max_width": 640,
     "frame_jpeg_quality": 80,
     "max_download_mb": 60.0,
     "danmaku_enabled": False,
@@ -160,7 +177,16 @@ def normalize_media_options(
         2700,
     )
     opts["max_frames"] = _clamp_int(opts["max_frames"], 1, 20, 12)
+    opts["subtitle_max_frames"] = _clamp_int(
+        opts["subtitle_max_frames"], 1, opts["max_frames"], min(6, opts["max_frames"])
+    )
     opts["frame_max_width"] = _clamp_int(opts["frame_max_width"], 320, 1280, 960)
+    opts["subtitle_frame_max_width"] = _clamp_int(
+        opts["subtitle_frame_max_width"],
+        320,
+        opts["frame_max_width"],
+        min(640, opts["frame_max_width"]),
+    )
     opts["frame_jpeg_quality"] = _clamp_int(opts["frame_jpeg_quality"], 50, 95, 80)
     opts["max_download_mb"] = _clamp_float(opts["max_download_mb"], 5.0, 200.0, 60.0)
     opts["danmaku_enabled"] = bool(opts["danmaku_enabled"])
@@ -171,6 +197,45 @@ def normalize_media_options(
     )
     opts["audio_max_mb"] = _clamp_float(opts["audio_max_mb"], 2.0, 60.0, 20.0)
     return opts
+
+
+def resolve_keyframe_budget(
+    opts: Mapping[str, Any],
+    *,
+    has_subtitle: bool,
+    duration_sec: float = 0.0,
+) -> tuple[int, int]:
+    """Return adaptive ``(max_frames, frame_max_width)`` based on subtitle availability.
+
+    Subtitle-backed videos use a compact budget (4-6 frames at <=640px) to cut visual
+    token cost while keeping scene grounding; subtitle-less videos keep the full budget.
+    """
+    full_frames = max(1, min(20, int(opts.get("max_frames", 12) or 12)))
+    full_width = max(320, min(1280, int(opts.get("frame_max_width", 960) or 960)))
+    if not has_subtitle:
+        return full_frames, full_width
+    sub_cap = max(
+        1,
+        min(
+            full_frames,
+            int(opts.get("subtitle_max_frames", min(6, full_frames)) or 6),
+        ),
+    )
+    sub_width = max(
+        320,
+        min(
+            full_width,
+            int(opts.get("subtitle_frame_max_width", min(640, full_width)) or 640),
+        ),
+    )
+    dur = float(duration_sec or 0.0)
+    if 0 < dur <= 180.0:
+        eff_frames = min(sub_cap, 4)
+    elif 0 < dur <= 600.0:
+        eff_frames = min(sub_cap, 5)
+    else:
+        eff_frames = sub_cap
+    return max(1, eff_frames), sub_width
 
 
 def format_timestamp(seconds: float) -> str:
@@ -205,6 +270,110 @@ def cleanup_temp_dir(path: str | Path | None) -> None:
             shutil.rmtree(target, ignore_errors=True)
     except Exception:
         return
+
+
+def get_media_pipeline_semaphore() -> asyncio.Semaphore:
+    """Return a per-event-loop Semaphore(1) serializing heavy media download/transcode."""
+    loop = asyncio.get_running_loop()
+    with _MEDIA_SEMAPHORE_LOCK:
+        sem = _MEDIA_SEMAPHORES.get(loop)
+        if sem is None:
+            sem = asyncio.Semaphore(1)
+            _MEDIA_SEMAPHORES[loop] = sem
+        return sem
+
+
+@contextlib.asynccontextmanager
+async def _media_pipeline_slot():
+    if _IN_MEDIA_SEMAPHORE.get():
+        yield
+        return
+    sem = get_media_pipeline_semaphore()
+    async with sem:
+        token = _IN_MEDIA_SEMAPHORE.set(True)
+        try:
+            yield
+        finally:
+            _IN_MEDIA_SEMAPHORE.reset(token)
+
+
+def _ensure_free_disk_space(
+    target_dir: Path,
+    *,
+    min_free_bytes: int = _MIN_FREE_DISK_BYTES,
+) -> None:
+    """Verify sufficient free disk space before downloading media artifacts."""
+    probe = target_dir
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    usage = shutil.disk_usage(probe)
+    if usage.free < min_free_bytes:
+        free_mb = usage.free / (1024 * 1024)
+        need_mb = min_free_bytes / (1024 * 1024)
+        logger.warning(
+            "[DynamicsHorizons] Skipping media download due to low disk space: free=%.1fMB < required=%.1fMB",
+            free_mb,
+            need_mb,
+        )
+        raise MediaDownloadError(
+            f"磁盘可用空间不足 ({free_mb:.1f}MB < {need_mb:.0f}MB)",
+            is_transient=True,
+        )
+
+
+def cleanup_stale_temp_dirs(
+    *,
+    max_age_seconds: float = _STALE_TEMP_TTL_SECONDS,
+    now: float | None = None,
+    temp_root: str | Path | None = None,
+    protected_dirs: Iterable[str | Path] | None = None,
+) -> int:
+    """Remove expired `horizons_bili_*` temp dirs whose mtime exceeds `max_age_seconds`."""
+    root = Path(temp_root) if temp_root is not None else Path(tempfile.gettempdir())
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        return 0
+    if not resolved_root.is_dir():
+        return 0
+    protected: set[Path] = set()
+    for p in protected_dirs or ():
+        if not p:
+            continue
+        try:
+            protected.add(Path(p).resolve())
+        except OSError:
+            continue
+    cutoff = (float(now) if now is not None else time.time()) - max(
+        0.0, float(max_age_seconds)
+    )
+    removed = 0
+    try:
+        entries = list(resolved_root.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(_TEMP_PREFIX):
+            continue
+        try:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            resolved = entry.resolve()
+            if resolved in protected or resolved_root not in resolved.parents:
+                continue
+            if entry.stat().st_mtime < cutoff:
+                shutil.rmtree(resolved, ignore_errors=True)
+                if not resolved.exists():
+                    removed += 1
+        except OSError:
+            continue
+    if removed > 0:
+        logger.info(
+            "[DynamicsHorizons] Cleaned up %d stale temp directories under %s",
+            removed,
+            resolved_root,
+        )
+    return removed
 
 
 def cleanup_media_bundle(bundle: Mapping[str, Any] | None) -> None:
@@ -413,7 +582,6 @@ async def _stream_single_url_to_file(
                             is_trans = resp.status >= 500 or resp.status in {
                                 403,
                                 408,
-                                412,
                                 429,
                             }
                             raise MediaDownloadError(
@@ -492,66 +660,76 @@ async def download_media_to_file(
     if not deduped:
         raise MediaDownloadError("缺少可用媒体下载地址", is_transient=False)
 
+    await asyncio.to_thread(_ensure_free_disk_space, output_path.parent)
+
     part_path = output_path.with_suffix(output_path.suffix + ".part")
     last_err: Exception | None = None
     candidates = deduped
-    try:
-        for attempt in range(2):
-            retry_urls: list[str] = []
-            for raw_url in candidates:
-                url = ("https:" + raw_url) if raw_url.startswith("//") else raw_url
+    async with _media_pipeline_slot():
+        try:
+            for attempt in range(2):
+                retry_urls: list[str] = []
+                for raw_url in candidates:
+                    url = ("https:" + raw_url) if raw_url.startswith("//") else raw_url
+                    try:
+                        written = await _stream_single_url_to_file(
+                            url,
+                            part_path,
+                            max_bytes=max_bytes,
+                            timeout=timeout,
+                            cookie_header=cookie_header,
+                            secrets=secrets,
+                        )
+                        part_path.replace(output_path)
+                        return written
+                    except (
+                        SSRFBlockedError,
+                        MediaSizeLimitExceeded,
+                        AdapterRateLimitError,
+                    ):
+                        raise
+                    except MediaDownloadError as exc:
+                        last_err = exc
+                        if exc.status_code == 412:
+                            raise
+                        if exc.is_transient:
+                            retry_urls.append(url)
+                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                        last_err = MediaDownloadError(
+                            redact_error_text(exc, secrets), is_transient=True
+                        )
+                        retry_urls.append(url)
+                    except AdapterHTTPError as exc:
+                        is_trans = exc.status_code >= 500 or exc.status_code in {
+                            403,
+                            408,
+                            429,
+                        }
+                        last_err = MediaDownloadError(
+                            f"HTTP {exc.status_code}",
+                            is_transient=is_trans,
+                            status_code=exc.status_code,
+                        )
+                        if exc.status_code == 412:
+                            raise last_err from None
+                        if is_trans:
+                            retry_urls.append(url)
+                    finally:
+                        if part_path.exists():
+                            try:
+                                part_path.unlink()
+                            except OSError:
+                                pass
+                if not retry_urls or attempt == 1:
+                    break
+                candidates = retry_urls
+                await asyncio.sleep(1.0)
+        finally:
+            if part_path.exists():
                 try:
-                    written = await _stream_single_url_to_file(
-                        url,
-                        part_path,
-                        max_bytes=max_bytes,
-                        timeout=timeout,
-                        cookie_header=cookie_header,
-                        secrets=secrets,
-                    )
-                    part_path.replace(output_path)
-                    return written
-                except (SSRFBlockedError, MediaSizeLimitExceeded, AdapterRateLimitError):
-                    raise
-                except MediaDownloadError as exc:
-                    last_err = exc
-                    if exc.is_transient:
-                        retry_urls.append(url)
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    last_err = MediaDownloadError(
-                        redact_error_text(exc, secrets), is_transient=True
-                    )
-                    retry_urls.append(url)
-                except AdapterHTTPError as exc:
-                    is_trans = exc.status_code >= 500 or exc.status_code in {
-                        403,
-                        408,
-                        412,
-                        429,
-                    }
-                    last_err = MediaDownloadError(
-                        f"HTTP {exc.status_code}",
-                        is_transient=is_trans,
-                        status_code=exc.status_code,
-                    )
-                    if is_trans:
-                        retry_urls.append(url)
-                finally:
-                    if part_path.exists():
-                        try:
-                            part_path.unlink()
-                        except OSError:
-                            pass
-            if not retry_urls or attempt == 1:
-                break
-            candidates = retry_urls
-            await asyncio.sleep(1.0)
-    finally:
-        if part_path.exists():
-            try:
-                part_path.unlink()
-            except OSError:
-                pass
+                    part_path.unlink()
+                except OSError:
+                    pass
 
     if isinstance(last_err, MediaDownloadError):
         raise last_err
@@ -710,11 +888,17 @@ async def _run_subprocess(
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except BaseException:
         try:
-            proc.kill()
-            await proc.wait()
+            if getattr(proc, "returncode", None) is None:
+                proc.kill()
+        except ProcessLookupError:
+            pass
         except Exception:
+            pass
+        try:
+            await proc.wait()
+        except BaseException:
             pass
         raise
     return int(proc.returncode or 0), stdout, stderr
@@ -786,56 +970,57 @@ async def mux_and_compress_native_video(
         (320, 1, max(60, int(video_kbps * 0.62)), 24, 34),
     ]
 
-    for idx, (h, target_fps, v_kbps, a_kbps, crf) in enumerate(passes):
-        cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path)]
-        has_separate_audio = audio_path is not None and audio_path.exists()
-        if has_separate_audio:
-            cmd.extend(["-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0?"])
-        else:
-            cmd.extend(["-map", "0:v:0", "-map", "0:a:0?"])
+    async with _media_pipeline_slot():
+        for idx, (h, target_fps, v_kbps, a_kbps, crf) in enumerate(passes):
+            cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path)]
+            has_separate_audio = audio_path is not None and audio_path.exists()
+            if has_separate_audio:
+                cmd.extend(["-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0?"])
+            else:
+                cmd.extend(["-map", "0:v:0", "-map", "0:a:0?"])
 
-        vf = f"fps={target_fps},scale=-2:'min({h},ih)'"
-        cmd.extend(
-            [
-                "-vf",
-                vf,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                str(crf),
-                "-maxrate",
-                f"{v_kbps}k",
-                "-bufsize",
-                f"{v_kbps * 2}k",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-ac",
-                "1",
-                "-ar",
-                "24000",
-                "-b:a",
-                f"{a_kbps}k",
-                "-movflags",
-                "+faststart",
-                "-shortest",
-                str(output_path),
-            ]
-        )
-        rc, _, stderr = await _run_subprocess(cmd, timeout=timeout)
-        if rc != 0 or not output_path.exists():
-            err_msg = stderr.decode("utf-8", errors="ignore").strip()[:240]
-            if idx == len(passes) - 1:
-                output_path.unlink(missing_ok=True)
-                raise RuntimeError(f"ffmpeg 压缩封装失败: {err_msg or rc}")
-            continue
+            vf = f"fps={target_fps},scale=-2:'min({h},ih)'"
+            cmd.extend(
+                [
+                    "-vf",
+                    vf,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    str(crf),
+                    "-maxrate",
+                    f"{v_kbps}k",
+                    "-bufsize",
+                    f"{v_kbps * 2}k",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "24000",
+                    "-b:a",
+                    f"{a_kbps}k",
+                    "-movflags",
+                    "+faststart",
+                    "-shortest",
+                    str(output_path),
+                ]
+            )
+            rc, _, stderr = await _run_subprocess(cmd, timeout=timeout)
+            if rc != 0 or not output_path.exists():
+                err_msg = stderr.decode("utf-8", errors="ignore").strip()[:240]
+                if idx == len(passes) - 1:
+                    output_path.unlink(missing_ok=True)
+                    raise RuntimeError(f"ffmpeg 压缩封装失败: {err_msg or rc}")
+                continue
 
-        size = output_path.stat().st_size
-        if 0 < size <= max_bytes:
-            return size
+            size = output_path.stat().st_size
+            if 0 < size <= max_bytes:
+                return size
 
     output_path.unlink(missing_ok=True)
     raise MediaSizeLimitExceeded(f"压缩后 MP4 仍超过上限 {max_mb:.1f}MB")
@@ -1022,77 +1207,78 @@ async def extract_keyframes_from_video(
     if not ffmpeg_bin or not video_path.exists():
         return []
 
-    eff_dur = float(duration_sec or 0.0)
-    if eff_dur <= 0.0:
-        eff_dur = await probe_media_duration(video_path)
-    if eff_dur <= 0.0:
-        eff_dur = 10.0
+    async with _media_pipeline_slot():
+        eff_dur = float(duration_sec or 0.0)
+        if eff_dur <= 0.0:
+            eff_dur = await probe_media_duration(video_path)
+        if eff_dur <= 0.0:
+            eff_dur = 10.0
 
-    scene_ts: list[float] = []
-    if use_scene_detect and eff_dur <= 1800:
-        scene_ts = await detect_scene_timestamps(
-            video_path,
-            duration_sec=eff_dur,
-            timeout=min(20.0, max(8.0, timeout * 0.35)),
+        scene_ts: list[float] = []
+        if use_scene_detect and eff_dur <= 1800:
+            scene_ts = await detect_scene_timestamps(
+                video_path,
+                duration_sec=eff_dur,
+                timeout=min(20.0, max(8.0, timeout * 0.35)),
+            )
+
+        timestamps = plan_frame_timestamps(
+            eff_dur,
+            max_frames=max_frames,
+            scene_timestamps=scene_ts,
+            danmaku_spikes_sec=danmaku_spikes_sec,
         )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # Map JPEG quality 50..95 -> ffmpeg mjpeg q:v 10..2
+        qscale = max(2, min(12, int(round((100 - max(50, min(95, jpeg_quality))) / 5.0))))
+        per_frame_timeout = max(8.0, min(20.0, timeout / max(1, len(timestamps)) * 2.0))
+        sem = asyncio.Semaphore(3)
 
-    timestamps = plan_frame_timestamps(
-        eff_dur,
-        max_frames=max_frames,
-        scene_timestamps=scene_ts,
-        danmaku_spikes_sec=danmaku_spikes_sec,
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # Map JPEG quality 50..95 -> ffmpeg mjpeg q:v 10..2
-    qscale = max(2, min(12, int(round((100 - max(50, min(95, jpeg_quality))) / 5.0))))
-    per_frame_timeout = max(8.0, min(20.0, timeout / max(1, len(timestamps)) * 2.0))
-    sem = asyncio.Semaphore(3)
+        async def _grab_one(idx: int, ts: float) -> dict[str, Any] | None:
+            label = format_timestamp(ts)
+            out_file = output_dir / f"frame_{idx:02d}_{int(ts):05d}s.jpg"
+            async with sem:
+                try:
+                    rc, _, _ = await _run_subprocess(
+                        [
+                            ffmpeg_bin,
+                            "-y",
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-ss",
+                            f"{ts:.2f}",
+                            "-i",
+                            str(video_path),
+                            "-frames:v",
+                            "1",
+                            "-vf",
+                            f"scale='min({int(max_width)},iw)':-2",
+                            "-q:v",
+                            str(qscale),
+                            str(out_file),
+                        ],
+                        timeout=per_frame_timeout,
+                    )
+                except Exception:
+                    return None
+                if rc != 0 or not out_file.exists() or out_file.stat().st_size == 0:
+                    out_file.unlink(missing_ok=True)
+                    return None
+                await asyncio.to_thread(stamp_timestamp_on_image, out_file, label)
+                return {
+                    "path": str(out_file),
+                    "timestamp_sec": round(ts, 2),
+                    "label": label,
+                    "source": "ffmpeg",
+                }
 
-    async def _grab_one(idx: int, ts: float) -> dict[str, Any] | None:
-        label = format_timestamp(ts)
-        out_file = output_dir / f"frame_{idx:02d}_{int(ts):05d}s.jpg"
-        async with sem:
-            try:
-                rc, _, _ = await _run_subprocess(
-                    [
-                        ffmpeg_bin,
-                        "-y",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-ss",
-                        f"{ts:.2f}",
-                        "-i",
-                        str(video_path),
-                        "-frames:v",
-                        "1",
-                        "-vf",
-                        f"scale='min({int(max_width)},iw)':-2",
-                        "-q:v",
-                        str(qscale),
-                        str(out_file),
-                    ],
-                    timeout=per_frame_timeout,
-                )
-            except Exception:
-                return None
-            if rc != 0 or not out_file.exists() or out_file.stat().st_size == 0:
-                out_file.unlink(missing_ok=True)
-                return None
-            await asyncio.to_thread(stamp_timestamp_on_image, out_file, label)
-            return {
-                "path": str(out_file),
-                "timestamp_sec": round(ts, 2),
-                "label": label,
-                "source": "ffmpeg",
-            }
-
-    results = await asyncio.gather(
-        *(_grab_one(i + 1, ts) for i, ts in enumerate(timestamps))
-    )
-    frames = [r for r in results if r is not None]
-    frames.sort(key=lambda item: float(item["timestamp_sec"]))
-    return frames
+        results = await asyncio.gather(
+            *(_grab_one(i + 1, ts) for i, ts in enumerate(timestamps))
+        )
+        frames = [r for r in results if r is not None]
+        frames.sort(key=lambda item: float(item["timestamp_sec"]))
+        return frames
 
 
 def _pick_videoshot_tile_indices(
@@ -1610,150 +1796,178 @@ async def _acquire_video_media_in_temp(
                 else:
                     transient_reason = redact_error_text(exc, secrets)
 
-    # Step 2: Download DASH/progressive video (and audio when needed) if within size cap
+    # Step 2 + 3A + 3B: Serialize heavy download and transcode under global Semaphore(1)
     max_dl_bytes = int(opts["max_download_mb"] * 1024 * 1024)
-    if (
-        opts["visual_enabled"]
-        and allow_dash_video
-        and stream_info is not None
-        and stream_info.get("video_urls")
-        and (
-            stream_info["estimated_video_bytes"] == 0
-            or stream_info["estimated_video_bytes"] <= max_dl_bytes
-        )
-    ):
-        cand_video = temp_dir / "raw_video.mp4"
-        try:
-            await download_media_to_file(
-                stream_info["video_urls"],
-                cand_video,
-                max_bytes=max_dl_bytes,
-                timeout=max(40.0, timeout),
-                cookie_header=cookie_header,
-                secrets=secrets,
-            )
-            raw_video_path = cand_video
-        except (SSRFBlockedError, AdapterRateLimitError):
-            cleanup_temp_dir(temp_dir)
-            raise
-        except MediaSizeLimitExceeded as exc:
-            transient_reason = redact_error_text(exc, secrets)
-        except Exception as exc:
-            transient_reason = redact_error_text(exc, secrets)
-
-    # Download audio track if needed for native mux or STT fallback
-    want_audio_dl = (
-        stream_info is not None
-        and not stream_info.get("is_progressive")
-        and stream_info.get("audio_urls")
-        and ((want_native and raw_video_path is not None) or need_audio_stt)
-    )
-    if want_audio_dl and stream_info is not None:
-        audio_cap_bytes = int(
-            min(opts["max_download_mb"], opts["audio_max_mb"]) * 1024 * 1024
-        )
+    async with _media_pipeline_slot():
         if (
-            stream_info["estimated_audio_bytes"] == 0
-            or stream_info["estimated_audio_bytes"] <= audio_cap_bytes
+            opts["visual_enabled"]
+            and allow_dash_video
+            and stream_info is not None
+            and stream_info.get("video_urls")
+            and (
+                stream_info["estimated_video_bytes"] == 0
+                or stream_info["estimated_video_bytes"] <= max_dl_bytes
+            )
         ):
-            cand_audio = temp_dir / "raw_audio.m4a"
+            cand_video = temp_dir / "raw_video.mp4"
             try:
                 await download_media_to_file(
-                    stream_info["audio_urls"],
-                    cand_audio,
-                    max_bytes=audio_cap_bytes,
-                    timeout=max(30.0, timeout),
+                    stream_info["video_urls"],
+                    cand_video,
+                    max_bytes=max_dl_bytes,
+                    timeout=max(40.0, timeout),
                     cookie_header=cookie_header,
                     secrets=secrets,
                 )
-                raw_audio_path = cand_audio
+                raw_video_path = cand_video
             except (SSRFBlockedError, AdapterRateLimitError):
                 cleanup_temp_dir(temp_dir)
                 raise
+            except MediaSizeLimitExceeded as exc:
+                transient_reason = redact_error_text(exc, secrets)
             except Exception as exc:
-                if not transient_reason:
-                    transient_reason = redact_error_text(exc, secrets)
+                if classify_error is not None:
+                    rc = classify_error(exc)
+                    if rc is not None:
+                        cleanup_temp_dir(temp_dir)
+                        raise rc from None
+                transient_reason = redact_error_text(exc, secrets)
 
-    # Step 3A: Channel A — Native compressed MP4 for short videos
-    if want_native and raw_video_path is not None:
-        native_out = temp_dir / "native_video.mp4"
-        try:
-            size_bytes = await mux_and_compress_native_video(
-                raw_video_path,
-                raw_audio_path,
-                native_out,
-                duration_sec=eff_dur,
-                max_mb=opts["native_max_mb"],
-                timeout=max(60.0, timeout * 2.0),
-            )
-            bundle["watch_mode"] = "native_video"
-            bundle["content_origin"] = "bilibili_native_video"
-            bundle["has_visual"] = True
-            bundle["native_video_path"] = str(native_out)
-            bundle["native_video_size_bytes"] = size_bytes
-
-            # Remove raw audio immediately; keep native_out for Gemini AND lazy fallback frames
-            if raw_audio_path is not None:
-                raw_audio_path.unlink(missing_ok=True)
-            # Keep raw_video_path? No, native_out already has all video frames and is <= 15MB!
-            raw_video_path.unlink(missing_ok=True)
-            raw_video_path = None
-
-            async def _ensure_fallback_frames() -> list[dict[str, Any]]:
-                if bundle["frames"]:
-                    return list(bundle["frames"])
-                src_mp4 = Path(bundle["native_video_path"])
-                if not src_mp4.exists():
-                    return []
-                extracted = await extract_keyframes_from_video(
-                    src_mp4,
-                    temp_dir / "frames",
-                    duration_sec=eff_dur,
-                    max_frames=opts["max_frames"],
-                    max_width=opts["frame_max_width"],
-                    jpeg_quality=opts["frame_jpeg_quality"],
-                    danmaku_spikes_sec=danmaku_spikes,
-                    use_scene_detect=True,
-                )
-                bundle["frames"] = extracted
-                bundle["frame_paths"] = [f["path"] for f in extracted]
-                bundle["frame_count"] = len(extracted)
-                return list(extracted)
-
-            bundle["ensure_fallback_frames"] = _ensure_fallback_frames
-        except Exception as exc:
-            # Compression/mux failed -> fall straight into Channel B keyframe extraction using raw_video_path!
-            transient_reason = redact_error_text(exc, secrets)
-
-    # Step 3B: Channel B — Extract keyframes from downloaded video
-    if opts["visual_enabled"] and not bundle["has_visual"] and raw_video_path is not None:
-        frames = await extract_keyframes_from_video(
-            raw_video_path,
-            temp_dir / "frames",
-            duration_sec=eff_dur,
-            max_frames=opts["max_frames"],
-            max_width=opts["frame_max_width"],
-            jpeg_quality=opts["frame_jpeg_quality"],
-            danmaku_spikes_sec=danmaku_spikes,
-            use_scene_detect=True,
-            timeout=max(45.0, timeout),
+        # Download audio track if needed for native mux or STT fallback
+        want_audio_dl = (
+            stream_info is not None
+            and not stream_info.get("is_progressive")
+            and stream_info.get("audio_urls")
+            and ((want_native and raw_video_path is not None) or need_audio_stt)
         )
-        # Release raw downloaded video promptly unless needed for progressive audio STT
-        if not (need_audio_stt and raw_audio_path is None and stream_info and stream_info.get("is_progressive")):
-            raw_video_path.unlink(missing_ok=True)
-            raw_video_path = None
+        if want_audio_dl and stream_info is not None:
+            audio_cap_bytes = int(
+                min(opts["max_download_mb"], opts["audio_max_mb"]) * 1024 * 1024
+            )
+            if (
+                stream_info["estimated_audio_bytes"] == 0
+                or stream_info["estimated_audio_bytes"] <= audio_cap_bytes
+            ):
+                cand_audio = temp_dir / "raw_audio.m4a"
+                try:
+                    await download_media_to_file(
+                        stream_info["audio_urls"],
+                        cand_audio,
+                        max_bytes=audio_cap_bytes,
+                        timeout=max(30.0, timeout),
+                        cookie_header=cookie_header,
+                        secrets=secrets,
+                    )
+                    raw_audio_path = cand_audio
+                except (SSRFBlockedError, AdapterRateLimitError):
+                    cleanup_temp_dir(temp_dir)
+                    raise
+                except Exception as exc:
+                    if classify_error is not None:
+                        rc = classify_error(exc)
+                        if rc is not None:
+                            cleanup_temp_dir(temp_dir)
+                            raise rc from None
+                    if not transient_reason:
+                        transient_reason = redact_error_text(exc, secrets)
 
-        if frames:
-            bundle["frames"] = frames
-            bundle["frame_paths"] = [f["path"] for f in frames]
-            bundle["frame_count"] = len(frames)
-            bundle["has_visual"] = True
-            bundle["watch_mode"] = (
-                "keyframes_subtitle" if has_subtitle else "keyframes_only"
+        # Step 3A: Channel A — Native compressed MP4 for short videos
+        if want_native and raw_video_path is not None:
+            native_out = temp_dir / "native_video.mp4"
+            try:
+                size_bytes = await mux_and_compress_native_video(
+                    raw_video_path,
+                    raw_audio_path,
+                    native_out,
+                    duration_sec=eff_dur,
+                    max_mb=opts["native_max_mb"],
+                    timeout=max(60.0, timeout * 2.0),
+                )
+                bundle["watch_mode"] = "native_video"
+                bundle["content_origin"] = "bilibili_native_video"
+                bundle["has_visual"] = True
+                bundle["native_video_path"] = str(native_out)
+                bundle["native_video_size_bytes"] = size_bytes
+
+                # Remove raw audio immediately; keep native_out for Gemini AND lazy fallback frames
+                if raw_audio_path is not None:
+                    raw_audio_path.unlink(missing_ok=True)
+                # Keep raw_video_path? No, native_out already has all video frames and is <= 15MB!
+                raw_video_path.unlink(missing_ok=True)
+                raw_video_path = None
+
+                async def _ensure_fallback_frames() -> list[dict[str, Any]]:
+                    if bundle["frames"]:
+                        return list(bundle["frames"])
+                    src_mp4 = Path(bundle["native_video_path"])
+                    if not src_mp4.exists():
+                        return []
+                    fb_max_frames, fb_max_width = resolve_keyframe_budget(
+                        opts, has_subtitle=has_subtitle, duration_sec=eff_dur
+                    )
+                    extracted = await extract_keyframes_from_video(
+                        src_mp4,
+                        temp_dir / "frames",
+                        duration_sec=eff_dur,
+                        max_frames=fb_max_frames,
+                        max_width=fb_max_width,
+                        jpeg_quality=opts["frame_jpeg_quality"],
+                        danmaku_spikes_sec=danmaku_spikes,
+                        use_scene_detect=True,
+                    )
+                    bundle["frames"] = extracted
+                    bundle["frame_paths"] = [f["path"] for f in extracted]
+                    bundle["frame_count"] = len(extracted)
+                    return list(extracted)
+
+                bundle["ensure_fallback_frames"] = _ensure_fallback_frames
+            except Exception as exc:
+                # Compression/mux failed -> fall straight into Channel B keyframe extraction using raw_video_path!
+                transient_reason = redact_error_text(exc, secrets)
+
+        # Step 3B: Channel B — Extract keyframes from downloaded video
+        if (
+            opts["visual_enabled"]
+            and not bundle["has_visual"]
+            and raw_video_path is not None
+        ):
+            kf_max_frames, kf_max_width = resolve_keyframe_budget(
+                opts, has_subtitle=has_subtitle, duration_sec=eff_dur
             )
-            bundle["content_origin"] = (
-                "bilibili_vision_subtitle" if has_subtitle else "bilibili_vision_frames"
+            frames = await extract_keyframes_from_video(
+                raw_video_path,
+                temp_dir / "frames",
+                duration_sec=eff_dur,
+                max_frames=kf_max_frames,
+                max_width=kf_max_width,
+                jpeg_quality=opts["frame_jpeg_quality"],
+                danmaku_spikes_sec=danmaku_spikes,
+                use_scene_detect=True,
+                timeout=max(45.0, timeout),
             )
+            # Release raw downloaded video promptly unless needed for progressive audio STT
+            if not (
+                need_audio_stt
+                and raw_audio_path is None
+                and stream_info
+                and stream_info.get("is_progressive")
+            ):
+                raw_video_path.unlink(missing_ok=True)
+                raw_video_path = None
+
+            if frames:
+                bundle["frames"] = frames
+                bundle["frame_paths"] = [f["path"] for f in frames]
+                bundle["frame_count"] = len(frames)
+                bundle["has_visual"] = True
+                bundle["watch_mode"] = (
+                    "keyframes_subtitle" if has_subtitle else "keyframes_only"
+                )
+                bundle["content_origin"] = (
+                    "bilibili_vision_subtitle"
+                    if has_subtitle
+                    else "bilibili_vision_frames"
+                )
 
     # Step 3C: Videoshot sprite fallback (for super-long videos or when DASH failed/oversized)
     if (
@@ -1763,12 +1977,15 @@ async def _acquire_video_media_in_temp(
         and cid
     ):
         try:
+            vs_max_frames, _ = resolve_keyframe_budget(
+                opts, has_subtitle=has_subtitle, duration_sec=eff_dur
+            )
             shot_frames = await fetch_videoshot_frames(
                 bvid,
                 cid,
                 temp_dir / "videoshot",
                 duration_sec=eff_dur,
-                max_frames=opts["max_frames"],
+                max_frames=vs_max_frames,
                 danmaku_spikes_sec=danmaku_spikes,
                 cookie_header=cookie_header,
                 secrets=secrets,

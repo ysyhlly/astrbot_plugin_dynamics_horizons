@@ -387,7 +387,8 @@ async def test_channel_a_gemini_native_video_and_review_alignment_and_cleanup(
         # Independent review_provider WAS called with visual_observations in source_evidence
         assert len(p_review.calls) == 1
         rev_sys, rev_payload = p_review.calls[0]
-        assert rev_sys == STAGE3_REVIEW_PROMPT
+        assert rev_sys.endswith(STAGE3_REVIEW_PROMPT)
+        assert "core_profile" not in rev_payload["character"]
         assert "visual_observations" in rev_sys
         se = rev_payload["source_evidence"]
         assert se["watch_mode"] == "native_video"
@@ -857,7 +858,7 @@ async def test_video_provider_does_not_merge_self_review_when_different_from_rev
         assert len(p_video.calls) == 1
         # Independent review call on prov_shared MUST have executed!
         assert len(p_shared.calls) == 1
-        assert p_shared.calls[0][0] == STAGE3_REVIEW_PROMPT
+        assert p_shared.calls[0][0].endswith(STAGE3_REVIEW_PROMPT)
     finally:
         await plugin.terminate()
 

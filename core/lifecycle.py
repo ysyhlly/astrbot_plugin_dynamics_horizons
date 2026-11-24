@@ -50,7 +50,8 @@ class LifecycleStore:
                     proposal_id TEXT NOT NULL,from_state TEXT NOT NULL,to_state TEXT NOT NULL,
                     actor TEXT NOT NULL,reason TEXT NOT NULL,created_at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS review_jobs(proposal_id TEXT PRIMARY KEY,kind TEXT NOT NULL,
-                    attempts INTEGER NOT NULL DEFAULT 0,next_at REAL NOT NULL DEFAULT 0,last_error TEXT NOT NULL DEFAULT '');
+                    attempts INTEGER NOT NULL DEFAULT 0,next_at REAL NOT NULL DEFAULT 0,last_error TEXT NOT NULL DEFAULT '',
+                    defer_count INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS world_outbox(log_id TEXT PRIMARY KEY,identity TEXT NOT NULL,
                     revision INTEGER NOT NULL,operation TEXT NOT NULL,payload_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,
@@ -90,6 +91,11 @@ class LifecycleStore:
                     ON discussion_reflections(identity, umo, member_id, occurred_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_discussion_reflections_log
                     ON discussion_reflections(identity, log_id, occurred_at DESC);
+                CREATE TABLE IF NOT EXISTS domain_cooldowns(
+                    domain TEXT PRIMARY KEY,
+                    cooldown_until REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
             """)
             additions = {
                 "candidate_items": {
@@ -108,6 +114,7 @@ class LifecycleStore:
                     "revision": "INTEGER NOT NULL DEFAULT 1",
                 },
                 "books": {"progress_verified": "INTEGER NOT NULL DEFAULT 1"},
+                "review_jobs": {"defer_count": "INTEGER NOT NULL DEFAULT 0"},
             }
             for table, columns in additions.items():
                 present = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
@@ -158,23 +165,137 @@ class LifecycleStore:
                 "UPDATE reading_tasks SET status='pending_review' WHERE status='interrupted' AND task_id IN (SELECT task_id FROM proposals WHERE state='pending_review')"
             )
 
-    def defer_review(self, proposal_id, now, reason, *, expected_revision=None, delay=300):
+    def defer_review(
+        self,
+        proposal_id,
+        now,
+        reason,
+        *,
+        expected_revision=None,
+        delay=300,
+        min_delay=0.0,
+        backoff=True,
+        max_delay=1800.0,
+    ):
         with self.lock, self.db:
             if not self.db.execute(
                 "SELECT 1 FROM proposals WHERE proposal_id=? AND state='pending_review' AND (? IS NULL OR revision=?)",
                 (proposal_id, expected_revision, expected_revision),
             ).fetchone():
                 return
+            existing = self.db.execute(
+                "SELECT kind, attempts, defer_count FROM review_jobs WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+            if existing is not None and existing["kind"] == "exhausted":
+                return
+            prev_defers = int(existing["defer_count"] or 0) if existing is not None else 0
+            base_delay = max(1.0, float(delay or 300.0))
+            floor_delay = max(0.0, float(min_delay or 0.0))
+            cap_delay = max(base_delay, float(max_delay or 1800.0))
+            if backoff:
+                new_defers = prev_defers + 1
+                multipliers = (1.0, 2.5, 5.0, 10.0, 15.0)
+                mult = multipliers[min(new_defers - 1, len(multipliers) - 1)]
+                effective_delay = max(floor_delay, min(cap_delay, base_delay * mult))
+            else:
+                new_defers = prev_defers
+                effective_delay = max(floor_delay, base_delay)
             self.db.execute(
-                "INSERT INTO review_jobs(proposal_id,kind,attempts,next_at,last_error) VALUES(?,'retry',0,?,?) ON CONFLICT(proposal_id) DO UPDATE SET kind='retry',next_at=excluded.next_at,last_error=excluded.last_error WHERE review_jobs.kind!='exhausted'",
-                (proposal_id, now + delay, str(reason)[:200]),
+                "INSERT INTO review_jobs(proposal_id,kind,attempts,next_at,last_error,defer_count) "
+                "VALUES(?,'retry',0,?,?,?) "
+                "ON CONFLICT(proposal_id) DO UPDATE SET "
+                "kind='retry',next_at=excluded.next_at,last_error=excluded.last_error,defer_count=excluded.defer_count "
+                "WHERE review_jobs.kind!='exhausted'",
+                (proposal_id, now + effective_delay, str(reason)[:200], new_defers),
             )
 
-    def reserve_call(self, identity, role, limit, now, *, lane="reading"):
-        start, end = shanghai_day_bounds(now)
+    def reschedule_reviews(
+        self, proposal_ids, next_at, reason="provider_budget_busy"
+    ) -> int:
+        ids = [str(pid).strip() for pid in (proposal_ids or ()) if str(pid or "").strip()]
+        if not ids:
+            return 0
+        target_ts = float(next_at)
+        clean_reason = str(reason or "provider_budget_busy")[:200]
+        updated = 0
+        with self.lock, self.db:
+            for pid in ids:
+                cur = self.db.execute(
+                    "UPDATE review_jobs SET next_at=MAX(next_at, ?), last_error=? "
+                    "WHERE proposal_id=? AND kind='retry'",
+                    (target_ts, clean_reason, pid),
+                )
+                updated += int(cur.rowcount or 0)
+        return updated
+
+    def load_domain_cooldowns(self, now=None) -> dict[str, float]:
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT domain, cooldown_until FROM domain_cooldowns"
+            ).fetchall()
+        out: dict[str, float] = {}
+        cutoff = float(now) if now is not None else 0.0
+        for r in rows:
+            until = float(r["cooldown_until"] or 0.0)
+            if until > cutoff:
+                out[str(r["domain"])] = until
+        return out
+
+    def set_domain_cooldown(
+        self, domain: str, cooldown_until: float, now=None
+    ) -> None:
+        clean_domain = str(domain or "").strip().lower()
+        if not clean_domain:
+            return
+        stamp = float(now if now is not None else time.time())
+        until = float(cooldown_until or 0.0)
+        with self.lock, self.db:
+            self.db.execute(
+                """
+                INSERT INTO domain_cooldowns(domain, cooldown_until, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(domain) DO UPDATE SET
+                    cooldown_until=MAX(domain_cooldowns.cooldown_until, excluded.cooldown_until),
+                    updated_at=excluded.updated_at
+                """,
+                (clean_domain, until, stamp),
+            )
+
+    def clear_domain_cooldown(self, domain: str) -> None:
+        clean_domain = str(domain or "").strip().lower()
+        if not clean_domain:
+            return
+        with self.lock, self.db:
+            self.db.execute(
+                "DELETE FROM domain_cooldowns WHERE domain=?", (clean_domain,)
+            )
+
+    def has_model_call_quota(
+        self, identity, limit, now, *, lane="reading", tz=None
+    ) -> bool:
+        start, end = shanghai_day_bounds(now, tz=tz)
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT role FROM model_calls WHERE identity=? AND created_at>=? AND created_at<? AND status!='exempt'",
+                (identity, start, end),
+            ).fetchall()
+        if len(rows) >= limit:
+            return False
+        if lane == "feedback" and limit >= 6:
+            reading_reserved = max(2, limit // 2)
+            feedback_used = sum(
+                1 for r in rows if str(r["role"] or "").endswith(":feedback")
+            )
+            if feedback_used >= limit - reading_reserved:
+                return False
+        return True
+
+    def reserve_call(self, identity, role, limit, now, *, lane="reading", tz=None):
+        start, end = shanghai_day_bounds(now, tz=tz)
         with self.lock, self.db:
             rows = self.db.execute(
-                "SELECT role FROM model_calls WHERE identity=? AND created_at>=? AND created_at<?",
+                "SELECT role FROM model_calls WHERE identity=? AND created_at>=? AND created_at<? AND status!='exempt'",
                 (identity, start, end),
             ).fetchall()
             used = len(rows)
@@ -201,7 +322,47 @@ class LifecycleStore:
                 "UPDATE model_calls SET status=? WHERE call_id=?", (status, call_id)
             )
 
-    def claim_reading(self, identity, unit, evidence, quota, now):
+    def has_reading_quota(self, identity, quota, now, *, tz=None) -> bool:
+        start, end = shanghai_day_bounds(now, tz=tz)
+        with self.lock:
+            used = self.db.execute(
+                "SELECT count(*) FROM reading_attempts WHERE identity=? AND created_at>=? AND created_at<?",
+                (identity, start, end),
+            ).fetchone()[0]
+        return used < quota
+
+    def refund_reading_attempt(self, task_id: str, now=None) -> bool:
+        """Exempt a transient reading failure from today's reading_attempts quota."""
+        if not task_id:
+            return False
+        stamp = float(now if now is not None else time.time())
+        with self.lock, self.db:
+            row = self.db.execute(
+                "SELECT attempt_id FROM reading_attempts WHERE task_id=? ORDER BY created_at DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            self.db.execute(
+                "DELETE FROM reading_attempts WHERE attempt_id=?",
+                (row["attempt_id"],),
+            )
+            self.db.execute(
+                "UPDATE reading_tasks SET status='failed', updated_at=? WHERE task_id=? AND status='running'",
+                (stamp, task_id),
+            )
+            return True
+
+    def fail_running_tasks(self, identity: str, now=None) -> int:
+        stamp = float(now if now is not None else time.time())
+        with self.lock, self.db:
+            cur = self.db.execute(
+                "UPDATE reading_tasks SET status='failed', updated_at=? WHERE identity=? AND status='running'",
+                (stamp, identity),
+            )
+            return int(cur.rowcount or 0)
+
+    def claim_reading(self, identity, unit, evidence, quota, now, *, tz=None):
         key = [
             identity,
             unit.get("source_id", ""),
@@ -210,7 +371,7 @@ class LifecycleStore:
             evidence["content_hash"],
         ]
         tid = hashlib.sha256(encode_json(key).encode()).hexdigest()
-        start, end = shanghai_day_bounds(now)
+        start, end = shanghai_day_bounds(now, tz=tz)
         with self.lock, self.db:
             row = self.db.execute(
                 "SELECT * FROM reading_tasks WHERE task_id=?", (tid,)
@@ -391,10 +552,10 @@ class LifecycleStore:
             )
             self.db.execute(
                 """
-                INSERT INTO review_jobs(proposal_id,kind,attempts,next_at,last_error)
-                VALUES(?,'retry',0,?,'')
+                INSERT INTO review_jobs(proposal_id,kind,attempts,next_at,last_error,defer_count)
+                VALUES(?,'retry',0,?,'',0)
                 ON CONFLICT(proposal_id) DO UPDATE SET
-                    kind='retry',attempts=0,next_at=excluded.next_at,last_error=''
+                    kind='retry',attempts=0,next_at=excluded.next_at,last_error='',defer_count=0
                 """,
                 (proposal_id, now),
             )
@@ -425,7 +586,7 @@ class LifecycleStore:
             if kind == "retry" and attempts > 3:
                 kind = "exhausted"
             self.db.execute(
-                "INSERT OR REPLACE INTO review_jobs VALUES(?,?,?,?,?)",
+                "INSERT OR REPLACE INTO review_jobs(proposal_id,kind,attempts,next_at,last_error,defer_count) VALUES(?,?,?,?,?,0)",
                 (proposal_id, kind, attempts, next_at, error[:200]),
             )
 
@@ -714,11 +875,11 @@ class LifecycleStore:
             removed["book_chapters"] = int(cur.rowcount or 0)
         return removed
 
-    def diagnostics(self, identity, now):
-        start, end = shanghai_day_bounds(now)
+    def diagnostics(self, identity, now, *, tz=None):
+        start, end = shanghai_day_bounds(now, tz=tz)
         with self.lock:
             calls = self.db.execute(
-                "SELECT count(*) FROM model_calls WHERE identity=? AND created_at>=? AND created_at<?",
+                "SELECT count(*) FROM model_calls WHERE identity=? AND created_at>=? AND created_at<? AND status!='exempt'",
                 (identity, start, end),
             ).fetchone()[0]
             tasks = [

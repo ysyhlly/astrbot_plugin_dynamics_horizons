@@ -4,10 +4,50 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 
-from ..series_panels import is_series_group_excluded
+from .. import series_panels as _series_panels
+from ..series_panels import is_provider_budget_busy_error, is_series_group_excluded
 from .contract import chat_umo_kind, make_identity
 from .io import run_io
+
+try:
+    from ..adapters.video_media import cleanup_stale_temp_dirs
+except Exception:  # pragma: no cover
+    cleanup_stale_temp_dirs = None
+
+
+def provider_circuit_remaining(context, provider_id: str) -> float:
+    """Defensive read-only pre-flight lookup for shared provider circuit breaker remaining seconds."""
+    pid = str(provider_id or "").strip()
+    if context is None or not pid:
+        return 0.0
+    fn = getattr(_series_panels, "provider_circuit_remaining", lambda _c, _p: 0.0)
+    if not callable(fn):
+        return 0.0
+    try:
+        raw = float(fn(context, pid) or 0.0)
+    except Exception:
+        return 0.0
+    if not math.isfinite(raw) or raw <= 0.0:
+        return 0.0
+    return raw
+
+
+def busy_retry_after(
+    exc: BaseException | None, *, default_min: float = 120.0
+) -> float:
+    """Extract structured ``retry_after`` from a budget-busy error with a safe minimum floor."""
+    floor = max(0.0, float(default_min or 0.0))
+    if exc is None:
+        return floor
+    try:
+        raw = float(getattr(exc, "retry_after", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        raw = 0.0
+    if not math.isfinite(raw) or raw < 0.0:
+        raw = 0.0
+    return max(raw, floor)
 
 
 def _caller_accepts_media_payload(fn) -> bool:
@@ -39,6 +79,7 @@ class EngineLifecycle:
             max(1, int(self.config.get("daily_model_call_quota", 50))),
             self.clock(),
             lane=lane,
+            tz=self.timezone,
         )
         try:
             if media_payload is not None and _caller_accepts_media_payload(
@@ -51,8 +92,16 @@ class EngineLifecycle:
                 value = await self.model_caller(role, instruction, payload)
             if not isinstance(value, dict):
                 raise ValueError("model_output_not_object")
-        except BaseException:
-            await asyncio.shield(run_io(self.store.finish_call, cid, "failed"))
+        except BaseException as exc:
+            fail_status = (
+                "exempt"
+                if (
+                    is_provider_budget_busy_error(exc)
+                    or isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                )
+                else "failed"
+            )
+            await asyncio.shield(run_io(self.store.finish_call, cid, fail_status))
             raise
         await run_io(self.store.finish_call, cid, "success")
         return value
@@ -86,6 +135,7 @@ class EngineLifecycle:
             now=self.clock(),
             quiet_hours=self.quiet_hours,
             sessions=self.sessions,
+            tz=self.timezone,
         )
         if (
             not current["awake"]
@@ -101,6 +151,13 @@ class EngineLifecycle:
 
     async def process_maintenance(self):
         now = self.clock()
+        prune_cp = getattr(self, "prune_media_checkpoints", None)
+        if callable(prune_cp):
+            prune_cp(now=now)
+        if callable(cleanup_stale_temp_dirs):
+            active_dirs_fn = getattr(self, "active_media_checkpoint_dirs", None)
+            protected = active_dirs_fn() if callable(active_dirs_fn) else ()
+            await run_io(cleanup_stale_temp_dirs, protected_dirs=protected)
         await run_io(
             self.store.archive_candidates,
             now,
@@ -116,11 +173,49 @@ class EngineLifecycle:
         )
         if not self.config.get("enabled", True) or self.closed:
             return
-        for pid in await run_io(self.store.due_reviews, self.clock()):
-            try:
-                await self.review_proposal(pid)
-            except Exception as exc:
-                self.last_error = type(exc).__name__
+        review_mode = getattr(self, "review_mode", self.config.get("review_mode", "llm"))
+        review_pid = self._provider_id("review_provider")
+        review_circuit_rem = (
+            0.0
+            if review_mode == "human"
+            else provider_circuit_remaining(getattr(self, "context", None), review_pid)
+        )
+        if review_circuit_rem <= 0.0:
+            due_pids = await run_io(self.store.due_reviews, self.clock())
+            for idx, pid in enumerate(due_pids):
+                self._last_review_budget_busy_retry_after = 0.0
+                busy_delay = 0.0
+                try:
+                    await self.review_proposal(pid)
+                except Exception as exc:
+                    self.last_error = type(exc).__name__
+                    if is_provider_budget_busy_error(exc):
+                        busy_delay = busy_retry_after(exc, default_min=120.0)
+                        await run_io(
+                            self.store.defer_review,
+                            pid,
+                            self.clock(),
+                            "provider_budget_busy",
+                            delay=120.0,
+                            min_delay=busy_delay,
+                            backoff=True,
+                        )
+                if busy_delay <= 0.0:
+                    busy_delay = float(
+                        getattr(self, "_last_review_budget_busy_retry_after", 0.0)
+                        or 0.0
+                    )
+                if busy_delay > 0.0:
+                    remaining = due_pids[idx + 1 :]
+                    if remaining:
+                        target_next = self.clock() + max(busy_delay, 120.0)
+                        await run_io(
+                            self.store.reschedule_reviews,
+                            remaining,
+                            target_next,
+                            "provider_budget_busy",
+                        )
+                    break
         await self.process_feedback_jobs()
         for row in await run_io(self.store.due_world, self.clock()):
             result = await self.world_bridge.sync_outbox(row, sessions=self.sessions)
@@ -133,9 +228,10 @@ class EngineLifecycle:
             )
 
     async def maintenance_loop(self):
+        maint_lock = getattr(self, "_maintenance_lock", None) or self.lock
         while not self.closed:
             try:
-                async with self.lock:
+                async with maint_lock:
                     await self.process_maintenance()
                     await self.refresh_projection()
             except asyncio.CancelledError:
@@ -188,6 +284,15 @@ class EngineLifecycle:
             if self.outreach_allowed(row["umo"])
         ]
 
+    async def effective_proactive_sessions_async(self, identity: str = "") -> list[str]:
+        scope = self.proactive_scope
+        if scope == "disabled":
+            return []
+        if scope == "explicit" and self.config.get("proactive_enabled") is not True:
+            return [umo for umo in self.proactive_sessions if self.outreach_allowed(umo)]
+        rows = await run_io(self.store.known_managed_scopes, identity)
+        return [row["umo"] for row in rows if self.outreach_allowed(row["umo"])]
+
     async def process_feedback_jobs(self):
         from .feedback import process_jobs
 
@@ -197,7 +302,7 @@ class EngineLifecycle:
         scope = wake.get("scope") or {}
         return make_identity(scope.get("persona_id", ""), scope.get("instance_id", ""))
 
-    def health(self, identity, wake=None):
+    def _build_health(self, wake, diagnostics):
         proactive_scope = self.proactive_scope
         reasons = [wake["skip_reason"]] if wake and wake.get("skip_reason") else []
         if not self.config.get("enabled", True):
@@ -263,7 +368,22 @@ class EngineLifecycle:
             "storage_warning_mb": self.config.get("storage_warning_mb", 512),
             "proactive_enabled": proactive_scope != "disabled",
             "proactive_scope": proactive_scope,
-            "diagnostics": self.store.diagnostics(identity, self.clock()),
+            "diagnostics": diagnostics,
             "next_poll_at": self.next_poll_at,
             "next_digest_at": self.next_digest_at,
         }
+
+    def health(self, identity, wake=None):
+        diagnostics = self.store.diagnostics(
+            identity, self.clock(), tz=getattr(self, "timezone", None)
+        )
+        return self._build_health(wake, diagnostics)
+
+    async def health_async(self, identity, wake=None):
+        diagnostics = await run_io(
+            self.store.diagnostics,
+            identity,
+            self.clock(),
+            tz=getattr(self, "timezone", None),
+        )
+        return self._build_health(wake, diagnostics)

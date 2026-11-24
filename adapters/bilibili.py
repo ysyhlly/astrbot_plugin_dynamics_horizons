@@ -657,13 +657,16 @@ async def poll_bilibili_source(
     cursor: Mapping[str, Any] | None,
     *,
     timeout: float = 20.0,
+    shared_cookie: str = "",
 ) -> dict[str, Any]:
     cfg = validate_bilibili_config(
         source.get("config") if isinstance(source.get("config"), Mapping) else {}
     )
     cur = dict(cursor or {})
     now = time.time()
-    cred, cookie_header, secrets = _build_readonly_credential(cfg)
+    cred, cookie_header, secrets = _build_readonly_credential(
+        cfg, shared_cookie=shared_cookie
+    )
     result = {"cooldown_until": 0.0, "status": "ok"}
     next_cur = dict(cur)
 

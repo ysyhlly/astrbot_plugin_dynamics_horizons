@@ -9,7 +9,10 @@ import pytest
 from bilibili_api.exceptions import NetworkException
 
 from astrbot_plugin_dynamics_horizons.adapters import bilibili, feed
-from astrbot_plugin_dynamics_horizons.adapters.ssrf import HttpResponse
+from astrbot_plugin_dynamics_horizons.adapters.ssrf import (
+    HttpResponse,
+    set_dns_resolver_for_testing,
+)
 from astrbot_plugin_dynamics_horizons.core.contract import make_identity
 from astrbot_plugin_dynamics_horizons.core.engine import HorizonsEngine
 from astrbot_plugin_dynamics_horizons.core.store import HorizonsStore
@@ -44,9 +47,11 @@ def source_poll(tmp_path, monkeypatch):
     store.update_source_poll_state(
         source_id, next_cursor={"seen_ids": ["already_read"]}, now=now.value
     )
+    set_dns_resolver_for_testing(lambda host: ["93.184.216.34"])
     try:
         yield engine, identity, source_id, sdk, now
     finally:
+        set_dns_resolver_for_testing(None)
         store.close()
 
 

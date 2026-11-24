@@ -1,7 +1,7 @@
 name: astrbot_plugin_dynamics_horizons
 display_name: 群间见闻 · Dynamics Horizons
 desc: 群间系列外部见闻与书架插件：按角色隔离 B 站、电子书连载、RSS 与剪报信息源，空闲清醒时自主精读，经独立审查沉淀阅读手记、衰减兴趣与分群待讨论话题。
-version: v0.2.0-rc.7
+version: v0.2.0-rc.8
 author: ysyhlly
 astrbot_version: ">=4.29.4,<5"
 tags:
