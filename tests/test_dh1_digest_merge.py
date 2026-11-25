@@ -136,7 +136,7 @@ async def test_dh1_distinct_review_provider_uses_two_calls_and_compact_review_pa
         assert calls[1][1].endswith(STAGE3_REVIEW_PROMPT)
         assert "core_profile" not in calls[1][2]["character"]
         review_payload = calls[1][2]
-        review_json = json.dumps(review_payload, ensure_ascii=False)
+        json.dumps(review_payload, ensure_ascii=False)
         # Compact review payload retains a bounded text excerpt for Stage 3 hallucination/injection
         # checks while excluding raw_url and capping length at 1600 chars.
         ev = review_payload["source_evidence"]

@@ -19,6 +19,7 @@ ensure_current(
 import asyncio
 import base64
 import hashlib
+from importlib import import_module, reload
 import inspect
 import os
 from datetime import datetime
@@ -45,6 +46,7 @@ from .core.io import run_io
 from .core.projection import _empty_result
 from .core.store import HorizonsStore
 from .core.web_api import HorizonsWebAPI
+from . import series_panels as _series_panels_mod
 from .series_panels import (
     find_provider_silently,
     get_series_defaults,
@@ -55,6 +57,54 @@ from .series_panels import (
     resolve_series_timezone,
     series_llm_call,
 )
+
+
+def _file_sha256(path_str: Any) -> str:
+    if not path_str:
+        return ""
+    try:
+        return hashlib.sha256(Path(str(path_str)).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+_SERIES_PANELS_INITIAL_HASH = _file_sha256(getattr(_series_panels_mod, "__file__", None))
+if _SERIES_PANELS_INITIAL_HASH:
+    _series_panels_mod._horizons_loaded_source_hash = _SERIES_PANELS_INITIAL_HASH
+
+
+def _ensure_fresh_series_panels():
+    global find_provider_silently, get_series_defaults, is_provider_budget_busy_error
+    global is_series_group_excluded, is_series_in_quiet_hours, resolve_series_provider
+    global resolve_series_timezone, series_llm_call, _series_panels_mod
+
+    sp_name = f"{__package__}.series_panels" if __package__ else "series_panels"
+    sp_mod = import_module(sp_name)
+    disk_hash = _file_sha256(getattr(sp_mod, "__file__", None))
+    loaded_hash = getattr(sp_mod, "_horizons_loaded_source_hash", None)
+    if disk_hash and loaded_hash != disk_hash:
+        sp_mod = reload(sp_mod)
+        sp_mod._horizons_loaded_source_hash = disk_hash
+        _series_panels_mod = sp_mod
+        find_provider_silently = getattr(sp_mod, "find_provider_silently", find_provider_silently)
+        get_series_defaults = getattr(sp_mod, "get_series_defaults", get_series_defaults)
+        is_provider_budget_busy_error = getattr(
+            sp_mod, "is_provider_budget_busy_error", is_provider_budget_busy_error
+        )
+        is_series_group_excluded = getattr(
+            sp_mod, "is_series_group_excluded", is_series_group_excluded
+        )
+        is_series_in_quiet_hours = getattr(
+            sp_mod, "is_series_in_quiet_hours", is_series_in_quiet_hours
+        )
+        resolve_series_provider = getattr(
+            sp_mod, "resolve_series_provider", resolve_series_provider
+        )
+        resolve_series_timezone = getattr(
+            sp_mod, "resolve_series_timezone", resolve_series_timezone
+        )
+        series_llm_call = getattr(sp_mod, "series_llm_call", series_llm_call)
+    return sp_mod
 
 _OPENAI_INLINE_VIDEO_MAX_BYTES = 8 * 1024 * 1024  # 8 MB cap for base64 inline proxy payloads
 
@@ -375,9 +425,7 @@ class Main(Star):
                 return Path(__file__).resolve().parent / "data"
 
     async def initialize(self) -> None:
-        from .series_panels import register_series_panels
-
-        register_series_panels(self, PLUGIN_ID)
+        _ensure_fresh_series_panels().register_series_panels(self, PLUGIN_ID)
         await run_io(cleanup_stale_temp_dirs)
         data_dir = self._resolve_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)

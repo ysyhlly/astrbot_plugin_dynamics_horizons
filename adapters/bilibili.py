@@ -33,7 +33,6 @@ from .ssrf import (
     redact_error_text,
     safe_http_get,
     validate_url_async,
-    validate_url_sync,
 )
 from .video_media import (
     acquire_video_media,
