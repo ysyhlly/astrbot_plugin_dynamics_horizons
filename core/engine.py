@@ -1027,8 +1027,10 @@ class HorizonsEngine(EngineLifecycle):
     @staticmethod
     def _compact_review_source_evidence(
         evidence: dict[str, Any] | None,
+        *,
+        max_text_chars: int = 1600,
     ) -> dict[str, Any]:
-        """Return compact provenance metadata for Stage 3 without duplicating long raw source text."""
+        """Return bounded source evidence for Stage 3 so the reviewer can detect hallucinations and injection."""
         ev = evidence if isinstance(evidence, dict) else {}
         compact: dict[str, Any] = {}
         for key in (
@@ -1044,7 +1046,10 @@ class HorizonsEngine(EngineLifecycle):
                 compact[key] = val
         raw_text = ev.get("text")
         if isinstance(raw_text, str) and raw_text:
+            limit = max(200, int(max_text_chars))
+            compact["text"] = raw_text[:limit]
             compact["text_chars"] = len(raw_text)
+            compact["text_truncated"] = len(raw_text) > limit
         raw_obs = ev.get("visual_observations")
         if isinstance(raw_obs, list) and raw_obs:
             compact["visual_observations"] = [
@@ -1167,7 +1172,53 @@ class HorizonsEngine(EngineLifecycle):
         self.projection.update_snapshot(snap)
         return snap
 
+    def track_ingest_task(self, task: asyncio.Task[Any]) -> None:
+        pending = getattr(self, "_pending_ingest_tasks", None)
+        if pending is None:
+            pending = set()
+            self._pending_ingest_tasks = pending
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    async def flush_pending_ingests(self) -> None:
+        pending = getattr(self, "_pending_ingest_tasks", None)
+        if not pending:
+            return
+        while pending:
+            batch = list(pending)
+            if not batch:
+                break
+            await asyncio.gather(*batch, return_exceptions=True)
+
+    def schedule_projection_refresh(self) -> None:
+        """Coalesce background projection refreshes without blocking the event loop."""
+        if self.closed:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.refresh_projection_sync()
+            return
+        self._projection_refresh_needed = True
+        current = getattr(self, "_projection_refresh_task", None)
+        if current is not None and not current.done():
+            return
+
+        async def _runner() -> None:
+            while getattr(self, "_projection_refresh_needed", False) and not self.closed:
+                self._projection_refresh_needed = False
+                try:
+                    await run_io(self.refresh_projection_sync)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug("[DynamicsHorizons] Async projection refresh failed", exc_info=True)
+
+        task = loop.create_task(_runner())
+        self._projection_refresh_task = task
+
     async def refresh_projection(self) -> dict[str, Any]:
+        await self.flush_pending_ingests()
         return await run_io(self.refresh_projection_sync)
 
     # ------------------------------------------------------------------

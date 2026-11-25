@@ -35,6 +35,7 @@ from .core.contract import (
     SCHEMA_VERSION,
     decode_model_object,
     encode_json,
+    make_identity,
     normalize_identity,
     shanghai_day_bounds,
     unpack_identity,
@@ -411,6 +412,13 @@ class Main(Star):
             await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks.clear()
         if self.engine is not None:
+            flush_fn = getattr(self.engine, "flush_pending_ingests", None)
+            if callable(flush_fn):
+                await flush_fn()
+            refresh_task = getattr(self.engine, "_projection_refresh_task", None)
+            if refresh_task is not None and not refresh_task.done():
+                refresh_task.cancel()
+                await asyncio.gather(refresh_task, return_exceptions=True)
             self.engine.clear_media_checkpoints()
             async with self.engine.lock:
                 await run_io(self.engine.store.close)
@@ -1042,6 +1050,69 @@ class Main(Star):
     # Turn Feedback & Per-UMO Question Consumption
     # ------------------------------------------------------------------
 
+    def _precheck_dynamics_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Pure-memory O(1) validation matching core.feedback.enqueue() without SQLite I/O."""
+        engine = self.engine
+        if engine is None:
+            return {"accepted": False}
+        scope = event.get("character_scope") or (
+            event.get("scope") if isinstance(event.get("scope"), dict) else {}
+        )
+        umo = str(
+            event.get("umo")
+            or (
+                event.get("scope")
+                if isinstance(event.get("scope"), str)
+                else scope.get("umo")
+            )
+            or ""
+        ).strip()
+        if not umo or (engine.sessions and umo not in engine.sessions):
+            return {"accepted": False}
+        if is_series_group_excluded(getattr(engine, "context", None), umo=umo):
+            return {"accepted": False, "reason": "excluded_by_core"}
+        if scope.get("umo") and scope["umo"] != umo:
+            return {"accepted": False, "reason": "scope_mismatch"}
+        ident = (
+            make_identity(
+                scope["persona_id"], scope.get("instance_id") or scope["persona_id"]
+            )
+            if scope.get("persona_id")
+            else None
+        )
+        if not ident and event.get("identity"):
+            ident = normalize_identity(event["identity"])
+        if not ident:
+            ident = engine.projection.resolve_identity(
+                umo=umo, persona=str(event.get("persona") or "")
+            )
+        if not ident:
+            return {"accepted": False, "reason": "unresolved_identity"}
+        member = str(event.get("member") or "").strip()[:128]
+        reply_obj = event.get("reply") if isinstance(event.get("reply"), dict) else {}
+        eid = str(
+            event.get("event_id")
+            or event.get("turn_id")
+            or reply_obj.get("message_id")
+            or ""
+        )
+        if not eid or not member:
+            return {"accepted": False, "reason": "missing_event_or_member"}
+        kind = str(event.get("kind") or event.get("type") or "")
+        reply = str(event.get("reply_text") or reply_obj.get("text") or "")[:2000]
+        delivered = bool(
+            (event.get("delivered") is True or reply_obj.get("delivered") is True)
+            and kind in {"delivery.success", "turn_completed"}
+        )
+        qids = list(event.get("question_ids") or [])[:8]
+        topics = [str(t) for t in (event.get("topics") or []) if t][:12]
+        will_queue = bool(
+            delivered
+            and reply
+            and (qids or topics or event.get("log_ids") or event.get("intent_id"))
+        )
+        return {"accepted": True, "queued": will_queue}
+
     def ingest_dynamics_event(self, event: dict[str, Any]) -> dict[str, Any]:
         if (
             self.closed
@@ -1054,6 +1125,39 @@ class Main(Star):
             return {"schema_version": SCHEMA_VERSION, "accepted": False}
 
         from .core.feedback import enqueue
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            pre = self._precheck_dynamics_event(event)
+            if not pre.get("accepted"):
+                return {"schema_version": SCHEMA_VERSION, **pre}
+            engine = self.engine
+            event_copy = dict(event)
+
+            async def _bg_ingest() -> None:
+                try:
+                    res = await run_io(enqueue, engine, event_copy)
+                    if isinstance(res, dict) and res.get("projection_dirty"):
+                        engine.schedule_projection_refresh()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug(
+                        "[DynamicsHorizons] Async ingest_dynamics_event failed",
+                        exc_info=True,
+                    )
+
+            task = loop.create_task(_bg_ingest())
+            engine.track_ingest_task(task)
+            return {
+                "schema_version": SCHEMA_VERSION,
+                **pre,
+                "async_offloaded": True,
+            }
 
         result = enqueue(self.engine, event)
         if result.pop("projection_dirty", False):

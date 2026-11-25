@@ -296,6 +296,9 @@ class EngineLifecycle:
     async def process_feedback_jobs(self):
         from .feedback import process_jobs
 
+        flush_fn = getattr(self, "flush_pending_ingests", None)
+        if callable(flush_fn):
+            await flush_fn()
         await process_jobs(self)
 
     def wake_identity(self, wake):

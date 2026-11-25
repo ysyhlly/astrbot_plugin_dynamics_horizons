@@ -652,34 +652,55 @@ async def download_media_to_file(
     *,
     max_bytes: int,
     timeout: float = 60.0,
+    total_timeout: float | None = None,
     cookie_header: str = "",
     secrets: Sequence[str] = (),
 ) -> int:
-    """Download a Bilibili media track trying primary + backup CDN URLs with SSRF protection."""
+    """Download a Bilibili media track trying primary + backup CDN URLs with SSRF protection.
+
+    Enforces a single total deadline across all ranged chunks, backup URLs, and retry
+    attempts so slow streams cannot stack timeouts and starve the global Semaphore(1).
+    """
     deduped = list(dict.fromkeys(str(u).strip() for u in urls if str(u or "").strip()))
     if not deduped:
         raise MediaDownloadError("缺少可用媒体下载地址", is_transient=False)
 
     await asyncio.to_thread(_ensure_free_disk_space, output_path.parent)
 
+    per_req_timeout = max(1.0, float(timeout))
+    effective_total = (
+        max(0.05, float(total_timeout))
+        if total_timeout is not None
+        else max(per_req_timeout, min(per_req_timeout * 1.5, 180.0))
+    )
     part_path = output_path.with_suffix(output_path.suffix + ".part")
     last_err: Exception | None = None
     candidates = deduped
     async with _media_pipeline_slot():
+        deadline = time.monotonic() + effective_total
         try:
             for attempt in range(2):
                 retry_urls: list[str] = []
                 for raw_url in candidates:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        last_err = MediaDownloadError(
+                            f"媒体下载超过总超时上限（{effective_total:.1f}s）",
+                            is_transient=True,
+                        )
+                        retry_urls.clear()
+                        break
                     url = ("https:" + raw_url) if raw_url.startswith("//") else raw_url
                     try:
-                        written = await _stream_single_url_to_file(
-                            url,
-                            part_path,
-                            max_bytes=max_bytes,
-                            timeout=timeout,
-                            cookie_header=cookie_header,
-                            secrets=secrets,
-                        )
+                        async with asyncio.timeout(remaining):
+                            written = await _stream_single_url_to_file(
+                                url,
+                                part_path,
+                                max_bytes=max_bytes,
+                                timeout=min(per_req_timeout, remaining),
+                                cookie_header=cookie_header,
+                                secrets=secrets,
+                            )
                         part_path.replace(output_path)
                         return written
                     except (
@@ -695,6 +716,13 @@ async def download_media_to_file(
                         if exc.is_transient:
                             retry_urls.append(url)
                     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                        if deadline - time.monotonic() <= 0.0:
+                            last_err = MediaDownloadError(
+                                f"媒体下载超过总超时上限（{effective_total:.1f}s）",
+                                is_transient=True,
+                            )
+                            retry_urls.clear()
+                            break
                         last_err = MediaDownloadError(
                             redact_error_text(exc, secrets), is_transient=True
                         )
@@ -720,10 +748,11 @@ async def download_media_to_file(
                                 part_path.unlink()
                             except OSError:
                                 pass
-                if not retry_urls or attempt == 1:
+                remaining = deadline - time.monotonic()
+                if not retry_urls or attempt == 1 or remaining <= 0.0:
                     break
                 candidates = retry_urls
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(min(1.0, remaining))
         finally:
             if part_path.exists():
                 try:

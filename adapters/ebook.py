@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import base64
 import hashlib
 import io
 import json
+import os
 import posixpath
 import re
+import shutil
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -42,6 +47,127 @@ MAX_COMPRESSION_RATIO = 120
 
 _XML_ENTITY_RE = re.compile(r"<!ENTITY\b", re.IGNORECASE)
 _WIKI_LANG_RE = re.compile(r"^[a-z]{2,8}(?:-[a-z0-9]{2,8})?$")
+
+_REMOTE_EBOOK_CACHE_DIR: Path | None = None
+_REMOTE_EBOOK_CACHE_TTL_SEC = 6 * 3600.0
+_REMOTE_EBOOK_CACHE_MAX_ITEMS = 16
+
+
+def _get_remote_ebook_cache_dir() -> Path:
+    """Return a private per-process temp cache directory, auto-cleaned on exit."""
+    global _REMOTE_EBOOK_CACHE_DIR
+    if _REMOTE_EBOOK_CACHE_DIR is not None:
+        return _REMOTE_EBOOK_CACHE_DIR
+    cache_dir = Path(tempfile.mkdtemp(prefix="astrbot_horizons_ebook_cache_"))
+    _REMOTE_EBOOK_CACHE_DIR = cache_dir
+    atexit.register(shutil.rmtree, str(cache_dir), True)
+    return cache_dir
+
+
+def _ebook_cache_key(url: str, *, auth_tag: str = "") -> str:
+    return hashlib.sha256(f"{url}\n{auth_tag}".encode("utf-8")).hexdigest()[:32]
+
+
+def _read_remote_ebook_cache(key: str) -> tuple[bytes, str] | None:
+    cache_dir = _REMOTE_EBOOK_CACHE_DIR
+    if cache_dir is None:
+        return None
+    meta_path = cache_dir / f"{key}.json"
+    body_path = cache_dir / f"{key}.bin"
+    try:
+        if not meta_path.is_file() or not body_path.is_file():
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        cached_at = float(meta.get("cached_at") or 0.0)
+        if (time.time() - cached_at) > _REMOTE_EBOOK_CACHE_TTL_SEC:
+            meta_path.unlink(missing_ok=True)
+            body_path.unlink(missing_ok=True)
+            return None
+        raw = body_path.read_bytes()
+        if not raw or len(raw) > MAX_RAW_EBOOK_BYTES:
+            return None
+        os.utime(body_path, None)
+        return raw, str(meta.get("content_type") or "")
+    except Exception:
+        return None
+
+
+def _write_remote_ebook_cache(key: str, raw: bytes, content_type: str) -> None:
+    if not raw or len(raw) > MAX_RAW_EBOOK_BYTES:
+        return
+    try:
+        cache_dir = _get_remote_ebook_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        body_path = cache_dir / f"{key}.bin"
+        meta_path = cache_dir / f"{key}.json"
+        tmp_body = cache_dir / f".{key}.{os.getpid()}.bin.tmp"
+        tmp_meta = cache_dir / f".{key}.{os.getpid()}.json.tmp"
+        try:
+            tmp_body.write_bytes(raw)
+            os.replace(tmp_body, body_path)
+            tmp_meta.write_text(
+                json.dumps(
+                    {"cached_at": time.time(), "content_type": str(content_type or "")},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp_meta, meta_path)
+        finally:
+            tmp_body.unlink(missing_ok=True)
+            tmp_meta.unlink(missing_ok=True)
+        # Bounded eviction by mtime
+        bins = sorted(
+            cache_dir.glob("*.bin"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in bins[_REMOTE_EBOOK_CACHE_MAX_ITEMS:]:
+            stale.unlink(missing_ok=True)
+            stale.with_suffix(".json").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _parse_remote_ebook_payload(
+    *,
+    book_title: str,
+    url: str,
+    raw: bytes,
+    content_type: str,
+    chunk_chars: int,
+    strip_gutenberg: bool = False,
+) -> tuple[dict[str, Any], str]:
+    """CPU/ZIP-heavy ebook parsing helper meant to run inside asyncio.to_thread."""
+    ctype = str(content_type or "").lower()
+    if "epub" in ctype or url.lower().endswith(".epub") or raw[:4] == b"PK\x03\x04":
+        parsed = parse_local_ebook(
+            f"{book_title}.epub", raw, chunk_chars=chunk_chars
+        )
+        return parsed, "epub"
+    if "html" in ctype or url.lower().endswith((".htm", ".html")):
+        text = raw.decode("utf-8", errors="replace")
+        if strip_gutenberg:
+            text = _strip_gutenberg_boilerplate(text)
+        art = extract_article_from_html(
+            text, max_chars=max(chunk_chars * (20 if strip_gutenberg else 10), 40000)
+        )
+        parsed = parse_local_ebook(
+            f"{book_title}.txt",
+            art["text"].encode("utf-8"),
+            chunk_chars=chunk_chars,
+        )
+        return parsed, "html"
+    if strip_gutenberg:
+        text = _strip_gutenberg_boilerplate(_decode_text_bytes(raw))
+        parsed = parse_local_ebook(
+            f"{book_title}.txt",
+            text.encode("utf-8"),
+            chunk_chars=chunk_chars,
+        )
+        return parsed, "txt"
+    parsed = parse_local_ebook(f"{book_title}.txt", raw, chunk_chars=chunk_chars)
+    return parsed, "txt"
 
 _CHAPTER_HEADING_RE = re.compile(
     r"^\s*("
@@ -1263,39 +1389,31 @@ async def _load_gutendex_book(
     if not dl_url:
         raise ValueError("该公版书未提供可下载的纯文本/EPUB/HTML 链接")
 
-    file_resp = await safe_http_get(
-        dl_url,
-        timeout=timeout,
-        max_bytes=12 * 1024 * 1024,
-        allow_private=False,
-    )
-    ctype = file_resp.header("content-type", "").lower()
-    raw = file_resp.body
-
-    if "epub" in ctype or dl_url.lower().endswith(".epub") or raw[:4] == b"PK\x03\x04":
-        parsed = parse_local_ebook(
-            f"{title or 'gutenberg'}.epub", raw, chunk_chars=chunk_chars
-        )
-        chapters = parsed["chapters"]
-    elif "html" in ctype or dl_url.lower().endswith((".htm", ".html")):
-        html_str = _strip_gutenberg_boilerplate(file_resp.text())
-        art = extract_article_from_html(
-            html_str, max_chars=max(chunk_chars * 20, 80000)
-        )
-        parsed = parse_local_ebook(
-            f"{title or 'gutenberg'}.txt",
-            art["text"].encode("utf-8"),
-            chunk_chars=chunk_chars,
-        )
-        chapters = parsed["chapters"]
+    cache_key = _ebook_cache_key(dl_url)
+    cached = await asyncio.to_thread(_read_remote_ebook_cache, cache_key)
+    if cached is not None:
+        raw, ctype = cached
     else:
-        plain = _strip_gutenberg_boilerplate(_decode_text_bytes(raw))
-        parsed = parse_local_ebook(
-            f"{title or 'gutenberg'}.txt",
-            plain.encode("utf-8"),
-            chunk_chars=chunk_chars,
+        file_resp = await safe_http_get(
+            dl_url,
+            timeout=timeout,
+            max_bytes=12 * 1024 * 1024,
+            allow_private=False,
         )
-        chapters = parsed["chapters"]
+        ctype = file_resp.header("content-type", "").lower()
+        raw = file_resp.body
+        await asyncio.to_thread(_write_remote_ebook_cache, cache_key, raw, ctype)
+
+    parsed, _ = await asyncio.to_thread(
+        _parse_remote_ebook_payload,
+        book_title=title or "gutenberg",
+        url=dl_url,
+        raw=raw,
+        content_type=ctype,
+        chunk_chars=chunk_chars,
+        strip_gutenberg=True,
+    )
+    chapters = parsed["chapters"]
 
     book_id = (
         f"gutendex:{gid}"
@@ -1809,46 +1927,44 @@ async def fetch_ebook_content(
             allowed.add(_origin_tuple(extra))
         if origin not in allowed:
             headers = {}
-        resp = await safe_http_get(
-            acq_url,
-            headers=headers,
-            timeout=timeout,
-            max_bytes=MAX_RAW_EBOOK_BYTES,
-            allow_private=allow_private,
-            secrets_to_redact=secrets,
-        )
-        acq_type = (
-            resp.header("content-type") or str(meta.get("acquisition_type") or "")
-        ).lower()
+        auth_tag = hashlib.sha256(
+            json.dumps(sorted(headers.items()), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:16] if headers else ""
+        cache_key = _ebook_cache_key(acq_url, auth_tag=auth_tag)
+        cached = await asyncio.to_thread(_read_remote_ebook_cache, cache_key)
+        if cached is not None:
+            raw_body, cached_ctype = cached
+            acq_type = (cached_ctype or str(meta.get("acquisition_type") or "")).lower()
+        else:
+            resp = await safe_http_get(
+                acq_url,
+                headers=headers,
+                timeout=timeout,
+                max_bytes=MAX_RAW_EBOOK_BYTES,
+                allow_private=allow_private,
+                secrets_to_redact=secrets,
+            )
+            raw_body = resp.body
+            acq_type = (
+                resp.header("content-type") or str(meta.get("acquisition_type") or "")
+            ).lower()
+            await asyncio.to_thread(_write_remote_ebook_cache, cache_key, raw_body, acq_type)
+
         book_title = str(
             meta.get("book_title") or candidate.get("title") or "opds_book"
         )
-        if (
-            "epub" in acq_type
-            or acq_url.lower().endswith(".epub")
-            or resp.body[:4] == b"PK\x03\x04"
-        ):
-            parsed = parse_local_ebook(
-                f"{book_title}.epub", resp.body, chunk_chars=chunk_chars
-            )
-            origin = "opds_epub"
-        elif "html" in acq_type:
-            art = extract_article_from_html(
-                resp.text(), max_chars=max(chunk_chars * 10, 40000)
-            )
-            parsed = parse_local_ebook(
-                f"{book_title}.txt",
-                art["text"].encode("utf-8"),
-                chunk_chars=chunk_chars,
-            )
-            origin = "opds_html"
-        else:
-            parsed = parse_local_ebook(
-                f"{book_title}.txt", resp.body, chunk_chars=chunk_chars
-            )
-            origin = "opds_txt"
-
+        parsed, fmt_kind = await asyncio.to_thread(
+            _parse_remote_ebook_payload,
+            book_title=book_title,
+            url=acq_url,
+            raw=raw_body,
+            content_type=acq_type,
+            chunk_chars=chunk_chars,
+            strip_gutenberg=False,
+        )
         chapters = parsed["chapters"]
+        origin = f"opds_{fmt_kind}"
+
         idx = max(0, min(target_idx, len(chapters) - 1))
         ch = chapters[idx]
         return {

@@ -137,12 +137,15 @@ async def test_dh1_distinct_review_provider_uses_two_calls_and_compact_review_pa
         assert "core_profile" not in calls[1][2]["character"]
         review_payload = calls[1][2]
         review_json = json.dumps(review_payload, ensure_ascii=False)
-        # Compact review payload MUST NOT duplicate the full raw source text or raw_url
-        assert "UNIQUE_LONG_RAW_SENTINEL_987654321" not in review_json
-        assert "text" not in review_payload["source_evidence"]
-        assert "raw_url" not in review_payload["source_evidence"]
-        assert review_payload["source_evidence"]["text_chars"] > 100
-        assert review_payload["source_evidence"]["content_hash"]
+        # Compact review payload retains a bounded text excerpt for Stage 3 hallucination/injection
+        # checks while excluding raw_url and capping length at 1600 chars.
+        ev = review_payload["source_evidence"]
+        assert "raw_url" not in ev
+        assert isinstance(ev.get("text"), str) and len(ev["text"]) > 100
+        assert len(ev["text"]) <= 1600
+        assert ev["text_chars"] >= len(ev["text"])
+        assert ev["text_truncated"] is (ev["text_chars"] > 1600)
+        assert ev["content_hash"]
         assert review_payload["proposal"]["digest"] == "资料梳理了宋代点茶建盏兔毫纹与汤花咬盏工艺。"
         assert review_payload["proposal"]["reflection"] == "建盏配白茶汤花很有宋人审美韵味。"
 
@@ -233,7 +236,8 @@ async def test_dh1_same_provider_with_merge_disabled_keeps_separate_review_call(
         assert len(calls) == 2
         assert calls[0][1].endswith(STAGE12_MERGED_DIGEST_PROMPT)
         assert calls[1][1].endswith(STAGE3_REVIEW_PROMPT)
-        assert "text" not in calls[1][2]["source_evidence"]
+        assert isinstance(calls[1][2]["source_evidence"].get("text"), str)
+        assert len(calls[1][2]["source_evidence"]["text"]) <= 1600
         assert _count_model_calls(store) == 2
         assert eng.health(IDENT)["review_context_policy"] == "independent_calls"
     finally:

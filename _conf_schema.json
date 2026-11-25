@@ -174,5 +174,17 @@
     "description": "单视频弹幕采样上限",
     "default": 15,
     "hint": "开启高能弹幕采样后，最多提取并附带的脱敏弹幕条数（默认 15）。"
+  },
+  "terminal_retention_days": {
+    "type": "int",
+    "description": "终态记录与大体积证据留存天数",
+    "default": 30,
+    "hint": "已完成/过期反馈任务、意图、审阅记录与历史证据的自动清理保留天数（最低 7 天，默认 30 天）。"
+  },
+  "bilibili_poll_jitter_max": {
+    "type": "float",
+    "description": "B站轮询随机抖动上限（秒）",
+    "default": 1.5,
+    "hint": "多 B 站信息源连续轮询之间的随机节流抖动上限（0~5 秒，默认 1.5 秒），降低风控触发概率。"
   }
 }

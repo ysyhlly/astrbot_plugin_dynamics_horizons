@@ -2427,6 +2427,15 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 status = "cooled"
                 if active_only:
                     continue
+            try:
+                raw_ev_ids = json.loads(r["evidence_log_ids_json"] or "[]")
+            except Exception:
+                raw_ev_ids = []
+            ev_ids = (
+                [str(x) for x in raw_ev_ids if str(x or "").strip()]
+                if isinstance(raw_ev_ids, list)
+                else []
+            )
             out.append(
                 {
                     "interest_id": r["interest_id"],
@@ -2438,6 +2447,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     "last_reinforced_at": float(r["last_reinforced_at"]),
                     "expires_at": float(r["expires_at"]),
                     "status": status,
+                    "evidence_log_ids": ev_ids,
                 }
             )
         out.sort(key=lambda x: (0 if x["status"] == "active" else 1, -x["heat_score"]))
@@ -3050,16 +3060,28 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             item = json.loads(row["payload_json"])
             if status == "claimed":
                 if not self.intent_evidence_valid(row):
+                    item["status"] = "cancelled"
+                    self.db.execute(
+                        "UPDATE horizon_intents SET status='cancelled', payload_json=?, updated_at=? WHERE intent_id=?",
+                        (encode_json(item), stamp, str(intent_id)),
+                    )
                     return {
                         "schema_version": 1,
                         "status": "cancelled",
                         "changed": False,
                     }
-                if (
-                    cur_status != "pending"
-                    or float(row["not_before"]) > stamp
-                    or float(row["expires_at"]) <= stamp
-                ):
+                if cur_status == "pending" and float(row["expires_at"]) <= stamp:
+                    item["status"] = "expired"
+                    self.db.execute(
+                        "UPDATE horizon_intents SET status='expired', payload_json=?, updated_at=? WHERE intent_id=?",
+                        (encode_json(item), stamp, str(intent_id)),
+                    )
+                    return {
+                        "schema_version": 1,
+                        "status": "expired",
+                        "changed": False,
+                    }
+                if cur_status != "pending" or float(row["not_before"]) > stamp:
                     return {"schema_version": 1, "status": cur_status, "changed": False}
                 if row["umo"] not in allowed:
                     return {"schema_version": 1, "status": "disabled", "changed": False}
@@ -3125,11 +3147,12 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 f"SELECT COUNT(*) FROM sources WHERE enabled=1{id_clause}", id_params
             ).fetchone()[0]
             candidates_unread = self.db.execute(
-                f"SELECT COUNT(*) FROM candidate_items WHERE status='unread'{id_clause}",
+                f"SELECT COUNT(*) FROM candidate_items WHERE status='unread' AND archived=0{id_clause}",
                 id_params,
             ).fetchone()[0]
             logs_total = self.db.execute(
-                f"SELECT COUNT(*) FROM reading_logs WHERE 1=1{id_clause}", id_params
+                f"SELECT COUNT(*) FROM reading_logs WHERE status='active'{id_clause}",
+                id_params,
             ).fetchone()[0]
             books_reading = self.db.execute(
                 f"SELECT COUNT(*) FROM books WHERE status='reading'{id_clause}",
@@ -3144,7 +3167,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 (stamp, *id_params),
             ).fetchone()[0]
             recent_row = self.db.execute(
-                f"SELECT citation_json FROM reading_logs WHERE 1=1{id_clause} ORDER BY created_at DESC LIMIT 1",
+                f"SELECT citation_json FROM reading_logs WHERE status='active'{id_clause} ORDER BY created_at DESC LIMIT 1",
                 id_params,
             ).fetchone()
         active_interests = len(
