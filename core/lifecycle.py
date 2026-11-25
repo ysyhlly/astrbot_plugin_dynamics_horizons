@@ -6,6 +6,7 @@ import hashlib
 import json
 import time
 import uuid
+from typing import Any
 
 from .contract import (
     chat_umo_kind,
@@ -28,6 +29,30 @@ def check_review_target(row, expected_identity="", expected_revision=None):
         raise ReviewConflict("review_identity_mismatch")
     if expected_revision is not None and row["revision"] != expected_revision:
         raise ReviewConflict("stale_review_revision")
+
+
+def _compact_terminal_evidence_json(raw_json: str | None) -> str:
+    """Strip bulky source text/chunks from terminal proposal evidence while preserving tiny media metadata."""
+    if not raw_json or raw_json == "{}":
+        return "{}"
+    try:
+        parsed = json.loads(raw_json)
+    except Exception:
+        return "{}"
+    if not isinstance(parsed, dict) or not parsed:
+        return "{}"
+    kept: dict[str, Any] = {}
+    for key in (
+        "watch_mode",
+        "content_origin",
+        "visual_observations",
+        "media_meta",
+        "content_hash",
+    ):
+        val = parsed.get(key)
+        if val:
+            kept[key] = val
+    return encode_json(kept) if kept else "{}"
 
 
 class LifecycleStore:
@@ -60,6 +85,16 @@ class LifecycleStore:
                     umo TEXT NOT NULL,member_id TEXT NOT NULL,payload_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,
                     next_at REAL NOT NULL DEFAULT 0,created_at REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_feedback_jobs_due
+                    ON feedback_jobs(status, next_at, created_at);
+                CREATE INDEX IF NOT EXISTS idx_feedback_jobs_status_created
+                    ON feedback_jobs(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_feedback_jobs_scope
+                    ON feedback_jobs(identity, umo, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_reading_tasks_status_updated
+                    ON reading_tasks(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_proposals_state_updated
+                    ON proposals(state, updated_at);
                 CREATE TABLE IF NOT EXISTS feedback_receipts(event_id TEXT PRIMARY KEY,created_at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS scope_bindings(umo TEXT PRIMARY KEY,identity TEXT NOT NULL,
                     managed INTEGER NOT NULL DEFAULT 0,updated_at REAL NOT NULL);
@@ -419,10 +454,16 @@ class LifecycleStore:
             ).fetchone()
             if not row or row["status"] == "cancelled":
                 return
-            self.db.execute(
-                "UPDATE reading_tasks SET status=?,proposal_id=?,context_json=?,updated_at=? WHERE task_id=?",
-                (status, proposal_id, encode_json(context or {}), now, task_id),
-            )
+            if status in ("approved", "rejected", "read_no_note", "cancelled"):
+                self.db.execute(
+                    "UPDATE reading_tasks SET status=?,proposal_id=?,context_json=?,evidence_json='{}',updated_at=? WHERE task_id=?",
+                    (status, proposal_id, encode_json(context or {}), now, task_id),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE reading_tasks SET status=?,proposal_id=?,context_json=?,updated_at=? WHERE task_id=?",
+                    (status, proposal_id, encode_json(context or {}), now, task_id),
+                )
             if status == "read_no_note":
                 if row["candidate_id"]:
                     self.db.execute(
@@ -504,7 +545,7 @@ class LifecycleStore:
     def cancel_source_work(self, source_id, now):
         # Called in the source update transaction.
         self.db.execute(
-            "UPDATE reading_tasks SET status='cancelled',updated_at=? WHERE source_id=? AND status IN ('running','pending_review','failed','interrupted')",
+            "UPDATE reading_tasks SET status='cancelled',evidence_json='{}',updated_at=? WHERE source_id=? AND status IN ('running','pending_review','failed','interrupted')",
             (now, source_id),
         )
         self.db.execute(
@@ -656,7 +697,7 @@ class LifecycleStore:
             if row["state"] != "approved":
                 raise ReviewConflict("只有已通过的提案可以撤销")
             self.db.execute(
-                "UPDATE proposals SET state='revoked',revision=revision+1,updated_at=? WHERE proposal_id=?",
+                "UPDATE proposals SET state='revoked',evidence_json='{}',revision=revision+1,updated_at=? WHERE proposal_id=?",
                 (now, proposal_id),
             )
             self.db.execute(
@@ -765,6 +806,7 @@ class LifecycleStore:
         *,
         retention_days: float = 30.0,
         attempt_days: float = 30.0,
+        evidence_days: float | None = None,
         batch_limit: int = 2000,
     ) -> dict[str, int]:
         """Bounded retention GC for completed/expired terminal rows to prevent unbounded SQLite growth."""
@@ -772,6 +814,12 @@ class LifecycleStore:
         held_cutoff = float(now) - max(60.0, float(retention_days)) * 86400.0
         # Never prune records within the recent 7 Shanghai days so daily quota counts stay exact.
         attempt_cutoff = float(now) - max(7.0, float(attempt_days)) * 86400.0
+        ev_days = (
+            max(1.0, float(evidence_days))
+            if evidence_days is not None
+            else min(7.0, max(1.0, float(retention_days)))
+        )
+        evidence_cutoff = float(now) - ev_days * 86400.0
         lim = max(1, min(10000, int(batch_limit)))
         removed: dict[str, int] = {}
         with self.lock, self.db:
@@ -873,6 +921,36 @@ class LifecycleStore:
                 (cutoff,),
             )
             removed["book_chapters"] = int(cur.rowcount or 0)
+            cur = self.db.execute(
+                """
+                UPDATE reading_tasks
+                SET evidence_json='{}'
+                WHERE task_id IN (
+                    SELECT task_id FROM reading_tasks
+                    WHERE status IN ('approved', 'rejected', 'read_no_note', 'cancelled', 'failed')
+                      AND evidence_json != '{}'
+                      AND updated_at<?
+                    LIMIT ?
+                )
+                """,
+                (evidence_cutoff, lim),
+            )
+            removed["reading_task_evidence"] = int(cur.rowcount or 0)
+            cur = self.db.execute(
+                """
+                UPDATE proposals
+                SET evidence_json='{}'
+                WHERE proposal_id IN (
+                    SELECT proposal_id FROM proposals
+                    WHERE state IN ('approved', 'rejected', 'revoked')
+                      AND evidence_json != '{}'
+                      AND updated_at<?
+                    LIMIT ?
+                )
+                """,
+                (cutoff, lim),
+            )
+            removed["proposal_evidence"] = int(cur.rowcount or 0)
         return removed
 
     def diagnostics(self, identity, now, *, tz=None):

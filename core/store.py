@@ -33,7 +33,12 @@ from .contract import (
     unpack_identity,
 )
 from .discussions import DiscussionStoreMixin
-from .lifecycle import LifecycleStore, ReviewConflict, check_review_target
+from .lifecycle import (
+    LifecycleStore,
+    ReviewConflict,
+    _compact_terminal_evidence_json,
+    check_review_target,
+)
 from .sanitize import (
     mask_secrets,
     merge_masked_secrets,
@@ -1737,26 +1742,46 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             )
             if state == "rejected" and row["task_id"]:
                 self.db.execute(
-                    "UPDATE reading_tasks SET status='rejected',updated_at=? WHERE task_id=?",
+                    "UPDATE reading_tasks SET status='rejected',evidence_json='{}',updated_at=? WHERE task_id=?",
                     (stamp, row["task_id"]),
                 )
                 self.advance_completed_chapters(row["book_id"], stamp)
-            self.db.execute(
-                """
-                UPDATE proposals
-                SET state=?, review_verdict=?, review_reason=?, review_risks_json=?, reviewed_by=?, updated_at=?
-                WHERE proposal_id=?
-                """,
-                (
-                    state,
-                    str(verdict)[:32],
-                    clean_reason,
-                    encode_json(clean_risks),
-                    str(reviewed_by)[:64],
-                    stamp,
-                    str(proposal_id),
-                ),
-            )
+            if state == "rejected":
+                compact_ev = _compact_terminal_evidence_json(row["evidence_json"])
+                self.db.execute(
+                    """
+                    UPDATE proposals
+                    SET state=?, review_verdict=?, review_reason=?, review_risks_json=?, reviewed_by=?, evidence_json=?, updated_at=?
+                    WHERE proposal_id=?
+                    """,
+                    (
+                        state,
+                        str(verdict)[:32],
+                        clean_reason,
+                        encode_json(clean_risks),
+                        str(reviewed_by)[:64],
+                        compact_ev,
+                        stamp,
+                        str(proposal_id),
+                    ),
+                )
+            else:
+                self.db.execute(
+                    """
+                    UPDATE proposals
+                    SET state=?, review_verdict=?, review_reason=?, review_risks_json=?, reviewed_by=?, updated_at=?
+                    WHERE proposal_id=?
+                    """,
+                    (
+                        state,
+                        str(verdict)[:32],
+                        clean_reason,
+                        encode_json(clean_risks),
+                        str(reviewed_by)[:64],
+                        stamp,
+                        str(proposal_id),
+                    ),
+                )
             if state == "rejected" and row["candidate_id"]:
                 self.db.execute(
                     "UPDATE candidate_items SET status='skipped' WHERE candidate_id=?",
@@ -1961,7 +1986,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 )
             if row["task_id"]:
                 self.db.execute(
-                    "UPDATE reading_tasks SET status='approved',updated_at=? WHERE task_id=?",
+                    "UPDATE reading_tasks SET status='approved',evidence_json='{}',updated_at=? WHERE task_id=?",
                     (stamp, row["task_id"]),
                 )
             if row["book_id"]:
@@ -1970,15 +1995,16 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     (row["reflection"][:160], row["book_id"]),
                 )
 
-            # Update proposal state
+            # Update proposal state (compact bulky raw text evidence while preserving tiny media metadata)
             clean_reason = strip_raw_urls(str(reason or "审查通过"))[:500]
             clean_risks = [strip_raw_urls(str(r))[:160] for r in (risks or [])[:8]]
+            compact_ev = _compact_terminal_evidence_json(row["evidence_json"])
             self.db.execute(
                 """
                 UPDATE proposals
                 SET state='approved', review_verdict='approve', review_reason=?,
                     review_risks_json=?, reviewed_by=?, applied_log_id=?,
-                    applied_interest_id=?, applied_question_ids_json=?, updated_at=?
+                    applied_interest_id=?, applied_question_ids_json=?, evidence_json=?, updated_at=?
                 WHERE proposal_id=?
                 """,
                 (
@@ -1988,6 +2014,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     log_id,
                     interest_id,
                     encode_json(q_ids),
+                    compact_ev,
                     stamp,
                     row["proposal_id"],
                 ),
