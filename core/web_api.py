@@ -177,30 +177,21 @@ class HorizonsWebAPI:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _authorize(self) -> str:
-        from astrbot.dashboard.api.auth import require_dashboard_user
+    async def _authorize(self, *, check_csrf: bool = False) -> str:
+        from ..series_panels import require_series_admin
 
-        raw = getattr(request, "_request", None)
-        if raw is None:
-            raise PermissionError("需要 Dashboard 管理员登录")
-        username = await require_dashboard_user(raw)
-        cfg = (
-            self.plugin.context.get_config()
-            if callable(getattr(self.plugin.context, "get_config", None))
-            else {}
+        username = await require_series_admin(
+            self.plugin.context, request, check_csrf=check_csrf
         )
-        expected = (
-            (cfg or {}).get("dashboard", {}).get("username")
-            if isinstance(cfg, dict)
-            else None
-        )
-        if not username or (expected and username != expected):
-            raise PermissionError("需要 Dashboard 管理员登录")
         return f"human:{username}"
 
-    async def _serve(self, fn, *, max_body: int = 0):
+    async def _serve(self, fn, *, max_body: int = 0, check_csrf: bool | None = None):
         try:
-            actor = await self._authorize()
+            enforce_csrf = (max_body > 0) if check_csrf is None else bool(check_csrf)
+            if enforce_csrf:
+                actor = await self._authorize(check_csrf=True)
+            else:
+                actor = await self._authorize()
             if self.plugin.closed or self.plugin.engine is None:
                 return _err("群间见闻尚未就绪", status_code=503)
             body = await _read_json_body(max_body) if max_body > 0 else {}
@@ -450,7 +441,7 @@ class HorizonsWebAPI:
                     if callable(validate_source_config)
                     else eng.validate_source_config
                 )
-                validated_cfg = validator(kind, raw_cfg)
+                validated_cfg = await run_io(validator, kind, raw_cfg)
                 name = str(
                     body.get("name") or validated_cfg.get("title") or f"{kind} 订阅源"
                 ).strip()[:120]
@@ -749,7 +740,7 @@ class HorizonsWebAPI:
 
             raise ValueError(f"未知 sources 操作: {action}")
 
-        return await self._serve(op, max_body=_MAX_UPLOAD_BODY)
+        return await self._serve(op, max_body=_MAX_UPLOAD_BODY, check_csrf=True)
 
     # ------------------------------------------------------------------
     # GET /logs
@@ -929,4 +920,4 @@ class HorizonsWebAPI:
 
             raise ValueError(f"未知 reviews 操作: {action}")
 
-        return await self._serve(op, max_body=_MAX_STD_BODY)
+        return await self._serve(op, max_body=_MAX_STD_BODY, check_csrf=True)

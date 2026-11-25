@@ -27,6 +27,7 @@ from .contract import (
     encode_json,
     is_in_quiet_hours,
     normalize_identity,
+    sanitize_readonly_bilibili_cookie,
     sha256_hex,
     shanghai_day_bounds,
     unpack_identity,
@@ -481,6 +482,23 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             "updated_at": float(row["updated_at"]),
         }
 
+    @staticmethod
+    def _sanitize_source_config_for_storage(
+        source_kind: str, config: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        clean = dict(config or {})
+        if source_kind == "bilibili":
+            for forbidden in ("bili_jct", "csrf", "csrf_token"):
+                clean.pop(forbidden, None)
+            raw_cookie = clean.get("cookie")
+            if isinstance(raw_cookie, str) and raw_cookie.strip():
+                stripped = sanitize_readonly_bilibili_cookie(raw_cookie)
+                if stripped:
+                    clean["cookie"] = stripped
+                else:
+                    clean.pop("cookie", None)
+        return clean
+
     def create_source(
         self,
         *,
@@ -497,6 +515,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         clean_name = clean_text(name, "name", 120)
         stamp = float(now if now is not None else time.time())
         source_id = "src_" + uuid.uuid4().hex[:16]
+        safe_config = self._sanitize_source_config_for_storage(source_kind, config)
         with self.lock, self.db:
             self.db.execute(
                 """
@@ -512,7 +531,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     source_kind,
                     clean_name,
                     int(bool(enabled)),
-                    encode_json(config or {}),
+                    encode_json(safe_config),
                     stamp,
                     stamp,
                 ),
@@ -567,7 +586,13 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 int(bool(enabled)) if enabled is not None else int(row["enabled"])
             )
             new_identity = normalize_identity(identity) if identity else row["identity"]
-            new_cfg = encode_json(config) if config is not None else row["config_json"]
+            new_cfg = (
+                encode_json(
+                    self._sanitize_source_config_for_storage(row["source_kind"], config)
+                )
+                if config is not None
+                else row["config_json"]
+            )
             if (
                 new_identity != row["identity"]
                 or new_cfg != row["config_json"]

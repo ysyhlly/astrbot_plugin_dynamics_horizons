@@ -736,6 +736,13 @@ async def test_web_api_auth_and_endpoints(tmp_path: Path, monkeypatch):
         state = {"user": None, "query": {}, "body": {}}
 
         class DummyRawRequest:
+            method = "POST"
+            headers = {
+                "Host": "dashboard.local",
+                "Origin": "https://dashboard.local",
+                "Sec-Fetch-Site": "same-origin",
+            }
+
             @property
             def query_params(self):
                 return state["query"]

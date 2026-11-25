@@ -32,6 +32,7 @@ from .ssrf import (
     normalize_candidate,
     redact_error_text,
     safe_http_get,
+    validate_url_async,
     validate_url_sync,
 )
 from .video_media import (
@@ -305,6 +306,32 @@ def _classify_bili_exception(
     return None
 
 
+_FORBIDDEN_WRITE_COOKIE_KEYS = frozenset({"bili_jct", "csrf", "csrf_token"})
+
+
+def _strip_write_cookie_fields(raw_cookie: str) -> str:
+    """Strip write/CSRF tokens (`bili_jct`, `csrf`, `csrf_token`) before persisting cookies."""
+    cleaned = str(raw_cookie or "").strip()
+    if not cleaned or is_masked_secret(cleaned):
+        return cleaned
+    if "=" not in cleaned:
+        return cleaned
+    kept: list[str] = []
+    for seg in cleaned.split(";"):
+        piece = seg.strip()
+        if not piece or "=" not in piece:
+            continue
+        k, v = piece.split("=", 1)
+        key = k.strip()
+        val = v.strip()
+        if not key or not val:
+            continue
+        if key.lower() in _FORBIDDEN_WRITE_COOKIE_KEYS:
+            continue
+        kept.append(f"{key}={val}")
+    return "; ".join(kept)
+
+
 def validate_bilibili_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(config, Mapping):
         raise ValueError("B站源配置必须是对象")
@@ -342,7 +369,7 @@ def validate_bilibili_config(config: Mapping[str, Any] | None) -> dict[str, Any]
             )
         out["popular_kind"] = pop_kind
 
-    cookie = str(config.get("cookie") or "").strip()
+    cookie = _strip_write_cookie_fields(str(config.get("cookie") or "").strip())
     sessdata = str(config.get("sessdata") or "").strip()
     if cookie:
         out["cookie"] = cookie
@@ -898,7 +925,7 @@ async def _download_subtitle_text(
     secrets: list[str],
     max_chars: int = 4500,
 ) -> str:
-    clean_url = validate_url_sync(sub_url, allow_private=False, require_dns=False)
+    clean_url = await validate_url_async(sub_url, allow_private=False, require_dns=False)
     resp = await safe_http_get(
         clean_url,
         headers=_BILI_HEADERS,

@@ -17,6 +17,7 @@ from .ssrf import (
     normalize_candidate,
     redact_error_text,
     safe_http_get,
+    validate_url_async,
     validate_url_sync,
 )
 
@@ -307,7 +308,7 @@ async def build_manual_candidate(
 ) -> dict[str, Any]:
     """Create a `NormalizedCandidate` from pasted clipping text and/or a public article URL."""
     clean_url = (
-        validate_url_sync(url, allow_private=False, require_dns=False)
+        await validate_url_async(url, allow_private=False, require_dns=False)
         if str(url or "").strip()
         else ""
     )

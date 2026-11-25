@@ -28,6 +28,7 @@ from .ssrf import (
     safe_http_get,
     safe_public_url,
     strip_html_to_text,
+    validate_url_async,
     validate_url_sync,
 )
 
@@ -1796,7 +1797,7 @@ async def fetch_ebook_content(
         ).strip()
         if not acq_url:
             raise ValueError("OPDS 条目缺少下载链接 acquisition_url")
-        acq_url = validate_url_sync(
+        acq_url = await validate_url_async(
             acq_url, allow_private=allow_private, require_dns=False
         )
         headers, secrets = _opds_auth_headers(cfg)

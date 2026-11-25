@@ -68,7 +68,7 @@ _PUBLIC_DNS_CACHE: OrderedDict[str, tuple[float, tuple[str, ...]]] = OrderedDict
 _PUBLIC_DNS_CACHE_LOCK = threading.RLock()
 _DEFAULT_DOH_ENDPOINTS = ("https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query")
 _SHARED_HTTP_SESSIONS: contextvars.ContextVar[
-    dict[bool, aiohttp.ClientSession] | None
+    dict[tuple[bool, str], aiohttp.ClientSession] | None
 ] = contextvars.ContextVar("horizons_shared_http_sessions", default=None)
 _ALIBABA_META_IP = ipaddress.ip_address("100.100.100.200")
 _AWS_IPV6_META_NET = ipaddress.ip_network("fd00:ec2::/32")
@@ -365,6 +365,33 @@ def _doh_endpoints() -> tuple[str, ...]:
     return tuple(valid) if valid else _DEFAULT_DOH_ENDPOINTS
 
 
+def _extract_proxy_host(proxy_url: str | None) -> str | None:
+    """Validate and extract the normalized host of an explicitly configured HTTP(S) proxy.
+
+    Explicitly configured local/LAN proxies (e.g. 127.0.0.1:7890 or localhost) are
+    permitted, while cloud metadata / link-local / unspecified / multicast addresses
+    remain strictly blocked.
+    """
+    if not proxy_url:
+        return None
+    try:
+        sp = urlsplit(proxy_url)
+    except ValueError as exc:
+        raise SSRFBlockedError("代理 URL 格式无效") from exc
+    host = (sp.hostname or "").strip().rstrip(".").lower()
+    if not host:
+        raise SSRFBlockedError("代理 URL 缺少有效主机名")
+    if host in _METADATA_HOSTS or host.endswith(".metadata.google.internal"):
+        raise SSRFBlockedError(f"安全策略拦截指向云元数据主机的代理：{host}")
+    try:
+        ip_obj = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        ip_obj = None
+    if ip_obj is not None:
+        _check_ip_address(ip_obj, allow_private=True)
+    return host
+
+
 def _resolve_proxy_url(explicit_proxy: str | None = None) -> str | None:
     raw = str(
         explicit_proxy
@@ -379,6 +406,7 @@ def _resolve_proxy_url(explicit_proxy: str | None = None) -> str | None:
         raise SSRFBlockedError("代理 URL 格式无效") from exc
     if (sp.scheme or "").lower() not in {"http", "https"} or not sp.hostname:
         raise SSRFBlockedError("仅支持显式 HTTP/HTTPS 代理 URL")
+    _extract_proxy_host(raw)
     return raw
 
 
@@ -389,7 +417,7 @@ async def http_session_scope():
     if existing is not None:
         yield existing
         return
-    pool: dict[bool, aiohttp.ClientSession] = {}
+    pool: dict[tuple[bool, str], aiohttp.ClientSession] = {}
     token = _SHARED_HTTP_SESSIONS.set(pool)
     try:
         yield pool
@@ -565,19 +593,39 @@ def _validate_parsed_url(
     return normalized, raw_host
 
 
+def _in_running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
 def validate_url_sync(
     url: str,
     *,
     allow_private: bool = False,
     require_dns: bool = False,
 ) -> str:
-    """Validate URL scheme/host/IP and check DNS resolution against private/loopback/metadata ranges."""
+    """Validate URL scheme/host/IP and check DNS resolution against private/loopback/metadata ranges.
+
+    Avoids blocking a running asyncio event loop with synchronous socket/DoH I/O:
+    async callers should use `validate_url_async` or `asyncio.to_thread`.
+    """
     normalized, host = _validate_parsed_url(url, allow_private=allow_private)
     try:
         ipaddress.ip_address(host)
         return normalized
     except ValueError:
         pass
+
+    if _dns_resolver is None and _in_running_event_loop():
+        if require_dns:
+            raise RuntimeError(
+                "validate_url_sync cannot perform blocking DNS/DoH on a running event loop; "
+                "use validate_url_async instead"
+            )
+        return normalized
 
     try:
         ips = resolve_host_ips(host)
@@ -670,14 +718,40 @@ def _origin_tuple(url: str) -> tuple[str, str, int]:
 class _CheckedResolver(aiohttp.abc.AbstractResolver):
     """Validate the addresses actually supplied to the connector (single DNS lookup per hop)."""
 
-    def __init__(self, allow_private: bool = False):
+    def __init__(
+        self, allow_private: bool = False, *, allowed_proxy_host: str | None = None
+    ):
         self.allow_private = allow_private
+        self.allowed_proxy_host = (
+            (allowed_proxy_host or "").strip().rstrip(".").lower() or None
+        )
 
     async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
-        try:
-            ips = await async_resolve_host_ips(host)
-        except socket.gaierror as exc:
-            raise SSRFBlockedError(f"域名无法解析：{host}") from exc
+        norm_host = (host or "").strip().rstrip(".").lower()
+        is_explicit_proxy = bool(
+            self.allowed_proxy_host and norm_host == self.allowed_proxy_host
+        )
+        effective_allow_private = True if is_explicit_proxy else self.allow_private
+
+        ips: list[str]
+        if is_explicit_proxy:
+            try:
+                ip_literal = ipaddress.ip_address(norm_host.strip("[]"))
+            except ValueError:
+                ip_literal = None
+            if ip_literal is not None:
+                ips = [str(ip_literal)]
+            else:
+                try:
+                    ips = await async_resolve_host_ips(host)
+                except socket.gaierror as exc:
+                    raise SSRFBlockedError(f"代理域名无法解析：{host}") from exc
+        else:
+            try:
+                ips = await async_resolve_host_ips(host)
+            except socket.gaierror as exc:
+                raise SSRFBlockedError(f"域名无法解析：{host}") from exc
+
         if not ips:
             raise SSRFBlockedError(f"域名解析结果为空：{host}")
         records = []
@@ -686,7 +760,7 @@ class _CheckedResolver(aiohttp.abc.AbstractResolver):
                 ip_obj = ipaddress.ip_address(addr)
             except ValueError as exc:
                 raise SSRFBlockedError(f"域名解析返回异常地址：{addr}") from exc
-            _check_ip_address(ip_obj, allow_private=self.allow_private)
+            _check_ip_address(ip_obj, allow_private=effective_allow_private)
             ip_family = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
             if family not in (socket.AF_UNSPEC, ip_family):
                 continue
@@ -740,8 +814,10 @@ async def _aiohttp_single_get(
             return HttpResponse(
                 status=resp.status, body=bytes(buf), headers=resp_headers, url=url
             )
+    proxy_host = _extract_proxy_host(proxy)
     connector = aiohttp.TCPConnector(
-        resolver=_CheckedResolver(allow_private), use_dns_cache=False
+        resolver=_CheckedResolver(allow_private, allowed_proxy_host=proxy_host),
+        use_dns_cache=False,
     )
     async with aiohttp.ClientSession(
         timeout=client_timeout, connector=connector, trust_env=False
@@ -800,12 +876,16 @@ async def safe_http_get(
         req_headers["If-Modified-Since"] = str(last_modified).strip()
 
     effective_proxy = _resolve_proxy_url(proxy) if _http_transport is None else None
+    proxy_host = _extract_proxy_host(effective_proxy)
     all_secrets = list(secrets_to_redact)
     if effective_proxy:
         all_secrets.append(effective_proxy)
 
     async def _prepare_hop_url(raw_hop_url: str) -> str:
-        if _http_transport is not None:
+        if _http_transport is not None or effective_proxy is not None:
+            # In explicit proxy mode aiohttp connects to the proxy host rather than
+            # resolving the target via _CheckedResolver, so validate every target hop
+            # asynchronously (scheme/host/DNS/private/metadata) before forwarding.
             return await validate_url_async(
                 raw_hop_url, allow_private=allow_private, require_dns=True
             )
@@ -821,19 +901,26 @@ async def safe_http_get(
     active_session: aiohttp.ClientSession | None = None
     if _http_transport is None:
         pool = _SHARED_HTTP_SESSIONS.get()
+        session_key = (bool(allow_private), proxy_host or "")
         if pool is not None:
-            active_session = pool.get(allow_private)
+            active_session = pool.get(session_key)
             if active_session is None or active_session.closed:
                 connector = aiohttp.TCPConnector(
-                    resolver=_CheckedResolver(allow_private), use_dns_cache=False
+                    resolver=_CheckedResolver(
+                        allow_private, allowed_proxy_host=proxy_host
+                    ),
+                    use_dns_cache=False,
                 )
                 active_session = aiohttp.ClientSession(
                     connector=connector, trust_env=False
                 )
-                pool[allow_private] = active_session
+                pool[session_key] = active_session
         else:
             connector = aiohttp.TCPConnector(
-                resolver=_CheckedResolver(allow_private), use_dns_cache=False
+                resolver=_CheckedResolver(
+                    allow_private, allowed_proxy_host=proxy_host
+                ),
+                use_dns_cache=False,
             )
             local_session = aiohttp.ClientSession(
                 connector=connector, trust_env=False
