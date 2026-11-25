@@ -13,7 +13,7 @@ ensure_current(
         ("core.runtime", "EngineLifecycle", "proactive_scope"),
         ("core.world_bridge", "WorldBridge", "_group_wake_scope_v2"),
     ],
-    version="0.2.0-rc.8",
+    version="0.2.0-rc.9",
 )
 
 import asyncio

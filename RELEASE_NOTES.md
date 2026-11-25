@@ -1,4 +1,11 @@
-# astrbot_plugin_dynamics_horizons v0.2.0-rc.8
+# astrbot_plugin_dynamics_horizons v0.2.0-rc.9
+
+## v0.2.0-rc.9 — 2026-11-25
+
+- 安全加固（Batch 1）：收紧作用域边界、加固 SSRF 与 Playwright URL 校验并接入统一管理鉴权。
+- 数据与存储修复（Batch 2）：消除线程局部 SQLite 连接泄漏、修复数据保留期清理并加固存储层。
+- 性能与运行时优化（Batch 3）：将热点路径 I/O 移出主事件循环、恢复审查证据链并加固运行时稳定性。
+- 工程与发布治理（Batch 4）：热重载时同步重载 `series_panels`，加固打包与 CI 检查并同步系列共享资产。
 
 ## v0.2.0-rc.8 — 2026-11-24
 
