@@ -65,7 +65,7 @@ def _get_remote_ebook_cache_dir() -> Path:
 
 
 def _ebook_cache_key(url: str, *, auth_tag: str = "") -> str:
-    return hashlib.sha256(f"{url}\n{auth_tag}".encode("utf-8")).hexdigest()[:32]
+    return hashlib.sha256(f"{url}\n{auth_tag}".encode()).hexdigest()[:32]
 
 
 def _read_remote_ebook_cache(key: str) -> tuple[bytes, str] | None:

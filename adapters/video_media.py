@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+
 from astrbot.api import logger
 
 from . import ssrf as ssrf_mod
