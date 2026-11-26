@@ -19,9 +19,17 @@ from .sanitize import contains_raw_url, sanitize_citation, strip_raw_urls
 
 _STATUS_INQUIRY_RE = re.compile(
     r"(?:"
-    r"(?:最近|这两天|近来|平时|空闲|闲着|今天|晚上)[^\n。！？!?]{0,8}(?:在看什么|看什么|读什么|刷什么|刷到什么|看啥|读啥|忙什么|忙啥|关注什么|追什么|有什么好玩|有什么有意思)"
-    r"|(?:在看什么书|看什么书|读什么书|在读什么|刷到什么(?:视频|好玩的|有意思的)?|有什么推荐的(?:书|小说|视频|文章|读物))"
+    r"(?:最近|这两天|近来|平时|空闲|闲着|今天|晚上)[^\n。！？!?]{0,8}"
+    r"(?:在看什么|看什么|读什么|刷什么|刷到什么|看到什么|看啥|读啥|忙什么|忙啥|关注什么|追什么|在追什么|聊什么|聊啥|想聊什么|想聊啥"
+    r"|(?<![没不别])有(?:没有)?(?:什么|啥)(?:好玩|有意思|有趣|新鲜|值得聊|可聊|想聊|话题|见闻))"
+    r"|(?:在看什么书|看什么书|读什么书|在读什么|刷到什么(?:视频|好玩的|有意思的|有趣的)?"
+    r"|(?<![没不别])有(?:没有)?(?:什么|啥)推荐的(?:书|小说|视频|文章|读物|话题)"
+    r"|推荐(?:点|些|个|几个)?(?:有意思|有趣|好玩)的?(?:话题|书|视频|文章))"
+    r"|(?:(?:(?<![没不别])有(?:没有)?(?:什么|啥)|找(?:个|点)?|聊(?:点|个|聊)?(?:什么|啥)?|说说|分享(?:点|个|下)?)[^\n。！？!?]{0,6}"
+    r"(?:(?:好玩|有意思|有趣|新鲜|值得聊|可聊|想聊|新)的?(?:话题|见闻|事儿?|新鲜事)|话题(?:吗|呀|啊|呢|聊|可以聊|能聊|推荐)))"
+    r"|(?:(?<![没不别])有(?:没有)?(?:什么|啥)(?:好玩|有意思|有趣|值得聊|想聊)的(?:可以聊|能聊|聊|分享))"
     r"|what\s+have\s+you\s+been\s+(?:reading|watching)"
+    r"|any\s+interesting\s+topics?"
     r")",
     re.IGNORECASE,
 )
@@ -429,19 +437,20 @@ class ProjectionCache:
             if str(q.get("topic") or "").casefold() not in recently_discussed_topics
         ]
 
-        # 1. Check Status-Inquiry Cues (e.g. "最近在看什么", "看什么书", "刷到什么", "最近忙啥")
+        # 1. Check Status-Inquiry / Topic-Inquiry Cues
+        # (e.g. "最近在看什么", "最近有什么有趣的话题吗", "有什么有意思的话题", "看什么书", "刷到什么")
         if _STATUS_INQUIRY_RE.search(q_str):
-            if not interests and not logs and not books:
+            if not interests and not logs and not books and not eligible_questions:
                 return _empty_result("empty_state")
             chosen_interests = interests[:2]
             chosen_logs = logs[:2]
-            chosen_q = eligible_questions[0] if eligible_questions else None
+            chosen_qs = self._select_diverse_questions(eligible_questions, limit=3)
             return self._pack_projection(
                 match_reason="status_inquiry",
                 interests=chosen_interests,
                 logs=chosen_logs,
                 books=books[:1],
-                question=chosen_q,
+                questions=chosen_qs,
             )
 
         # 2. Topic / Keyword Matching
@@ -585,6 +594,306 @@ class ProjectionCache:
             question=chosen_q,
         )
 
+    @staticmethod
+    def _select_diverse_questions(
+        eligible_questions: list[dict[str, Any]], *, limit: int = 3
+    ) -> list[dict[str, Any]]:
+        """Pick up to `limit` questions, preferring distinct topics first."""
+        cap = max(1, int(limit))
+        picked: list[dict[str, Any]] = []
+        seen_topics: set[str] = set()
+        overflow: list[dict[str, Any]] = []
+        for q in eligible_questions:
+            topic_key = str(q.get("topic") or "").strip().casefold()
+            if topic_key and topic_key in seen_topics:
+                overflow.append(q)
+                continue
+            if topic_key:
+                seen_topics.add(topic_key)
+            picked.append(q)
+            if len(picked) >= cap:
+                return picked
+        for q in overflow:
+            picked.append(q)
+            if len(picked) >= cap:
+                break
+        return picked
+
+    def query_for_tool(
+        self,
+        *,
+        enabled: bool,
+        ready: bool,
+        allowed_sessions: list[str] | None,
+        scope: str | dict[str, Any],
+        persona: str = "",
+        member: str = "",
+        kind: str = "questions",
+        query: str = "",
+        limit: int = 5,
+        character_scope: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Read-only, URL-free lookup for the `query_horizons_topics` LLM tool."""
+        if not enabled or not ready:
+            return {"available": False, "reason": "disabled"}
+
+        if isinstance(scope, dict):
+            umo = str(scope.get("umo") or "").strip()
+            if character_scope is None and scope.get("persona_id"):
+                character_scope = scope
+        else:
+            umo = str(scope or "").strip()
+        if not umo:
+            return {"available": False, "reason": "missing_scope"}
+
+        whitelist = [
+            str(s).strip() for s in (allowed_sessions or []) if str(s or "").strip()
+        ]
+        if whitelist and umo not in whitelist:
+            return {"available": False, "reason": "scope_not_allowed"}
+
+        ident = self.resolve_identity(
+            umo=umo, persona=persona, character_scope=character_scope
+        )
+        if not ident:
+            return {"available": False, "reason": "no_identity"}
+
+        bucket = (self._snapshot.get("by_identity") or {}).get(ident)
+        if not bucket:
+            return {
+                "available": True,
+                "fact_kind": "external_media",
+                "questions": [],
+                "interests": [],
+                "readings": [],
+                "reason": "empty_state",
+            }
+
+        stamp = float(now if now is not None else time.time())
+        clean_kind = str(kind or "questions").strip().lower()
+        if clean_kind not in {"questions", "topics", "readings"}:
+            clean_kind = "questions"
+        try:
+            lim = max(1, min(8, int(limit)))
+        except (TypeError, ValueError):
+            lim = 5
+        q_str = str(query or "").strip()
+        q_lower = q_str.casefold()
+
+        for blocked in bucket.get("blocked") or []:
+            if blocked and q_lower and blocked in q_lower:
+                return {"available": False, "reason": "blocked_topic"}
+
+        suppressed = {
+            r["log_id"]
+            for r in bucket.get("corrections", [])
+            if r["umo"] == umo and r["member_id"] == member
+        }
+        blocked_member_topics = {
+            r["topic"]
+            for r in bucket.get("member_topics", [])
+            if r["umo"] == umo and r["member_id"] == member
+        }
+        blocked_member_lower = {
+            str(t).strip().casefold() for t in blocked_member_topics if str(t).strip()
+        }
+        if q_lower and any(bt in q_lower for bt in blocked_member_lower):
+            return {"available": False, "reason": "blocked_topic"}
+
+        interests = [
+            i
+            for i in (bucket.get("interests") or [])
+            if i.get("status") == "active"
+            and float(i.get("expires_at", 0)) > stamp
+            and i["topic"] not in blocked_member_topics
+            and not suppressed.intersection(i.get("evidence_log_ids", []))
+        ]
+        logs = [
+            row for row in (bucket.get("logs") or []) if row["log_id"] not in suppressed
+        ]
+        log_title_by_id = {
+            row["log_id"]: strip_raw_urls(
+                sanitize_citation(row.get("citation")).get("title", "")
+            )[:60]
+            for row in logs
+        }
+
+        recently_discussed_topics: set[str] = set()
+        eligible_questions: list[dict[str, Any]] = []
+        for q in bucket.get("questions") or []:
+            if q.get("log_id") in suppressed or q.get("topic") in blocked_member_topics:
+                continue
+            if float(q.get("expires_at", 0)) <= stamp:
+                continue
+            discussed_map = q.get("discussed_umos") or {}
+            if umo in discussed_map:
+                if stamp - float(discussed_map[umo]) < 14400.0 and q.get("topic"):
+                    recently_discussed_topics.add(str(q["topic"]).casefold())
+                continue
+            eligible_questions.append(q)
+        eligible_questions = [
+            q
+            for q in eligible_questions
+            if str(q.get("topic") or "").casefold() not in recently_discussed_topics
+        ]
+
+        q_strong, q_bi = _extract_features(q_str) if q_str else (set(), set())
+
+        def _score_match(primary: str, body: str) -> float:
+            if not q_str:
+                return 1.0
+            p_low = str(primary or "").strip().casefold()
+            b_low = str(body or "").strip().casefold()
+            score = 0.0
+            if len(q_lower) >= 2 and (q_lower in p_low or q_lower in b_low):
+                score += 5.0
+            if (
+                len(p_low) >= 2
+                and p_low not in _CJK_STOPWORDS
+                and p_low not in _LATIN_STOPWORDS
+                and p_low in q_lower
+            ):
+                score += 4.0
+            t_strong, t_bi = _extract_features(f"{primary} {body}")
+            if q_strong & t_strong:
+                score += 2.6 + 0.6 * min(3, len(q_strong & t_strong) - 1)
+            if len(q_bi & t_bi) >= 2:
+                score += 2.2
+            elif len(q_bi & t_bi) == 1 and p_low and any(bg in p_low for bg in (q_bi & t_bi)):
+                score += 2.0
+            return score
+
+        matched_by = "recent"
+        if q_str:
+            scored_q = [
+                (s, q)
+                for q in eligible_questions
+                if (s := _score_match(q.get("topic", ""), q.get("question", ""))) >= 2.0
+            ]
+            scored_q.sort(key=lambda x: -x[0])
+            scored_i = [
+                (s, i)
+                for i in interests
+                if (s := _score_match(i.get("topic", ""), i.get("summary", ""))) >= 2.0
+            ]
+            scored_i.sort(key=lambda x: -x[0])
+            scored_l = [
+                (s, row)
+                for row in logs
+                if (
+                    s := _score_match(
+                        f"{row.get('citation', {}).get('title', '')} {row.get('citation', {}).get('creator', '')}",
+                        f"{row.get('digest', '')} {row.get('reflection', '')}",
+                    )
+                )
+                >= 2.0
+            ]
+            scored_l.sort(key=lambda x: -x[0])
+            if scored_q or scored_i or scored_l:
+                matched_by = "query"
+                sel_questions = [x[1] for x in scored_q[:lim]]
+                sel_interests = [x[1] for x in scored_i[: min(3, lim)]]
+                sel_logs = [x[1] for x in scored_l[: min(3, lim)]]
+            else:
+                matched_by = "recent_fallback"
+                sel_questions = self._select_diverse_questions(
+                    eligible_questions, limit=min(3, lim)
+                )
+                sel_interests = interests[: min(2, lim)]
+                sel_logs = logs[: min(2, lim)]
+        else:
+            sel_questions = self._select_diverse_questions(eligible_questions, limit=lim)
+            sel_interests = interests[: min(3, lim)]
+            sel_logs = logs[: min(lim if clean_kind == "readings" else 3, lim)]
+
+        out_questions: list[dict[str, str]] = []
+        out_interests: list[dict[str, Any]] = []
+        out_readings: list[dict[str, Any]] = []
+        offer_qids: list[str] = []
+        offer_log_ids: list[str] = []
+        offer_topics: list[str] = []
+
+        if clean_kind in {"questions", "topics"}:
+            for q in sel_questions[:lim]:
+                qt = strip_raw_urls(q.get("topic", ""))[:40]
+                qq = strip_raw_urls(q.get("question", ""))[:120]
+                qid = str(q.get("question_id") or "")[:128]
+                lid = str(q.get("log_id") or "")[:128]
+                item: dict[str, str] = {
+                    "question_id": qid,
+                    "topic": qt,
+                    "question": qq,
+                }
+                src_title = log_title_by_id.get(lid, "")
+                if src_title:
+                    item["source_title"] = src_title
+                out_questions.append(item)
+                if qid and qid not in offer_qids:
+                    offer_qids.append(qid)
+                if lid and lid.startswith("log_") and lid not in offer_log_ids:
+                    offer_log_ids.append(lid)
+                if qt and qt not in offer_topics:
+                    offer_topics.append(qt)
+
+        if clean_kind in {"questions", "topics"}:
+            i_cap = 2 if clean_kind == "questions" else min(3, lim)
+            for i in sel_interests[:i_cap]:
+                t = strip_raw_urls(i.get("topic", ""))[:40]
+                out_interests.append(
+                    {
+                        "topic": t,
+                        "summary": strip_raw_urls(i.get("summary", ""))[:120],
+                    }
+                )
+                if t and t not in offer_topics:
+                    offer_topics.append(t)
+
+        if clean_kind in {"topics", "readings"} or (
+            clean_kind == "questions" and not out_questions
+        ):
+            r_cap = lim if clean_kind == "readings" else min(3, lim)
+            for r in sel_logs[:r_cap]:
+                cit = sanitize_citation(r.get("citation"))
+                lid = str(r.get("log_id") or "")[:128]
+                out_readings.append(
+                    {
+                        "log_id": lid,
+                        "source_kind": str(r.get("source_kind") or ""),
+                        "citation": cit,
+                        "digest": strip_raw_urls(r.get("digest", ""))[:140],
+                        "reflection": strip_raw_urls(r.get("reflection", ""))[:110],
+                    }
+                )
+                if lid and lid.startswith("log_") and lid not in offer_log_ids:
+                    offer_log_ids.append(lid)
+                title = cit.get("title", "")[:40]
+                if title and title not in offer_topics:
+                    offer_topics.append(title)
+
+        payload: dict[str, Any] = {
+            "available": True,
+            "fact_kind": "external_media",
+            "kind": clean_kind,
+            "matched_by": matched_by,
+            "policy": (
+                "这是角色在群间见闻里积累的外部见闻与待讨论问题库。"
+                "群友问最近有什么有趣或有意思的话题时，可从中自然挑 1-2 个用角色自己的话展开，不必照念清单。"
+                "转述作品内容时交代来自外部作品，不编造出处，不发裸链接。"
+            ),
+            "questions": out_questions,
+            "interests": out_interests,
+            "readings": out_readings,
+            "_offer": {
+                "question_ids": offer_qids[:8],
+                "log_ids": offer_log_ids[:4],
+                "topics": offer_topics[:12],
+            },
+        }
+        if contains_raw_url(payload):
+            return {"available": False, "reason": "url_guard_blocked"}
+        return payload
+
     def _pack_projection(
         self,
         *,
@@ -592,7 +901,8 @@ class ProjectionCache:
         interests: list[dict[str, Any]],
         logs: list[dict[str, Any]],
         books: list[dict[str, Any]],
-        question: dict[str, Any] | None,
+        question: dict[str, Any] | None = None,
+        questions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         versions: list[str] = []
         topics: list[str] = []
@@ -665,23 +975,29 @@ class ProjectionCache:
 
         proj_questions: list[dict[str, str]] = []
         q_slot: dict[str, str] | None = None
-        if question is not None:
-            qt = strip_raw_urls(question["topic"])[:36]
-            qq = strip_raw_urls(question["question"])[:100]
+        raw_questions: list[dict[str, Any]] = []
+        if questions:
+            raw_questions.extend(q for q in questions if isinstance(q, dict))
+        elif question is not None:
+            raw_questions.append(question)
+        for q_item in raw_questions[:3]:
+            qt = strip_raw_urls(q_item["topic"])[:36]
+            qq = strip_raw_urls(q_item["question"])[:100]
             if qt and qt not in topics:
                 topics.append(qt)
             q_obj = {
-                "question_id": question["question_id"],
+                "question_id": q_item["question_id"],
                 "topic": qt,
                 "question": qq,
             }
             proj_questions.append(q_obj)
-            q_slot = {
-                "question_id": question["question_id"],
-                "topic": qt[:28],
-                "question": qq[:80],
-            }
-            versions.append(f"question:{question['question_id']}")
+            if q_slot is None:
+                q_slot = {
+                    "question_id": q_item["question_id"],
+                    "topic": qt[:28],
+                    "question": qq[:80],
+                }
+            versions.append(f"question:{q_item['question_id']}")
 
         if not topics and proj_readings:
             t_fallback = proj_readings[0]["citation"]["title"][:32]
@@ -715,7 +1031,8 @@ class ProjectionCache:
             "fact_kind": "external_media",
             "match_reason": match_reason,
             "policy": (
-                "见闻感悟供参考。契合时可用角色自己的话融入一个想法，无需汇报看过什么或接着提问。"
+                "见闻感悟供参考。契合时可用角色自己的话融入一个想法，平时无需汇报看过什么或强行追问；"
+                "若对方主动问最近有什么有趣或有意思的话题，可直接从 questions 或见闻里自然挑一个展开。"
                 "转述作品内容时交代其来自作品。摘要和感悟不能作原句引用，笔记里的想象不算亲历。"
                 "群友回应与交流后记是特定会话中的参考，不能当作事实或自动变成固定人设。"
                 "有人问阅读或出处时按记录答，不发裸链接。"
@@ -794,6 +1111,13 @@ def _fit_reply_projection(proj: dict[str, Any]) -> dict[str, Any]:
         return out
     if len(out.get("readings", [])) > 1:
         out["readings"] = out["readings"][:1]
+    if _serialized_len(out) <= REPLY_PROJECTION_MAX_CHARS:
+        return out
+    if len(out.get("questions", [])) > 1:
+        out["questions"] = out["questions"][:1]
+        out["question_ids"] = [
+            q["question_id"] for q in out["questions"] if isinstance(q, dict) and q.get("question_id")
+        ]
     if _serialized_len(out) <= REPLY_PROJECTION_MAX_CHARS:
         return out
     if len(out.get("interests", [])) > 1:

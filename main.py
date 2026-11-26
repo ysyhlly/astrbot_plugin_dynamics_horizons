@@ -10,25 +10,28 @@ ensure_current(
     checks=[
         ("core.engine", "HorizonsEngine", "_horizons_contract_v1"),
         ("core.engine", "HorizonsEngine", "_video_vision_v1"),
+        ("core.projection", "ProjectionCache", "query_for_tool"),
         ("core.runtime", "EngineLifecycle", "proactive_scope"),
         ("core.world_bridge", "WorldBridge", "_group_wake_scope_v2"),
     ],
-    version="0.2.0-rc.9",
+    version="0.2.0",
 )
 
 import asyncio
 import base64
 import hashlib
-from importlib import import_module, reload
 import inspect
 import os
 from datetime import datetime
+from importlib import import_module, reload
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
+from . import series_panels as _series_panels_mod
 from .adapters.video_media import cleanup_stale_temp_dirs
 from .core.contract import (
     PLUGIN_ID,
@@ -46,7 +49,6 @@ from .core.io import run_io
 from .core.projection import _empty_result
 from .core.store import HorizonsStore
 from .core.web_api import HorizonsWebAPI
-from . import series_panels as _series_panels_mod
 from .series_panels import (
     find_provider_silently,
     get_series_defaults,
@@ -519,6 +521,7 @@ class Main(Star):
                 "outreach_all_managed_v1",
                 "review_evidence_v2",
                 "video_vision_v1",
+                "topic_query_tool_v1",
             ],
         }
 
@@ -1093,6 +1096,135 @@ class Main(Star):
             character_scope=character_scope,
             now=self.engine.clock(),
         )
+
+    # ------------------------------------------------------------------
+    # LLM Tool (Active Read-Only Query for Horizons Questions & Topics)
+    # ------------------------------------------------------------------
+
+    async def _resolve_event_character_scope(
+        self, event: AstrMessageEvent, umo: str
+    ) -> tuple[dict[str, str] | None, str]:
+        """Resolve `(character_scope, identity)` strictly for the current event UMO."""
+        eng = self.engine
+        if eng is None or not umo:
+            return None, ""
+        world = eng.world_bridge.find_world_plugin()
+        if world is not None:
+            getter = getattr(world, "get_character_context", None)
+            if callable(getter):
+                platform = umo.rsplit(":", 2)[0] if ":" in umo else ""
+                scope_req = {"umo": umo, "platform": platform}
+                try:
+                    res = (
+                        getter(scope_req, event)
+                        if len(inspect.signature(getter).parameters) >= 2
+                        else getter(scope_req)
+                    )
+                    if inspect.isawaitable(res):
+                        res = await asyncio.wait_for(res, timeout=3.0)
+                    if isinstance(res, dict) and res.get("available") and not res.get("disabled"):
+                        c_scope = res.get("scope") if isinstance(res.get("scope"), dict) else {}
+                        pid = str(c_scope.get("persona_id") or res.get("persona_id") or "").strip()
+                        inst = str(c_scope.get("instance_id") or res.get("instance_id") or pid).strip()
+                        scope_umo = str(c_scope.get("umo") or umo).strip()
+                        if pid and scope_umo == umo:
+                            ident = make_identity(pid, inst)
+                            eng.projection.bind_umo_identity(umo, ident)
+                            return (
+                                {
+                                    "platform": str(c_scope.get("platform") or platform),
+                                    "umo": umo,
+                                    "persona_id": pid,
+                                    "instance_id": inst,
+                                },
+                                ident,
+                            )
+                except Exception:
+                    pass
+        ident = self._resolve_scope_identity_readonly(scope=umo)
+        if ident:
+            pid, inst = unpack_identity(ident)
+            return (
+                {
+                    "platform": umo.rsplit(":", 2)[0] if ":" in umo else "",
+                    "umo": umo,
+                    "persona_id": pid,
+                    "instance_id": inst,
+                },
+                ident,
+            )
+        return None, ""
+
+    @filter.llm_tool(name="query_horizons_topics")
+    async def query_horizons_topics(
+        self,
+        event: AstrMessageEvent,
+        kind: str = "questions",
+        query: str = "",
+        limit: int = 5,
+    ) -> str:
+        """查询角色在「群间见闻」中积累的待讨论问题库、近期兴趣话题与阅读/观看见闻笔记。当群友询问「最近有什么有趣/有意思的话题」「最近在看什么/读什么」「有什么想聊的」或想找话题聊时主动调用。
+
+        Args:
+            kind(str): 查询类型：questions 优先查未讨论的问题库（默认），topics 综合查问题库与近期兴趣/见闻，readings 仅查近期阅读/观看记录。
+            query(str): 可选。按关键词筛选相关话题或问题；留空返回最新的待讨论问题与近期见闻。
+            limit(int): 可选。最多返回条数（1-8，默认 5）。
+        """
+        if (
+            self.closed
+            or not self.ready
+            or self.engine is None
+            or not bool(self.config.get("enabled", True))
+        ):
+            return encode_json({"available": False, "reason": "群间见闻尚未就绪或已停用"})
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not umo:
+            return encode_json({"available": False, "reason": "missing_scope"})
+        if is_series_group_excluded(self.context, umo=umo):
+            return encode_json({"available": False, "reason": "excluded_by_core"})
+        eng = self.engine
+        if eng.sessions and umo not in eng.sessions:
+            return encode_json({"available": False, "reason": "scope_not_allowed"})
+        sender_fn = getattr(event, "get_sender_id", None)
+        member = str(sender_fn() or "").strip() if callable(sender_fn) else ""
+        char_scope, ident = await self._resolve_event_character_scope(event, umo)
+        if not ident:
+            return encode_json({"available": False, "reason": "no_identity"})
+        result = eng.projection.query_for_tool(
+            enabled=bool(self.config.get("enabled", True)),
+            ready=bool(self.ready and not self.closed),
+            allowed_sessions=eng.sessions,
+            scope=umo,
+            persona=ident,
+            member=member,
+            kind=kind,
+            query=query,
+            limit=limit,
+            character_scope=char_scope,
+            now=eng.clock(),
+        )
+        offer = result.pop("_offer", None)
+        if isinstance(offer, dict) and result.get("available"):
+            try:
+                existing = getattr(event, "_horizons_tool_context_v1", None)
+                merged = (
+                    {
+                        "question_ids": list(existing.get("question_ids", ())),
+                        "log_ids": list(existing.get("log_ids", ())),
+                        "topics": list(existing.get("topics", ())),
+                    }
+                    if isinstance(existing, dict)
+                    else {"question_ids": [], "log_ids": [], "topics": []}
+                )
+                for key, cap in (("question_ids", 8), ("log_ids", 4), ("topics", 12)):
+                    for val in offer.get(key, ()) or ():
+                        s = str(val or "").strip()
+                        if s and s not in merged[key] and len(merged[key]) < cap:
+                            merged[key].append(s)
+                setattr(event, "_horizons_tool_context_v1", merged)
+            except Exception:
+                pass
+        return encode_json(result)
 
     # ------------------------------------------------------------------
     # Turn Feedback & Per-UMO Question Consumption

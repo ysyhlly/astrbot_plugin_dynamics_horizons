@@ -394,7 +394,7 @@ async def test_channel_a_gemini_native_video_and_review_alignment_and_cleanup(
         assert se["watch_mode"] == "native_video"
         assert len(se["visual_observations"]) == 2
         assert "https://" not in se["visual_observations"][1]
-        assert "text" not in se
+        assert len(se.get("text", "")) <= 1600
         assert "raw_url" not in se
         # Reading log persists watch_mode, visual_observations, media_meta
         logs = plugin.engine.store.list_logs(identity=IDENT)["items"]

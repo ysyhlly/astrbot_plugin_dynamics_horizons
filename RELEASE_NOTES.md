@@ -1,4 +1,9 @@
-# astrbot_plugin_dynamics_horizons v0.2.0-rc.9
+# astrbot_plugin_dynamics_horizons v0.2.0
+
+## v0.2.0 — 2026-11-26
+
+- **正式版发布（GA）**：整合全部 `v0.2.0-rc.x` 安全/SSRF 校验、SQLite 连接泄漏修复、热点 I/O 异步化及热重载治理。
+- **话题询问匹配与 `query_horizons_topics` 工具**：新增自然话题询问投影匹配与 LLM 主动查询见闻话题工具，支持群聊对话中自然检索近期见闻。
 
 ## v0.2.0-rc.9 — 2026-11-25
 
