@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
+
 from astrbot.api import logger
 
 try:
