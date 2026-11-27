@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from html.parser import HTMLParser
 from typing import Any
 
@@ -305,8 +306,10 @@ async def build_manual_candidate(
     text: str = "",
     url: str = "",
     timeout: float = 20.0,
+    shared_cookie: str = "",
+    fallback_cookies: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Create a `NormalizedCandidate` from pasted clipping text and/or a public article URL."""
+    """Create a `NormalizedCandidate` from pasted clipping text, a single Bilibili video URL, or a public article URL."""
     clean_url = (
         await validate_url_async(url, allow_private=False, require_dns=False)
         if str(url or "").strip()
@@ -319,6 +322,19 @@ async def build_manual_candidate(
     origin = "manual_text"
 
     if clean_url and not body_text:
+        from .bilibili import fetch_bilibili_video_candidate, is_bilibili_video_url
+
+        if is_bilibili_video_url(clean_url):
+            return await fetch_bilibili_video_candidate(
+                clean_url,
+                source,
+                title=title,
+                creator=creator,
+                timeout=timeout,
+                shared_cookie=shared_cookie,
+                fallback_cookies=fallback_cookies,
+            )
+
         resp = await safe_http_get(
             clean_url,
             timeout=timeout,
@@ -328,16 +344,26 @@ async def build_manual_candidate(
                 "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5"
             },
         )
-        ctype = resp.header("content-type", "").lower()
-        raw_str = resp.text()
-        if "text/plain" in ctype and "<html" not in raw_str[:500].lower():
-            body_text = clean_external_text(raw_str, max_chars=4000)
-        else:
+
+        def _extract_response() -> tuple[str, str, str, str]:
+            ctype = resp.header("content-type", "").lower()
+            raw_str = resp.text()
+            if "text/plain" in ctype and "<html" not in raw_str[:500].lower():
+                return clean_external_text(raw_str, max_chars=4000), "", "", ""
             parsed = extract_article_from_html(raw_str, max_chars=4000)
-            body_text = parsed["text"]
-            extracted_title = parsed["title"]
-            extracted_creator = parsed["creator"]
-            extracted_summary = parsed["summary"]
+            return (
+                parsed["text"],
+                parsed["title"],
+                parsed["creator"],
+                parsed["summary"],
+            )
+
+        (
+            body_text,
+            extracted_title,
+            extracted_creator,
+            extracted_summary,
+        ) = await asyncio.to_thread(_extract_response)
         origin = "manual_url"
 
     if not body_text:
@@ -377,6 +403,7 @@ async def poll_manual_source(
     cursor: Mapping[str, Any] | None,
     *,
     timeout: float = 20.0,
+    shared_cookie: str = "",
 ) -> dict[str, Any]:
     cfg = validate_manual_config(
         source.get("config") if isinstance(source.get("config"), Mapping) else {}
@@ -391,6 +418,8 @@ async def poll_manual_source(
         }
 
     now = time.time()
+    from .bilibili import BilibiliRiskControlError
+
     try:
         item = await build_manual_candidate(
             source,
@@ -399,9 +428,17 @@ async def poll_manual_source(
             text=cfg.get("text", ""),
             url=cfg.get("url", ""),
             timeout=timeout,
+            shared_cookie=shared_cookie,
         )
     except SSRFBlockedError:
         raise
+    except BilibiliRiskControlError as exc:
+        return {
+            "items": [],
+            "next_cursor": cur,
+            "cooldown_until": now + exc.cooldown_seconds,
+            "status": f"risk_control_backoff: {redact_error_text(exc)}",
+        }
     except AdapterRateLimitError as exc:
         return {
             "items": [],
@@ -441,12 +478,54 @@ async def fetch_manual_content(
     candidate: Mapping[str, Any],
     *,
     timeout: float = 25.0,
+    shared_cookie: str = "",
+    fallback_cookies: Sequence[str] | None = None,
+    media_options: Mapping[str, Any] | None = None,
+    audio_transcriber: Callable[[str, int], Awaitable[str]] | None = None,
 ) -> dict[str, Any]:
+    meta = candidate.get("meta") if isinstance(candidate.get("meta"), Mapping) else {}
+    raw_url = str(
+        candidate.get("raw_url") or (source.get("config") or {}).get("url") or ""
+    ).strip()
+
+    from .bilibili import (
+        fetch_bilibili_content,
+        is_bilibili_video_url,
+        resolve_bilibili_video_url,
+    )
+
+    is_bili_clip = bool(
+        str(candidate.get("bvid") or "").strip()
+        or meta.get("bili_video_clip")
+        or meta.get("kind") == "video"
+        or (raw_url and is_bilibili_video_url(raw_url))
+    )
+    if is_bili_clip:
+        target_cand = dict(candidate)
+        if not target_cand.get("bvid") and raw_url and is_bilibili_video_url(raw_url):
+            resolved = await resolve_bilibili_video_url(raw_url, timeout=min(timeout, 15.0))
+            if resolved:
+                if resolved.get("bvid"):
+                    target_cand["bvid"] = resolved["bvid"]
+                if resolved.get("aid"):
+                    merged_meta = dict(meta)
+                    merged_meta.setdefault("aid", resolved["aid"])
+                    target_cand["meta"] = merged_meta
+                if resolved.get("canonical_url"):
+                    target_cand["raw_url"] = resolved["canonical_url"]
+        return await fetch_bilibili_content(
+            source,
+            target_cand,
+            timeout=timeout,
+            shared_cookie=shared_cookie,
+            fallback_cookies=fallback_cookies,
+            media_options=media_options,
+            audio_transcriber=audio_transcriber,
+        )
+
     existing = clean_external_text(candidate.get("full_text") or "", max_chars=4000)
     if existing:
-        origin = str(
-            (candidate.get("meta") or {}).get("content_origin") or "manual_text"
-        )
+        origin = str(meta.get("content_origin") or "manual_text")
         return {
             "full_text": existing,
             "content_origin": origin,
@@ -456,9 +535,6 @@ async def fetch_manual_content(
             "total_chapters": candidate.get("total_chapters"),
         }
 
-    raw_url = str(
-        candidate.get("raw_url") or (source.get("config") or {}).get("url") or ""
-    ).strip()
     if raw_url:
         rebuilt = await build_manual_candidate(
             source,
@@ -466,6 +542,8 @@ async def fetch_manual_content(
             creator=str(candidate.get("creator") or ""),
             url=raw_url,
             timeout=timeout,
+            shared_cookie=shared_cookie,
+            fallback_cookies=fallback_cookies,
         )
         return {
             "full_text": rebuilt["full_text"],

@@ -395,7 +395,11 @@ window.AstrBotPluginPage = {
     }
     if (route === 'reviews') {
       const filtered = params.state
-        ? st.reviews.filter(x => x.state === params.state)
+        ? (
+            params.state === 'pending_review' || params.state === 'pending'
+              ? st.reviews.filter(x => x.state === 'pending_review' || x.state === 'held')
+              : st.reviews.filter(x => x.state === params.state)
+          )
         : st.reviews;
       return {
         status: 'ok',
@@ -1005,6 +1009,89 @@ def test_v2_health_disclosure_half_life_bars_journal_chips_and_cmdk_deeplink(ser
         q_chip = page.locator("#logs-list .question-chip").first
         assert "待聊：" in q_chip.inner_text()
         assert "屋檐底下的斗拱" in q_chip.inner_text()
+
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        )
+        assert not page_errors and not console_errors
+        browser.close()
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_wave1_held_filter_review_risks_and_series_scope_persona_sync(server, width):
+    mock = make_mock_state()
+    id_a = '["rin","rin-main"]'
+    mock["overviews"][id_a]["stats"]["pending_reviews"] = 2
+    mock["overviews"][id_a]["stats"]["held_reviews"] = 1
+    mock["reviews"].append(
+        {
+            "proposal_id": "prop-held-1",
+            "state": "held",
+            "source_kind": "bilibili",
+            "title": "需人工复核的视频见闻",
+            "digest": "介绍某地冷门建筑修缮争议。",
+            "reflection": "感觉说法还有些存疑，先记下来再看看。",
+            "staged_interest": None,
+            "questions": [],
+            "review_verdict": "hold",
+            "review_reason": "观点存在边界疑点，建议管理员复核。",
+            "review_risks": [
+                "raw_url_detected",
+                "injection:zh_prompt_injection",
+                "blocked_topic:剧透",
+                "外部传闻未经核实",
+            ],
+            "created_at": 1763033000,
+        }
+    )
+
+    with playwright.sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": width, "height": 1000})
+        page_errors, console_errors = attach_error_guards(page)
+        page.add_init_script(
+            f"window.__mock = {json.dumps(mock, ensure_ascii=False)};\n"
+            + BRIDGE_INIT_SCRIPT
+        )
+        page.goto(server)
+
+        page.get_by_text("古建筑木构榫卯").first.wait_for()
+        # Badge includes held proposals
+        assert page.locator("#badge-reviews").inner_text().strip() == "2"
+        assert "含人工复核 1 项" in page.locator("#kpi-grid").inner_text()
+
+        # Switch to reviews tab: default pending_review view shows BOTH pending_review and held
+        page.locator('[data-tab="reviews"]').click()
+        rev_list = page.locator("#reviews-list")
+        rev_list.get_by_text("需人工复核的视频见闻").wait_for()
+        assert "古建筑彩画矿物颜料考" in rev_list.inner_text()
+        # Review risks rendered with Chinese labels & explanations
+        assert "裸链接风险" in rev_list.inner_text()
+        assert "中文越狱/改人设注入" in rev_list.inner_text()
+        assert "屏蔽话题：剧透" in rev_list.inner_text()
+        assert "外部传闻未经核实" in rev_list.inner_text()
+
+        # Click dedicated held filter
+        page.locator('#reviews-filter-group [data-review-state="held"]').click()
+        page.wait_for_function(
+            "window.__calls.some(c => c.route === 'reviews' && c.params?.state === 'held')"
+        )
+        assert "需人工复核的视频见闻" in rev_list.inner_text()
+        assert "古建筑彩画矿物颜料考" not in rev_list.inner_text()
+
+        # Switch back to overview and verify dynamics-scopechange + dynamics-personachange sync
+        page.locator('[data-tab="overview"]').click()
+        page.evaluate(
+            "window.dispatchEvent(new CustomEvent('dynamics-scopechange', { detail: { umo: 'napcat:GroupMessage:20002' } }))"
+        )
+        page.locator("#questions-list .pill.is-active-scope").wait_for()
+        assert "20002" in page.locator("#questions-list .pill.is-active-scope").inner_text()
+
+        page.evaluate(
+            "window.dispatchEvent(new CustomEvent('dynamics-personachange', { detail: { persona_id: 'alice' } }))"
+        )
+        page.get_by_text("熟睡休息中").wait_for()
+        assert page.locator("#persona-select").input_value() == '["alice","alice-fantasy"]'
 
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"

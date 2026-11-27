@@ -1612,15 +1612,17 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         page_size: int = 20,
     ) -> dict[str, Any]:
         norm = normalize_identity(identity) if identity else ""
-        mapped_state = "pending_review" if state == "pending" else state
+        clean_state = str(state or "").strip()
         where = "WHERE 1=1"
         params: list[Any] = []
         if norm:
             where += " AND identity=?"
             params.append(norm)
-        if mapped_state in PROPOSAL_STATES:
+        if clean_state in {"pending", "pending_review"}:
+            where += " AND state IN ('pending_review', 'held')"
+        elif clean_state in PROPOSAL_STATES:
             where += " AND state=?"
-            params.append(mapped_state)
+            params.append(clean_state)
         p = max(1, min(10000, int(page or 1)))
         ps = max(1, min(100, int(page_size or 20)))
         with self.lock:
@@ -3135,6 +3137,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 "active_interests": 0,
                 "pending_questions": 0,
                 "pending_reviews": 0,
+                "held_reviews": 0,
                 "recent_title": "",
             }
         id_clause = " AND identity=?" if norm else ""
@@ -3159,7 +3162,11 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 id_params,
             ).fetchone()[0]
             pending_reviews = self.db.execute(
-                f"SELECT COUNT(*) FROM proposals WHERE state='pending_review'{id_clause}",
+                f"SELECT COUNT(*) FROM proposals WHERE state IN ('pending_review', 'held'){id_clause}",
+                id_params,
+            ).fetchone()[0]
+            held_reviews = self.db.execute(
+                f"SELECT COUNT(*) FROM proposals WHERE state='held'{id_clause}",
                 id_params,
             ).fetchone()[0]
             pending_questions = self.db.execute(
@@ -3190,6 +3197,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             "active_interests": int(active_interests),
             "pending_questions": int(pending_questions),
             "pending_reviews": int(pending_reviews),
+            "held_reviews": int(held_reviews),
             "recent_title": recent_title,
         }
 

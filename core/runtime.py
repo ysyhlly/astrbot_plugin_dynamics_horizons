@@ -255,11 +255,16 @@ class EngineLifecycle:
     def outreach_allowed(self, umo: str) -> bool:
         scope = self.proactive_scope
         kind = chat_umo_kind(umo)
-        managed_sessions = self.sessions
+        session_checker = getattr(self, "is_session_allowed", None)
+        session_allowed = (
+            bool(session_checker(umo))
+            if callable(session_checker)
+            else (not self.sessions or umo in self.sessions)
+        )
         if (
             scope == "disabled"
             or not kind
-            or (managed_sessions and umo not in managed_sessions)
+            or not session_allowed
             or is_series_group_excluded(getattr(self, "context", None), umo=umo)
         ):
             return False

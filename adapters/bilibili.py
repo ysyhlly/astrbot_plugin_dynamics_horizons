@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from http.cookies import SimpleCookie
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from bilibili_api import (
     Credential,
@@ -31,6 +32,7 @@ from .ssrf import (
     is_masked_secret,
     normalize_candidate,
     redact_error_text,
+    resolve_safe_redirect_url,
     safe_http_get,
     validate_url_async,
 )
@@ -57,6 +59,317 @@ _BILI_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 _BVID_RE = re.compile(r"\b(BV[0-9A-Za-z]{10})\b")
+_AVID_RE = re.compile(r"(?<![0-9A-Za-z])av(\d{1,12})(?![0-9A-Za-z])", re.IGNORECASE)
+_BILI_VIDEO_HOSTS = frozenset({"bilibili.com", "www.bilibili.com", "m.bilibili.com"})
+_BILI_SHORT_HOSTS = frozenset({"b23.tv", "bili2233.cn"})
+
+
+def parse_bilibili_video_ref(raw: Any) -> dict[str, Any] | None:
+    """Parse a single Bilibili video URL (`bilibili.com/video/BV...`, `av...`, `b23.tv/...`) or bare BV/av ID."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+
+    # Bare BV / av identifier
+    if "://" not in text and "/" not in text:
+        m_bv = re.fullmatch(r"(BV[0-9A-Za-z]{10})", text)
+        if m_bv:
+            bvid = m_bv.group(1)
+            return {
+                "bvid": bvid,
+                "aid": None,
+                "page": 1,
+                "canonical_url": f"https://www.bilibili.com/video/{bvid}",
+                "short_url": "",
+                "needs_redirect": False,
+            }
+        m_av = re.fullmatch(r"av(\d{1,12})", text, re.IGNORECASE)
+        if m_av:
+            aid = int(m_av.group(1))
+            if aid > 0:
+                return {
+                    "bvid": "",
+                    "aid": aid,
+                    "page": 1,
+                    "canonical_url": f"https://www.bilibili.com/video/av{aid}",
+                    "short_url": "",
+                    "needs_redirect": False,
+                }
+        return None
+
+    try:
+        sp = urlsplit(text)
+    except ValueError:
+        return None
+    if (sp.scheme or "").lower() not in {"http", "https"}:
+        return None
+    host = (sp.hostname or "").strip().rstrip(".").lower()
+    path = sp.path or ""
+
+    page_num = 1
+    try:
+        p_vals = parse_qs(sp.query).get("p") or []
+        if p_vals and str(p_vals[0]).isdigit():
+            page_num = max(1, int(p_vals[0]))
+    except Exception:
+        page_num = 1
+
+    if host in _BILI_VIDEO_HOSTS:
+        if "/video/" not in path.lower():
+            return None
+        m_bv = _BVID_RE.search(path)
+        if m_bv:
+            bvid = m_bv.group(1)
+            return {
+                "bvid": bvid,
+                "aid": None,
+                "page": page_num,
+                "canonical_url": f"https://www.bilibili.com/video/{bvid}",
+                "short_url": "",
+                "needs_redirect": False,
+            }
+        m_av = _AVID_RE.search(path)
+        if m_av:
+            aid = int(m_av.group(1))
+            if aid > 0:
+                return {
+                    "bvid": "",
+                    "aid": aid,
+                    "page": page_num,
+                    "canonical_url": f"https://www.bilibili.com/video/av{aid}",
+                    "short_url": "",
+                    "needs_redirect": False,
+                }
+        return None
+
+    if host in _BILI_SHORT_HOSTS:
+        slug = path.strip("/")
+        if not slug:
+            return None
+        m_bv = _BVID_RE.search(slug)
+        if m_bv:
+            bvid = m_bv.group(1)
+            return {
+                "bvid": bvid,
+                "aid": None,
+                "page": page_num,
+                "canonical_url": f"https://www.bilibili.com/video/{bvid}",
+                "short_url": text,
+                "needs_redirect": False,
+            }
+        m_av = _AVID_RE.search(slug)
+        if m_av:
+            aid = int(m_av.group(1))
+            if aid > 0:
+                return {
+                    "bvid": "",
+                    "aid": aid,
+                    "page": page_num,
+                    "canonical_url": f"https://www.bilibili.com/video/av{aid}",
+                    "short_url": text,
+                    "needs_redirect": False,
+                }
+        return {
+            "bvid": "",
+            "aid": None,
+            "page": page_num,
+            "canonical_url": "",
+            "short_url": text,
+            "needs_redirect": True,
+        }
+
+    return None
+
+
+def is_bilibili_video_url(url: Any) -> bool:
+    """Return True if `url` points to a single Bilibili video (BV/av/b23.tv)."""
+    return parse_bilibili_video_ref(url) is not None
+
+
+async def resolve_bilibili_video_url(
+    url_or_ref: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any] | None:
+    """Resolve a Bilibili video URL (`bilibili.com/video/BV...`, `av...`, `b23.tv/...`) with strict SSRF checks."""
+    text = str(url_or_ref or "").strip()
+    ref = parse_bilibili_video_ref(text)
+    if ref is None:
+        return None
+
+    if "://" in text:
+        await validate_url_async(text, allow_private=False, require_dns=False)
+
+    if not ref["needs_redirect"]:
+        return ref
+
+    def _matched_video_hop(hop_url: str) -> bool:
+        parsed = parse_bilibili_video_ref(hop_url)
+        return bool(parsed and (parsed.get("bvid") or parsed.get("aid")))
+
+    final_url, resp = await resolve_safe_redirect_url(
+        text,
+        headers=_BILI_HEADERS,
+        timeout=timeout,
+        allow_private=False,
+        max_redirects=5,
+        stop_predicate=_matched_video_hop,
+    )
+    resolved = parse_bilibili_video_ref(final_url)
+    if resolved and (resolved.get("bvid") or resolved.get("aid")):
+        resolved["short_url"] = text
+        return resolved
+
+    if resp is not None:
+        body_snip = resp.text()[:65536]
+        m_url = re.search(
+            r"https?://(?:www\.|m\.)?bilibili\.com/video/(?:BV[0-9A-Za-z]{10}|av\d{1,12})",
+            body_snip,
+            re.IGNORECASE,
+        )
+        if m_url:
+            fallback_ref = parse_bilibili_video_ref(m_url.group(0))
+            if fallback_ref and (fallback_ref.get("bvid") or fallback_ref.get("aid")):
+                fallback_ref["short_url"] = text
+                return fallback_ref
+    return None
+
+
+async def fetch_bilibili_video_candidate(
+    url_or_ref: str,
+    source: Mapping[str, Any],
+    *,
+    title: str = "",
+    creator: str = "",
+    timeout: float = 20.0,
+    shared_cookie: str = "",
+    fallback_cookies: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Resolve a single Bilibili video URL and build a Stage-2-ready NormalizedCandidate."""
+    resolved = await resolve_bilibili_video_url(url_or_ref, timeout=timeout)
+    if resolved is None or (not resolved.get("bvid") and not resolved.get("aid")):
+        raise ValueError("未能从该 B 站链接解析出有效的视频 BV/av 号")
+
+    bvid = str(resolved.get("bvid") or "").strip()
+    aid = resolved.get("aid")
+    page_num = max(1, int(resolved.get("page") or 1))
+    cfg = source.get("config") if isinstance(source.get("config"), Mapping) else {}
+    cred, _cookie_header, secrets = _build_readonly_credential(
+        cfg, shared_cookie=shared_cookie, fallback_cookies=fallback_cookies
+    )
+
+    v = (
+        video.Video(bvid=bvid, credential=cred)
+        if bvid
+        else video.Video(aid=int(aid), credential=cred)
+    )
+    info: Mapping[str, Any] = {}
+    try:
+        raw_info = await _call_with_timeout(v.get_info(), timeout)
+        if isinstance(raw_info, Mapping):
+            info = raw_info
+    except SSRFBlockedError:
+        raise
+    except Exception as exc:
+        rc = _classify_bili_exception(exc, secrets)
+        if rc is not None:
+            raise BilibiliRiskControlError(
+                redact_error_text(rc, secrets),
+                code=rc.code,
+                cooldown_seconds=rc.cooldown_seconds,
+            ) from None
+        perm_reason = _classify_permanent_unavailable(exc)
+        if perm_reason:
+            raise ValueError(f"B站视频不可访问：{perm_reason}") from None
+        if not bvid:
+            raise ValueError(
+                f"无法获取 B站 av{aid} 视频信息：{redact_error_text(exc, secrets)}"
+            ) from None
+
+    if info.get("bvid"):
+        bvid = str(info["bvid"]).strip()
+    if info.get("aid"):
+        try:
+            aid = int(info["aid"])
+        except (TypeError, ValueError):
+            pass
+
+    cid = info.get("cid")
+    pages = info.get("pages") if isinstance(info.get("pages"), list) else []
+    if pages:
+        chosen_page = None
+        if page_num > 1 and page_num <= len(pages):
+            chosen_page = pages[page_num - 1]
+        elif not cid:
+            chosen_page = pages[0]
+        if isinstance(chosen_page, Mapping) and chosen_page.get("cid"):
+            cid = chosen_page.get("cid")
+
+    owner = info.get("owner") if isinstance(info.get("owner"), Mapping) else {}
+    info_title = str(info.get("title") or "").strip()
+    info_creator = str(owner.get("name") or "").strip()
+    up_mid = owner.get("mid")
+    desc = str(info.get("desc") or "").strip()
+    pubdate = info.get("pubdate") or info.get("ctime") or time.time()
+    duration_sec = _parse_duration_seconds(info.get("duration"))
+
+    meta: dict[str, Any] = {
+        "kind": "video",
+        "content_origin": "bilibili_video",
+        "bili_video_clip": True,
+        "page": page_num,
+    }
+    if aid:
+        try:
+            meta["aid"] = int(aid)
+        except (TypeError, ValueError):
+            pass
+    if cid:
+        try:
+            meta["cid"] = int(cid)
+        except (TypeError, ValueError):
+            pass
+    if up_mid:
+        try:
+            meta["up_mid"] = int(up_mid)
+        except (TypeError, ValueError):
+            pass
+    if duration_sec > 0:
+        meta["duration_sec"] = duration_sec
+
+    canonical_url = (
+        f"https://www.bilibili.com/video/{bvid}"
+        if bvid
+        else str(resolved.get("canonical_url") or url_or_ref)
+    )
+    if page_num > 1:
+        canonical_url = f"{canonical_url}?p={page_num}"
+
+    final_title = (
+        clean_inline_field(title or info_title or bvid or f"av{aid}", max_chars=160)
+        or "B站视频"
+    )
+    final_creator = (
+        clean_inline_field(creator or info_creator or "B站UP主", max_chars=80)
+        or "B站UP主"
+    )
+    ext_id = f"bili:bv:{bvid}" if bvid else f"bili:av:{aid}"
+    if page_num > 1:
+        ext_id = f"{ext_id}:p{page_num}"
+
+    return normalize_candidate(
+        external_id=ext_id,
+        source=source,
+        title=final_title,
+        creator=final_creator,
+        bvid=bvid,
+        summary=desc or final_title,
+        raw_url=canonical_url,
+        published_at=pubdate,
+        content_ready=False,
+        full_text="",
+        meta=meta,
+    )
 
 
 class BilibiliRiskControlError(RuntimeError):
@@ -1045,15 +1358,28 @@ async def fetch_bilibili_content(
         }
 
     bvid = str(candidate.get("bvid") or "").strip()
+    aid_val: int | None = None
+    if meta.get("aid"):
+        try:
+            aid_val = int(meta["aid"])
+        except (TypeError, ValueError):
+            aid_val = None
+    if bvid and bvid.lower().startswith("av") and bvid[2:].isdigit():
+        aid_val = int(bvid[2:])
+        bvid = ""
     if not bvid:
-        m = _BVID_RE.search(
-            str(candidate.get("raw_url") or candidate.get("external_id") or "")
-        )
+        raw_hint = str(candidate.get("raw_url") or candidate.get("external_id") or "")
+        m = _BVID_RE.search(raw_hint)
         if m:
             bvid = m.group(1)
+        elif aid_val is None:
+            m_av = _AVID_RE.search(raw_hint)
+            if m_av:
+                aid_val = int(m_av.group(1))
 
     fallback_title = clean_inline_field(
-        candidate.get("title") or bvid or "B站视频", max_chars=160
+        candidate.get("title") or bvid or (f"av{aid_val}" if aid_val else "B站视频"),
+        max_chars=160,
     )
     fallback_desc = clean_external_text(
         candidate.get("full_text")
@@ -1068,7 +1394,7 @@ async def fetch_bilibili_content(
     )
     max_text_chars = 4000 if legacy_mode else 6000
 
-    if not bvid:
+    if not bvid and not aid_val:
         empty_bundle = build_empty_media_bundle(
             watch_mode="unavailable" if not legacy_mode else "metadata_only",
             content_origin="bilibili_description"
@@ -1089,7 +1415,11 @@ async def fetch_bilibili_content(
     cred, cookie_header, secrets = _build_readonly_credential(
         cfg, shared_cookie=shared_cookie, fallback_cookies=fallback_cookies
     )
-    v = video.Video(bvid=bvid, credential=cred)
+    v = (
+        video.Video(bvid=bvid, credential=cred)
+        if bvid
+        else video.Video(aid=int(aid_val), credential=cred)
+    )
 
     cid = meta.get("cid")
     up_mid = meta.get("up_mid")
@@ -1100,7 +1430,8 @@ async def fetch_bilibili_content(
     info_transient_err = ""
 
     need_info = (
-        not cid
+        not bvid
+        or not cid
         or not up_mid
         or not fallback_desc
         or (eff_opts["visual_enabled"] and duration_sec <= 0)
@@ -1109,6 +1440,8 @@ async def fetch_bilibili_content(
         try:
             info = await _call_with_timeout(v.get_info(), timeout)
             if isinstance(info, Mapping):
+                if not bvid and info.get("bvid"):
+                    bvid = str(info["bvid"]).strip()
                 if not cid:
                     cid = info.get("cid")
                     if (

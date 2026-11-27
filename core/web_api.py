@@ -226,12 +226,24 @@ class HorizonsWebAPI:
             return _err(f"请求失败：{type(exc).__name__}", status_code=400)
 
     def _resolve_active_identity(
-        self, requested: str
+        self,
+        requested: str,
+        *,
+        known_identities: list[str] | None = None,
+        fallback_identity: str = "",
     ) -> tuple[str, list[dict[str, str]]]:
         eng = self.plugin.engine
-        personas = eng.world_bridge.discover_personas(eng.store, eng.sessions)
-        if requested and requested != "all":
-            active = normalize_identity(requested)
+        try:
+            personas = eng.world_bridge.discover_personas(
+                eng.store, eng.sessions, known_identities=known_identities
+            )
+        except TypeError:
+            personas = eng.world_bridge.discover_personas(eng.store, eng.sessions)
+        effective_req = str(requested or "").strip()
+        if not effective_req and fallback_identity:
+            effective_req = str(fallback_identity).strip()
+        if effective_req and effective_req != "all":
+            active = normalize_identity(effective_req)
             if all(p["identity"] != active for p in personas):
                 pid, inst = unpack_identity(active)
                 personas.insert(
@@ -256,7 +268,18 @@ class HorizonsWebAPI:
             now = eng.clock()
 
             req_id = _query_param("identity", "")
-            active_identity, personas = self._resolve_active_identity(req_id)
+            req_scope = _query_param("scope", "") or _query_param("umo", "")
+            scope_identity = ""
+            if not req_id and req_scope:
+                binding = await run_io(eng.store.get_scope_binding, req_scope)
+                if binding and binding.get("identity"):
+                    scope_identity = str(binding["identity"])
+                else:
+                    scope_identity = eng.projection.resolve_identity(umo=req_scope)
+            known_ids = await run_io(eng.store.known_identities)
+            active_identity, personas = self._resolve_active_identity(
+                req_id, known_identities=known_ids, fallback_identity=scope_identity
+            )
 
             counts = await run_io(
                 eng.store.summary_counts,
@@ -306,6 +329,7 @@ class HorizonsWebAPI:
                     "active_interests": counts["active_interests"],
                     "pending_questions": counts["pending_questions"],
                     "pending_reviews": counts["pending_reviews"],
+                    "held_reviews": int(counts.get("held_reviews", 0) or 0),
                     "daily_quota": eng.daily_quota,
                     "daily_used": daily_used,
                     "last_poll_at": eng.last_poll_at,
@@ -587,11 +611,32 @@ class HorizonsWebAPI:
                         }
                     )
                 else:
+                    import inspect
+
+                    from .contract import sanitize_readonly_bilibili_cookie
+
                     poller = (
                         poll_source
                         if callable(poll_source)
                         else eng.poll_source_adapter
                     )
+                    shared_cookie = sanitize_readonly_bilibili_cookie(
+                        str(self.plugin.config.get("bilibili_shared_cookie", "") or "")
+                    )
+                    poll_kwargs: dict[str, Any] = {"timeout": 20.0}
+                    if shared_cookie:
+                        try:
+                            sig = inspect.signature(poller)
+                            params = sig.parameters
+                            has_varkw = any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in params.values()
+                            )
+                        except (TypeError, ValueError):
+                            params = {}
+                            has_varkw = False
+                        if has_varkw or "shared_cookie" in params:
+                            poll_kwargs["shared_cookie"] = shared_cookie
                     poll_res = await poller(
                         {
                             "source_id": manual_src["source_id"],
@@ -606,10 +651,24 @@ class HorizonsWebAPI:
                             },
                         },
                         {},
-                        timeout=20.0,
+                        **poll_kwargs,
                     )
                     raw_items = list((poll_res or {}).get("items") or [])
                     if not raw_items:
+                        is_bili_clip_url = False
+                        try:
+                            from ..adapters.bilibili import is_bilibili_video_url
+
+                            is_bili_clip_url = bool(is_bilibili_video_url(url_val))
+                        except Exception:
+                            is_bili_clip_url = False
+                        if is_bili_clip_url:
+                            err_detail = str(
+                                (poll_res or {}).get("error")
+                                or (poll_res or {}).get("status")
+                                or "B站视频解析失败"
+                            ).strip()
+                            raise ValueError(err_detail)
                         fetcher = (
                             fetch_item_content
                             if callable(fetch_item_content)

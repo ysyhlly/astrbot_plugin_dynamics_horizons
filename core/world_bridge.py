@@ -8,7 +8,11 @@ import inspect
 import time
 from typing import Any
 
-from ..series_panels import is_series_in_quiet_hours, resolve_series_timezone
+from ..series_panels import (
+    get_series_shared_config,
+    is_series_in_quiet_hours,
+    resolve_series_timezone,
+)
 from .contract import (
     is_in_quiet_hours,
     make_identity,
@@ -156,8 +160,25 @@ class WorldBridge:
                     self.projection.bind_persona_alias(pid, ident)
         return results
 
+    def _shared_persona_id(self) -> str:
+        if self.context is None:
+            return ""
+        try:
+            shared = get_series_shared_config(self.context)
+            if isinstance(shared, dict):
+                pid = str(shared.get("persona_id") or "").strip()
+                if pid:
+                    return pid[:128]
+        except Exception:
+            pass
+        return ""
+
     def discover_personas(
-        self, store: Any, sessions: list[str] | None = None
+        self,
+        store: Any,
+        sessions: list[str] | None = None,
+        *,
+        known_identities: list[str] | None = None,
     ) -> list[dict[str, str]]:
         by_identity: dict[str, dict[str, str]] = {}
 
@@ -209,21 +230,49 @@ class WorldBridge:
             )
 
         # 3. Persisted identities in Horizons SQLite store
-        if store is not None and callable(getattr(store, "known_identities", None)):
-            for ident in store.known_identities():
-                norm = normalize_identity(ident)
-                pid, inst = unpack_identity(norm)
-                label = pid if pid == inst else f"{pid} ({inst})"
-                by_identity.setdefault(
-                    norm,
-                    {
-                        "identity": norm,
-                        "persona_id": pid,
-                        "label": label,
-                    },
-                )
+        persisted_ids: list[str] = []
+        if known_identities is not None:
+            persisted_ids = list(known_identities)
+        elif store is not None and callable(getattr(store, "known_identities", None)):
+            persisted_ids = list(store.known_identities())
+        for ident in persisted_ids:
+            norm = normalize_identity(ident)
+            pid, inst = unpack_identity(norm)
+            label = pid if pid == inst else f"{pid} ({inst})"
+            by_identity.setdefault(
+                norm,
+                {
+                    "identity": norm,
+                    "persona_id": pid,
+                    "label": label,
+                },
+            )
 
-        # 4. Always provide a deterministic fallback persona
+        # 4. Inherit series shared persona_id as preferred default when configured
+        shared_pid = self._shared_persona_id()
+        if shared_pid:
+            matched_key = next(
+                (
+                    k
+                    for k, v in by_identity.items()
+                    if v.get("persona_id") == shared_pid
+                ),
+                "",
+            )
+            if not matched_key:
+                shared_ident = make_identity(shared_pid, shared_pid)
+                by_identity[shared_ident] = {
+                    "identity": shared_ident,
+                    "persona_id": shared_pid,
+                    "label": shared_pid,
+                }
+                matched_key = shared_ident
+            if matched_key in by_identity:
+                preferred = by_identity.pop(matched_key)
+                ordered = [preferred, *by_identity.values()]
+                return ordered
+
+        # 5. Always provide a deterministic fallback persona
         if not by_identity:
             default_ident = make_identity("default", "default")
             by_identity[default_ident] = {
@@ -482,10 +531,18 @@ class WorldBridge:
             self.context
         )
         host_prompt = ""
-        for hp in self._host_personas():
+        host_personas = self._host_personas()
+        for hp in host_personas:
             if hp["persona_id"] == persona_id or hp["identity"] == norm_id:
                 host_prompt = hp.get("prompt", "")
                 break
+        if not host_prompt and persona_id == "default":
+            shared_pid = self._shared_persona_id()
+            if shared_pid:
+                for hp in host_personas:
+                    if hp["persona_id"] == shared_pid:
+                        host_prompt = hp.get("prompt", "")
+                        break
 
         installed, world_enabled, world_ready = self._inspect_installed_world_state()
         has_host = bool(host_prompt.strip())

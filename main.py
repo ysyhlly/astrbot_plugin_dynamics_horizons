@@ -44,7 +44,7 @@ from .core.contract import (
     shanghai_day_bounds,
     unpack_identity,
 )
-from .core.engine import HorizonsEngine
+from .core.engine import HorizonsEngine, read_series_shared_config
 from .core.io import run_io
 from .core.projection import _empty_result
 from .core.store import HorizonsStore
@@ -52,6 +52,9 @@ from .core.web_api import HorizonsWebAPI
 from .series_panels import (
     find_provider_silently,
     get_series_defaults,
+    get_series_shared_config,
+    inherit_umos,
+    invalidate_presence_cache,
     is_provider_budget_busy_error,
     is_series_group_excluded,
     is_series_in_quiet_hours,
@@ -76,7 +79,8 @@ if _SERIES_PANELS_INITIAL_HASH:
 
 
 def _ensure_fresh_series_panels():
-    global find_provider_silently, get_series_defaults, is_provider_budget_busy_error
+    global find_provider_silently, get_series_defaults, get_series_shared_config
+    global inherit_umos, invalidate_presence_cache, is_provider_budget_busy_error
     global is_series_group_excluded, is_series_in_quiet_hours, resolve_series_provider
     global resolve_series_timezone, series_llm_call, _series_panels_mod
 
@@ -90,6 +94,13 @@ def _ensure_fresh_series_panels():
         _series_panels_mod = sp_mod
         find_provider_silently = getattr(sp_mod, "find_provider_silently", find_provider_silently)
         get_series_defaults = getattr(sp_mod, "get_series_defaults", get_series_defaults)
+        get_series_shared_config = getattr(
+            sp_mod, "get_series_shared_config", get_series_shared_config
+        )
+        inherit_umos = getattr(sp_mod, "inherit_umos", inherit_umos)
+        invalidate_presence_cache = getattr(
+            sp_mod, "invalidate_presence_cache", invalidate_presence_cache
+        )
         is_provider_budget_busy_error = getattr(
             sp_mod, "is_provider_budget_busy_error", is_provider_budget_busy_error
         )
@@ -871,18 +882,62 @@ class Main(Star):
                 "metrics": {},
             }
 
+    def _series_scope_version(self) -> str:
+        """Deterministic optimistic-lock token over Horizons' enabled/sessions scope config."""
+        enabled = bool(self.config.get("enabled", True))
+        explicit = sorted(
+            {
+                str(s).strip()
+                for s in (self.config.get("sessions") or [])
+                if str(s or "").strip()
+            }
+        )
+        disabled = sorted(
+            {
+                str(s).strip()
+                for s in (self.config.get("disabled_sessions") or [])
+                if str(s or "").strip()
+            }
+        )
+        empty_allowlist = bool(self.config.get("sessions_allowlist_empty", False))
+        payload = encode_json(
+            {
+                "enabled": enabled,
+                "sessions": explicit,
+                "disabled_sessions": disabled,
+                "sessions_allowlist_empty": empty_allowlist,
+            }
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+    def _save_plugin_config(self) -> None:
+        saver = getattr(self.config, "save_config", None)
+        if callable(saver):
+            try:
+                saver()
+            except Exception:
+                logger.warning(
+                    "[DynamicsHorizons] Failed to persist config via save_config()",
+                    exc_info=True,
+                )
+
     def get_series_scope_status(self, umo: str) -> dict[str, Any]:
         """Synchronous, read-only per-UMO scope status for Chat Dynamics control matrix."""
         try:
             clean_umo = str(umo or "").strip()
+            version_token = self._series_scope_version()
             if self.closed or not self.ready or self.engine is None:
                 return {
+                    "umo": clean_umo,
                     "enabled": False,
                     "supported": False,
+                    "writable": False,
+                    "mode": "unavailable",
                     "persona_id": "",
                     "activity_today": None,
                     "summary": "群间见闻未就绪",
-                    "version": PLUGIN_VERSION,
+                    "detail": "群间见闻未就绪",
+                    "version": version_token,
                 }
             eng = self.engine
             now = eng.clock()
@@ -891,15 +946,26 @@ class Main(Star):
                 clean_umo and is_series_group_excluded(self.context, umo=clean_umo)
             )
             plugin_enabled = bool(self.config.get("enabled", True))
-            sessions = eng.sessions
+            explicit_sessions = [
+                str(s).strip()
+                for s in (self.config.get("sessions") or [])
+                if str(s or "").strip()
+            ]
+            disabled_sessions = set(eng.disabled_sessions)
+            empty_allowlist = bool(self.config.get("sessions_allowlist_empty", False))
+            if explicit_sessions or empty_allowlist:
+                scope_mode = "allowlist"
+            elif inherit_umos([], self.context):
+                scope_mode = "inherited"
+            else:
+                scope_mode = "open"
+
             if excluded_by_core:
                 scope_enabled = False
             elif not clean_umo:
                 scope_enabled = plugin_enabled
-            elif sessions:
-                scope_enabled = plugin_enabled and (clean_umo in sessions)
             else:
-                scope_enabled = plugin_enabled
+                scope_enabled = eng.is_session_allowed(clean_umo)
 
             identity, allow_all = self._resolve_query_identity_readonly(scope=clean_umo)
             persona_id = unpack_identity(identity)[0] if identity else ""
@@ -927,6 +993,8 @@ class Main(Star):
                 summary_text = "主控排除（群间见闻已静默跳过）"
             elif not plugin_enabled:
                 summary_text = "插件已停用"
+            elif clean_umo and clean_umo in disabled_sessions:
+                summary_text = "已在总控矩阵暂停"
             elif not scope_enabled:
                 summary_text = "未在当前会话白名单内"
             elif clean_umo and not identity:
@@ -941,25 +1009,174 @@ class Main(Star):
                 summary_text = " · ".join(parts)
 
             result = {
+                "umo": clean_umo,
                 "enabled": scope_enabled,
-                "supported": False,
+                "supported": True,
+                "writable": True,
+                "mode": scope_mode,
                 "persona_id": persona_id,
                 "activity_today": int(activity_today),
                 "summary": summary_text,
-                "version": int(eng.projection.generation),
+                "detail": summary_text,
+                "version": version_token,
             }
             if excluded_by_core:
                 result["excluded_by_core"] = True
             return result
         except Exception:
             return {
+                "umo": str(umo or "").strip(),
                 "enabled": None,
                 "supported": False,
+                "writable": False,
+                "mode": "error",
                 "persona_id": "",
                 "activity_today": None,
                 "summary": "状态读取异常",
+                "detail": "状态读取异常",
                 "version": PLUGIN_VERSION,
             }
+
+    async def set_series_scope_enabled(
+        self,
+        umo: str,
+        enabled: bool,
+        expected_version: str | int | None = None,
+    ) -> dict[str, Any]:
+        """Optimistic-locked toggle of one UMO's Horizons scope in `sessions` / `disabled_sessions`."""
+        clean_umo = str(umo or "").strip()
+        current_ver = self._series_scope_version()
+        if not clean_umo:
+            return {
+                "ok": False,
+                "umo": "",
+                "enabled": False,
+                "version": current_ver,
+                "reason": "umo_required",
+                "summary": "缺少会话 UMO",
+            }
+        if not isinstance(enabled, bool):
+            return {
+                "ok": False,
+                "umo": clean_umo,
+                "enabled": bool(self.engine and self.engine.is_session_allowed(clean_umo)),
+                "version": current_ver,
+                "reason": "invalid_enabled",
+                "summary": "enabled 必须为布尔值",
+            }
+        if self.closed or self.engine is None:
+            return {
+                "ok": False,
+                "umo": clean_umo,
+                "enabled": False,
+                "version": current_ver,
+                "reason": "not_ready",
+                "summary": "群间见闻尚未就绪",
+            }
+
+        if expected_version is not None:
+            exp_str = str(expected_version).strip()
+            if exp_str and exp_str != current_ver:
+                return {
+                    "ok": False,
+                    "conflict": True,
+                    "umo": clean_umo,
+                    "enabled": self.engine.is_session_allowed(clean_umo),
+                    "version": current_ver,
+                    "reason": "version_conflict",
+                    "summary": "版本冲突，请刷新后重试",
+                }
+
+        explicit = [
+            str(s).strip()
+            for s in (self.config.get("sessions") or [])
+            if str(s or "").strip()
+        ]
+        disabled = [
+            str(s).strip()
+            for s in (self.config.get("disabled_sessions") or [])
+            if str(s or "").strip()
+        ]
+        empty_allowlist = bool(self.config.get("sessions_allowlist_empty", False))
+        inherited = inherit_umos([], self.context) if self.context is not None else []
+
+        if enabled:
+            if not bool(self.config.get("enabled", True)):
+                self.config["enabled"] = True
+            disabled = [s for s in disabled if s != clean_umo]
+            if explicit or empty_allowlist:
+                if clean_umo not in explicit:
+                    explicit.append(clean_umo)
+                empty_allowlist = False
+            elif inherited and clean_umo not in inherited:
+                explicit = list(dict.fromkeys([*inherited, clean_umo]))
+        else:
+            if explicit:
+                explicit = [s for s in explicit if s != clean_umo]
+                if not explicit:
+                    empty_allowlist = True
+                if clean_umo not in disabled:
+                    disabled.append(clean_umo)
+            else:
+                if clean_umo not in disabled:
+                    disabled.append(clean_umo)
+
+        self.config["sessions"] = explicit
+        if disabled or "disabled_sessions" in self.config:
+            self.config["disabled_sessions"] = disabled
+        if empty_allowlist or "sessions_allowlist_empty" in self.config:
+            self.config["sessions_allowlist_empty"] = empty_allowlist
+
+        self._save_plugin_config()
+        try:
+            await self.engine.refresh_projection()
+        except Exception:
+            pass
+        try:
+            invalidate_presence_cache(PLUGIN_ID, context=self.context)
+        except Exception:
+            pass
+
+        new_ver = self._series_scope_version()
+        status_after = self.get_series_scope_status(clean_umo)
+        actual_enabled = bool(status_after.get("enabled"))
+        reason = (
+            "excluded_by_core"
+            if (enabled and not actual_enabled and status_after.get("excluded_by_core"))
+            else ""
+        )
+        return {
+            "ok": True,
+            "umo": clean_umo,
+            "enabled": actual_enabled,
+            "version": new_ver,
+            "reason": reason,
+            "summary": str(status_after.get("summary") or ("开启" if actual_enabled else "暂停")),
+        }
+
+    def activate_series_runtime(self) -> dict[str, Any]:
+        """Activate Horizons runtime gate for Chat Dynamics Setup Wizard step 4."""
+        if self.closed:
+            return {
+                "ok": False,
+                "plugin_id": PLUGIN_ID,
+                "enabled": False,
+                "ready": False,
+                "detail": "群间见闻已关闭",
+            }
+        self.config["enabled"] = True
+        self._save_plugin_config()
+        try:
+            invalidate_presence_cache(PLUGIN_ID, context=self.context)
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "plugin_id": PLUGIN_ID,
+            "enabled": True,
+            "ready": bool(self.ready and not self.closed and self.engine is not None),
+            "detail": "群间见闻运行态已激活",
+        }
 
     def series_search_items(
         self, query: str, scope: str = "", limit: int = 20
@@ -977,7 +1194,7 @@ class Main(Star):
                 return []
             eng = self.engine
             clean_scope = str(scope or "").strip()
-            if clean_scope and eng.sessions and clean_scope not in eng.sessions:
+            if clean_scope and not eng.is_session_allowed(clean_scope):
                 return []
             identity, allow_all = self._resolve_query_identity_readonly(
                 scope=clean_scope
@@ -1017,7 +1234,7 @@ class Main(Star):
                 return []
             eng = self.engine
             clean_scope = str(scope or "").strip()
-            if clean_scope and eng.sessions and clean_scope not in eng.sessions:
+            if clean_scope and not eng.is_session_allowed(clean_scope):
                 return []
 
             now = eng.clock()
@@ -1084,6 +1301,8 @@ class Main(Star):
             scope_umo = str(character_scope.get("umo") or "").strip()
         if scope_umo and is_series_group_excluded(self.context, umo=scope_umo):
             return _empty_result("excluded_by_core")
+        if scope_umo and not self.engine.is_session_allowed(scope_umo):
+            return _empty_result("scope_not_allowed")
         return self.engine.projection.query(
             enabled=bool(self.config.get("enabled", True)),
             ready=bool(self.ready and not self.closed),
@@ -1183,7 +1402,7 @@ class Main(Star):
         if is_series_group_excluded(self.context, umo=umo):
             return encode_json({"available": False, "reason": "excluded_by_core"})
         eng = self.engine
-        if eng.sessions and umo not in eng.sessions:
+        if not eng.is_session_allowed(umo):
             return encode_json({"available": False, "reason": "scope_not_allowed"})
         sender_fn = getattr(event, "get_sender_id", None)
         member = str(sender_fn() or "").strip() if callable(sender_fn) else ""
@@ -1247,7 +1466,7 @@ class Main(Star):
             )
             or ""
         ).strip()
-        if not umo or (engine.sessions and umo not in engine.sessions):
+        if not umo or not engine.is_session_allowed(umo):
             return {"accepted": False}
         if is_series_group_excluded(getattr(engine, "context", None), umo=umo):
             return {"accepted": False, "reason": "excluded_by_core"}
@@ -1417,9 +1636,16 @@ class Main(Star):
         explicit = str(self.config.get(role, "") or "").strip()
         if explicit:
             return explicit
+        shared = read_series_shared_config(self.context) if self.context is not None else {}
         if role == "video_provider":
+            vision_p = str(shared.get("vision_provider") or "").strip()
+            if vision_p:
+                return vision_p
             return self._effective_provider("analysis_provider")
         if role == "analysis_provider":
+            light_p = str(shared.get("light_analysis_provider") or "").strip()
+            if light_p:
+                return light_p
             return resolve_series_provider(
                 self.context,
                 "",
@@ -1427,13 +1653,13 @@ class Main(Star):
                 role="reply",
             )
         if role == "review_provider":
-            defaults = get_series_defaults(self.context)
-            decision_p = str(defaults.get("decision_provider") or "").strip()
+            decision_p = str(shared.get("decision_provider") or "").strip()
+            light_p = str(shared.get("light_analysis_provider") or "").strip()
             allow_same = bool(self.config.get("allow_same_provider_for_review", False))
-            if decision_p and (
-                allow_same or decision_p != self._effective_provider("analysis_provider")
-            ):
-                return decision_p
+            analysis_p = self._effective_provider("analysis_provider")
+            for cand in (decision_p, light_p):
+                if cand and (allow_same or cand != analysis_p):
+                    return cand
             if allow_same:
                 return resolve_series_provider(
                     self.context,

@@ -22,6 +22,7 @@ from astrbot.api import logger
 from ..series_panels import (
     find_provider_silently,
     get_series_defaults,
+    get_series_shared_config,
     inherit_umos,
     is_provider_budget_busy_error,
     resolve_series_provider,
@@ -104,6 +105,65 @@ except Exception:  # pragma: no cover
 _MEDIA_CHECKPOINT_TTL_SECONDS = 7200.0  # 2 hours
 _MEDIA_CHECKPOINT_MAX_ENTRIES = 16
 _STT_KEY_REDACT_RE = re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b")
+_EXTENDED_SHARED_STR_KEYS = (
+    "light_analysis_provider",
+    "vision_provider",
+    "embedding_provider",
+    "rerank_provider",
+    "persona_id",
+)
+
+
+def read_series_shared_config(context: Any) -> dict[str, Any]:
+    """Read series shared config via `series_panels.get_series_shared_config`, preserving Wave-1 extended keys."""
+    if context is None:
+        return {}
+    merged: dict[str, Any] = {}
+    try:
+        base = get_series_shared_config(context)
+        if isinstance(base, dict):
+            merged.update(base)
+    except Exception:
+        pass
+    # Supplement Wave-1 extended provider/persona keys when series_panels.py has not yet been synced.
+    if any(k not in merged for k in _EXTENDED_SHARED_STR_KEYS):
+        getter = getattr(context, "get_all_stars", None)
+        if callable(getter):
+            try:
+                raw_stars = getter()
+                entries = (
+                    list(raw_stars.values())
+                    if isinstance(raw_stars, dict)
+                    else list(raw_stars or [])
+                )
+            except Exception:
+                entries = []
+            for row in entries:
+                val = (
+                    row.get
+                    if isinstance(row, dict)
+                    else lambda k, d=None: getattr(row, k, d)
+                )
+                name = str(val("name") or val("root_dir_name") or "")
+                if name != "astrbot_plugin_chat_dynamics":
+                    continue
+                if val("activated", True) is False:
+                    break
+                owner = val("star_cls") or val("star") or val("plugin")
+                fn = getattr(owner, "get_series_shared_config", None)
+                if callable(fn) and not inspect.iscoroutinefunction(fn):
+                    try:
+                        raw_cfg = fn()
+                        if isinstance(raw_cfg, dict) and raw_cfg.get("enabled") is not False:
+                            for key in _EXTENDED_SHARED_STR_KEYS:
+                                if not merged.get(key):
+                                    sv = raw_cfg.get(key)
+                                    if isinstance(sv, str) and sv.strip():
+                                        merged[key] = sv.strip()[:128]
+                    except Exception:
+                        pass
+                break
+    return merged
 
 
 def _redact_stt_error(exc: BaseException) -> str:
@@ -814,6 +874,32 @@ class HorizonsEngine(EngineLifecycle):
             return True
         return False
 
+    @classmethod
+    def _is_bilibili_video_candidate(
+        cls,
+        unit_obj: dict[str, Any],
+        fetched: dict[str, Any] | None = None,
+        media_bundle: dict[str, Any] | None = None,
+    ) -> bool:
+        sk = str(unit_obj.get("source_kind") or "").strip().lower()
+        if sk == "bilibili":
+            return not cls._is_bilibili_dynamic_candidate(unit_obj, fetched, media_bundle)
+        if sk == "manual":
+            if str(unit_obj.get("bvid") or "").strip():
+                return True
+            meta = unit_obj.get("meta") if isinstance(unit_obj.get("meta"), dict) else {}
+            if meta.get("bili_video_clip") or str(meta.get("kind") or "").lower() == "video":
+                return True
+            raw_url = str(unit_obj.get("raw_url") or "").strip()
+            if raw_url:
+                try:
+                    from ..adapters.bilibili import is_bilibili_video_url
+
+                    return bool(is_bilibili_video_url(raw_url))
+                except Exception:
+                    return False
+        return False
+
     def _video_provider_supports_native_video(self) -> bool:
         provider_id = self.effective_provider("video_provider")
         if not provider_id or self.context is None:
@@ -1105,13 +1191,20 @@ class HorizonsEngine(EngineLifecycle):
         explicit = str(self.config.get(role, "") or "").strip()
         if explicit:
             return explicit
+        shared = read_series_shared_config(self.context) if self.context is not None else {}
         if role == "video_provider":
+            vision_p = str(shared.get("vision_provider") or "").strip()
+            if vision_p:
+                return vision_p
             return self.effective_provider("analysis_provider")
         if role == "video_audio_stt_provider":
             return ""
         if self.context is None:
             return ""
         if role == "analysis_provider":
+            light_p = str(shared.get("light_analysis_provider") or "").strip()
+            if light_p:
+                return light_p
             return resolve_series_provider(
                 self.context,
                 "",
@@ -1119,13 +1212,13 @@ class HorizonsEngine(EngineLifecycle):
                 role="reply",
             )
         if role == "review_provider":
-            defaults = get_series_defaults(self.context)
-            decision_p = str(defaults.get("decision_provider") or "").strip()
+            decision_p = str(shared.get("decision_provider") or "").strip()
+            light_p = str(shared.get("light_analysis_provider") or "").strip()
             allow_same = bool(self.config.get("allow_same_provider_for_review", False))
-            if decision_p and (
-                allow_same or decision_p != self.effective_provider("analysis_provider")
-            ):
-                return decision_p
+            analysis_p = self.effective_provider("analysis_provider")
+            for cand in (decision_p, light_p):
+                if cand and (allow_same or cand != analysis_p):
+                    return cand
             if allow_same:
                 return resolve_series_provider(
                     self.context,
@@ -1151,12 +1244,44 @@ class HorizonsEngine(EngineLifecycle):
         return "00:00-08:00"
 
     @property
+    def disabled_sessions(self) -> list[str]:
+        raw = self.config.get("disabled_sessions", [])
+        return [str(s).strip() for s in (raw or []) if str(s or "").strip()]
+
+    @property
     def sessions(self) -> list[str]:
+        disabled = set(self.disabled_sessions)
         raw = self.config.get("sessions", [])
-        cleaned = [str(s).strip() for s in (raw or []) if str(s or "").strip()]
+        cleaned = [
+            str(s).strip()
+            for s in (raw or [])
+            if str(s or "").strip() and str(s).strip() not in disabled
+        ]
         if cleaned:
             return cleaned
-        return inherit_umos([], self.context) if self.context is not None else []
+        if bool(self.config.get("sessions_allowlist_empty", False)):
+            return []
+        inherited = inherit_umos([], self.context) if self.context is not None else []
+        return [s for s in inherited if s not in disabled]
+
+    def is_session_allowed(self, umo: str) -> bool:
+        clean_umo = str(umo or "").strip()
+        if not bool(self.config.get("enabled", True)):
+            return False
+        if not clean_umo:
+            return True
+        if clean_umo in set(self.disabled_sessions):
+            return False
+        raw = self.config.get("sessions", [])
+        explicit = [str(s).strip() for s in (raw or []) if str(s or "").strip()]
+        if explicit:
+            return clean_umo in explicit
+        if bool(self.config.get("sessions_allowlist_empty", False)):
+            return False
+        inherited = inherit_umos([], self.context) if self.context is not None else []
+        if inherited:
+            return clean_umo in inherited
+        return True
 
     @property
     def proactive_sessions(self) -> list[str]:
@@ -1311,10 +1436,14 @@ class HorizonsEngine(EngineLifecycle):
                 sanitize_readonly_bilibili_cookie(
                     str(self.config.get("bilibili_shared_cookie", "") or "")
                 )
-                if src.get("source_kind") == "bilibili"
+                if src.get("source_kind") in {"bilibili", "manual"}
                 else ""
             )
-            poll_kwargs: dict[str, Any] = {"timeout": 20.0}
+            poll_timeout = max(
+                5.0,
+                min(60.0, float(self.config.get("poll_source_timeout_seconds", 20.0) or 20.0)),
+            )
+            poll_kwargs: dict[str, Any] = {"timeout": poll_timeout}
             if shared_cookie:
                 try:
                     sig = inspect.signature(self.poll_source_adapter)
@@ -1329,17 +1458,20 @@ class HorizonsEngine(EngineLifecycle):
                 if has_varkw or "shared_cookie" in params:
                     poll_kwargs["shared_cookie"] = shared_cookie
             async with http_session_scope():
-                res = await self.poll_source_adapter(
-                    {
-                        "source_id": src["source_id"],
-                        "source_kind": src["source_kind"],
-                        "identity": src["identity"],
-                        "name": src["name"],
-                        "enabled": src["enabled"],
-                        "config": src["config"],
-                    },
-                    src.get("cursor") or {},
-                    **poll_kwargs,
+                res = await asyncio.wait_for(
+                    self.poll_source_adapter(
+                        {
+                            "source_id": src["source_id"],
+                            "source_kind": src["source_kind"],
+                            "identity": src["identity"],
+                            "name": src["name"],
+                            "enabled": src["enabled"],
+                            "config": src["config"],
+                        },
+                        src.get("cursor") or {},
+                        **poll_kwargs,
+                    ),
+                    timeout=max(25.0, poll_timeout + 10.0),
                 )
             outcome = res.get("outcome", "success")
             items = list(res.get("items") or []) if isinstance(res.get("items"), list) else []
@@ -1469,9 +1601,11 @@ class HorizonsEngine(EngineLifecycle):
         cooldown_count = 0
         bili_polled = 0
         async with http_session_scope():
-            for s in sources:
+            for idx, s in enumerate(sources):
                 if self.closed:
                     break
+                if idx > 0:
+                    await asyncio.sleep(0)
                 if s["source_kind"] == "manual" and not force:
                     continue
                 if s["source_kind"] == "bilibili" and not force:
@@ -1493,10 +1627,22 @@ class HorizonsEngine(EngineLifecycle):
                         )
                         if jitter > 0:
                             await asyncio.sleep(random.uniform(0.3 * jitter, jitter))
+                per_source_limit = max(
+                    30.0,
+                    float(self.config.get("poll_source_timeout_seconds", 20.0) or 20.0)
+                    + 15.0,
+                )
                 try:
-                    res = await self.poll_one_source(
-                        s["source_id"], force=force, expected_identity=s["identity"]
+                    res = await asyncio.wait_for(
+                        self.poll_one_source(
+                            s["source_id"], force=force, expected_identity=s["identity"]
+                        ),
+                        timeout=per_source_limit,
                     )
+                except asyncio.TimeoutError:
+                    self.last_error = f"poll_timeout:{s['source_id']}"[:180]
+                    failed_count += 1
+                    continue
                 except ValueError:
                     # A source can be deleted or reassigned after the list was read.
                     continue
@@ -1539,7 +1685,13 @@ class HorizonsEngine(EngineLifecycle):
 
         now = self.clock()
         await run_io(self.store.settle_decay, now, self.half_life_days)
-        personas = self.world_bridge.discover_personas(self.store, self.sessions)
+        known_ids = await run_io(self.store.known_identities)
+        try:
+            personas = self.world_bridge.discover_personas(
+                self.store, self.sessions, known_identities=known_ids
+            )
+        except TypeError:
+            personas = self.world_bridge.discover_personas(self.store, self.sessions)
         if identity:
             target_identities = [normalize_identity(identity)]
         else:
@@ -2073,9 +2225,9 @@ class HorizonsEngine(EngineLifecycle):
                 raw_url = unit_obj["raw_url"]
                 full_text = unit_obj["full_text"]
                 checkpoint_key = self._media_checkpoint_key(identity, unit_obj)
+                is_pre_bili_video = self._is_bilibili_video_candidate(unit_obj)
                 needs_ephemeral_video_refetch = (
-                    source_kind == "bilibili"
-                    and not self._is_bilibili_dynamic_candidate(unit_obj)
+                    is_pre_bili_video
                     and str(unit_obj.get("content_origin") or "")
                     in _EPHEMERAL_VISUAL_ORIGINS
                 )
@@ -2115,24 +2267,20 @@ class HorizonsEngine(EngineLifecycle):
                             now_ts = self.clock()
                             domain_cd = (
                                 self._domain_cooldowns.get("bilibili", 0.0)
-                                if source_kind == "bilibili"
+                                if (source_kind == "bilibili" or is_pre_bili_video)
                                 else 0.0
                             )
                             if (
-                                source_kind == "bilibili"
+                                (source_kind == "bilibili" or is_pre_bili_video)
                                 and max(float(src.get("cooldown_until") or 0.0), domain_cd)
                                 > now_ts
                             ):
                                 return None, None
-                            is_pre_dynamic = (
-                                source_kind == "bilibili"
-                                and self._is_bilibili_dynamic_candidate(unit_obj)
-                            )
                             fallback_cookies = None
                             media_options = None
                             audio_transcriber = None
                             fetch_timeout = 25.0
-                            if source_kind == "bilibili" and not is_pre_dynamic:
+                            if is_pre_bili_video:
                                 video_pid = self.effective_provider("video_provider")
                                 if (
                                     provider_circuit_remaining(self.context, video_pid)
@@ -2236,7 +2384,7 @@ class HorizonsEngine(EngineLifecycle):
                                         now=now_ts,
                                         expected_source=src,
                                     )
-                                    if source_kind == "bilibili":
+                                    if source_kind == "bilibili" or is_pre_bili_video:
                                         await self._set_domain_cooldown(
                                             "bilibili", cooldown_until
                                         )
@@ -2254,11 +2402,8 @@ class HorizonsEngine(EngineLifecycle):
                                 if fetched_origin:
                                     unit_obj["content_origin"] = fetched_origin
 
-                            is_bili_video_fetched = (
-                                source_kind == "bilibili"
-                                and not self._is_bilibili_dynamic_candidate(
-                                    unit_obj, fetched, media_bundle
-                                )
+                            is_bili_video_fetched = self._is_bilibili_video_candidate(
+                                unit_obj, fetched, media_bundle
                             )
                             # "宁缺毋滥" degradation gate for Bilibili videos:
                             # Never fabricate a reading log from title+description alone.
@@ -2344,7 +2489,9 @@ class HorizonsEngine(EngineLifecycle):
             is_bili_dynamic = source_kind == "bilibili" and (
                 self._is_bilibili_dynamic_candidate(unit_obj, fetched, media_bundle)
             )
-            is_bili_video = source_kind == "bilibili" and not is_bili_dynamic
+            is_bili_video = self._is_bilibili_video_candidate(
+                unit_obj, fetched, media_bundle
+            )
             has_visual = bool((media_bundle or {}).get("has_visual"))
             has_subtitle = bool((media_bundle or {}).get("has_subtitle"))
             has_audio_transcript = bool((media_bundle or {}).get("has_audio_transcript"))
@@ -3153,11 +3300,20 @@ class HorizonsEngine(EngineLifecycle):
                 60,
                 min(86400, int(self.config.get("poll_interval_seconds", 900) or 900)),
             )
+            cycle_timeout = max(
+                120.0,
+                min(600.0, float(self.config.get("poll_cycle_timeout_seconds", 0) or (interval * 0.8))),
+            )
             try:
                 if self.config.get("enabled", True):
-                    await self.poll_all_due_sources()
+                    await asyncio.wait_for(
+                        self.poll_all_due_sources(),
+                        timeout=cycle_timeout,
+                    )
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                self.last_error = "poll_loop_timeout"
             except Exception as exc:
                 self.last_error = type(exc).__name__
             self.next_poll_at = self.clock() + interval

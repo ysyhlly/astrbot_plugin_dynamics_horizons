@@ -1199,14 +1199,16 @@ async def _poll_wikisource(
         max_bytes=4 * 1024 * 1024,
         allow_private=False,
     )
-    payload = json.loads(resp.text())
-    parse_obj = (payload or {}).get("parse")
-    if not isinstance(parse_obj, Mapping):
-        raise ValueError(f"维基文库未找到页面：{page}")
+    def _parse_ws_response():
+        payload = json.loads(resp.text())
+        parse_obj = (payload or {}).get("parse")
+        if not isinstance(parse_obj, Mapping):
+            raise ValueError(f"维基文库未找到页面：{page}")
+        return _extract_wikisource_parse(
+            parse_obj, base_page=page, chunk_chars=chunk_chars
+        )
 
-    title, creator, chapters, subpages = _extract_wikisource_parse(
-        parse_obj, base_page=page, chunk_chars=chunk_chars
-    )
+    title, creator, chapters, subpages = await asyncio.to_thread(_parse_ws_response)
     book_id = f"wikisource:{lang}:{page}"
     canonical_url = f"https://{lang}.wikisource.org/wiki/{quote(page, safe='/')}"
 
@@ -1638,11 +1640,13 @@ async def _poll_opds(
             "status": "not_modified",
         }
 
-    items = _parse_opds_catalog(
-        resp.text(),
-        feed_url=resp.url or cfg["url"],
-        allow_private=allow_private,
-        source=source,
+    items = await asyncio.to_thread(
+        lambda: _parse_opds_catalog(
+            resp.text(),
+            feed_url=resp.url or cfg["url"],
+            allow_private=allow_private,
+            source=source,
+        )
     )
     seen_ids = list(next_cur.get("seen_ids") or [])
     seen_set = set(seen_ids)
@@ -1752,7 +1756,7 @@ async def poll_ebook_source(
             return await _poll_gutendex(cfg, source, cur, timeout)
         if prov == "opds":
             return await _poll_opds(cfg, source, cur, timeout)
-        return _poll_local(cfg, source, cur)
+        return await asyncio.to_thread(_poll_local, cfg, source, cur)
     except SSRFBlockedError:
         raise
     except AdapterRateLimitError as exc:
@@ -1821,11 +1825,16 @@ async def fetch_ebook_content(
             max_bytes=4 * 1024 * 1024,
             allow_private=False,
         )
-        parse_obj = (json.loads(resp.text()) or {}).get("parse") or {}
-        _, _, chapters, subpages = _extract_wikisource_parse(
-            parse_obj,
-            base_page=base_page,
-            chunk_chars=chunk_chars,
+        def _parse_ws_fetch(target_resp, target_page):
+            parse_obj = (json.loads(target_resp.text()) or {}).get("parse") or {}
+            return _extract_wikisource_parse(
+                parse_obj,
+                base_page=target_page,
+                chunk_chars=chunk_chars,
+            )
+
+        _, _, chapters, subpages = await asyncio.to_thread(
+            _parse_ws_fetch, resp, base_page
         )
 
         if not explicit_subpage and subpages and not chapters:
@@ -1845,11 +1854,8 @@ async def fetch_ebook_content(
                 max_bytes=4 * 1024 * 1024,
                 allow_private=False,
             )
-            sub_parse = (json.loads(sub_resp.text()) or {}).get("parse") or {}
-            _, _, sub_chapters, _ = _extract_wikisource_parse(
-                sub_parse,
-                base_page=chosen["subpage"],
-                chunk_chars=chunk_chars,
+            _, _, sub_chapters, _ = await asyncio.to_thread(
+                _parse_ws_fetch, sub_resp, chosen["subpage"]
             )
             sub_text = (
                 "\n\n".join(c["text"] for c in sub_chapters)

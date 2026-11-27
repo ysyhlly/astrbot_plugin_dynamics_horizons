@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -499,11 +500,10 @@ async def poll_feed_source(
             "status": "not_modified",
         }
 
-    raw_text = resp.text()
-    ctype = resp.header("content-type", "").lower()
-    stripped = raw_text.lstrip()
-
-    try:
+    def _parse_feed_payload() -> list[dict[str, Any]]:
+        raw_text = resp.text()
+        ctype = resp.header("content-type", "").lower()
+        stripped = raw_text.lstrip()
         if (
             "feed+json" in ctype
             or "application/json" in ctype
@@ -512,19 +512,21 @@ async def poll_feed_source(
             parsed_json = json.loads(stripped)
             if not isinstance(parsed_json, Mapping):
                 raise ValueError("JSON Feed 根节点必须是对象")
-            parsed_items = _parse_json_feed(
+            return _parse_json_feed(
                 parsed_json,
                 base_url=resp.url or cfg["url"],
                 source=source,
                 fetch_full_article=cfg["fetch_full_article"],
             )
-        else:
-            parsed_items = _parse_xml_feed(
-                raw_text,
-                base_url=resp.url or cfg["url"],
-                source=source,
-                fetch_full_article=cfg["fetch_full_article"],
-            )
+        return _parse_xml_feed(
+            raw_text,
+            base_url=resp.url or cfg["url"],
+            source=source,
+            fetch_full_article=cfg["fetch_full_article"],
+        )
+
+    try:
+        parsed_items = await asyncio.to_thread(_parse_feed_payload)
     except Exception as exc:
         # Keep the validators for the last parsed feed so the next request
         # cannot accept a 304 for content this poll never consumed.
@@ -591,7 +593,9 @@ async def fetch_feed_content(
                     "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5"
                 },
             )
-            extracted = extract_article_from_html(resp.text(), max_chars=4000)
+            extracted = await asyncio.to_thread(
+                lambda: extract_article_from_html(resp.text(), max_chars=4000)
+            )
             article_text = extracted["text"]
             if len(article_text) >= max(80, len(inline_excerpt)):
                 return {

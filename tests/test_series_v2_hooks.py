@@ -218,16 +218,24 @@ def test_get_series_scope_status_contract(tmp_path):
     _seed_sample_data(plugin)
 
     managed = plugin.get_series_scope_status("qq:GroupMessage:10001")
-    assert set(managed.keys()) == {
+    assert {
+        "umo",
         "enabled",
         "supported",
+        "writable",
+        "mode",
         "persona_id",
         "activity_today",
         "summary",
+        "detail",
         "version",
-    }
+    }.issubset(set(managed.keys()))
+    assert managed["umo"] == "qq:GroupMessage:10001"
     assert managed["enabled"] is True
-    assert managed["supported"] is False
+    assert managed["supported"] is True
+    assert managed["writable"] is True
+    assert managed["mode"] == "allowlist"
+    assert isinstance(managed["version"], str) and managed["version"]
     assert managed["persona_id"] == "rin"
     assert managed["activity_today"] >= 1
     assert "活跃兴趣" in managed["summary"]

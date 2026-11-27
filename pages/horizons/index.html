@@ -219,6 +219,7 @@
             </div>
             <div id="reviews-filter-group" class="segmented-group" role="group" aria-label="审查状态筛选" data-series-aria-label="审查状态筛选">
               <button type="button" data-review-state="pending_review" aria-pressed="true" data-series-text="待审">待审</button>
+              <button type="button" data-review-state="held" aria-pressed="false" data-series-text="人工复核">人工复核</button>
               <button type="button" data-review-state="approved" aria-pressed="false" data-series-text="已通过">已通过</button>
               <button type="button" data-review-state="rejected" aria-pressed="false" data-series-text="已拒绝">已拒绝</button>
               <button type="button" data-review-state="" aria-pressed="false" data-series-text="全部">全部</button>
@@ -376,8 +377,8 @@
           </label>
         </div>
         <label class="form-field">
-          <span data-series-text="公开文章 URL（可选，支持自动提取正文）">公开文章 URL（可选，支持自动提取正文）</span>
-          <input id="manual-url" type="url" maxlength="512" placeholder="https://example.com/article">
+          <span data-series-text="公开文章或 B 站单视频 URL（可选，支持 BV/av/b23.tv 自动精读）">公开文章或 B 站单视频 URL（可选，支持 BV/av/b23.tv 自动精读）</span>
+          <input id="manual-url" type="url" maxlength="512" placeholder="https://example.com/article 或 https://www.bilibili.com/video/BV..." data-series-placeholder="https://example.com/article 或 https://www.bilibili.com/video/BV...">
         </label>
         <label class="form-field">
           <span data-series-text="剪报正文内容（直接投喂给当前角色案头）">剪报正文内容（直接投喂给当前角色案头）</span>

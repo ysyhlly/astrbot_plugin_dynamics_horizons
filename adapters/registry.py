@@ -127,7 +127,9 @@ async def poll_source(
     elif kind == "feed":
         res = await poll_feed_source(source, cur, timeout=effective_timeout)
     else:
-        res = await poll_manual_source(source, cur, timeout=effective_timeout)
+        res = await poll_manual_source(
+            source, cur, timeout=effective_timeout, shared_cookie=shared_cookie
+        )
 
     items = list(res.get("items") or [])
     next_cursor = dict(res.get("next_cursor") or {})
@@ -185,7 +187,15 @@ async def fetch_item_content(
     elif kind == "feed":
         raw = await fetch_feed_content(src, candidate, timeout=effective_timeout)
     else:
-        raw = await fetch_manual_content(src, candidate, timeout=effective_timeout)
+        raw = await fetch_manual_content(
+            src,
+            candidate,
+            timeout=effective_timeout,
+            shared_cookie=shared_cookie,
+            fallback_cookies=fallback_cookies,
+            media_options=media_options,
+            audio_transcriber=transcriber,
+        )
 
     total_ch = raw.get("total_chapters")
     if total_ch is not None:
@@ -194,7 +204,11 @@ async def fetch_item_content(
         except (TypeError, ValueError):
             total_ch = None
 
-    max_text_chars = 6000 if (kind == "bilibili" and media_options is not None) else 4000
+    max_text_chars = (
+        6000
+        if (media_options is not None and (kind == "bilibili" or "media_bundle" in raw))
+        else 4000
+    )
     result: dict[str, Any] = {
         "full_text": clean_external_text(
             raw.get("full_text") or "", max_chars=max_text_chars, strip_html=True

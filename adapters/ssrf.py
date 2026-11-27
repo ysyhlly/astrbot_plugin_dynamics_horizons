@@ -984,6 +984,132 @@ async def safe_http_get(
     raise AdapterHTTPError(310, "重定向次数超过安全上限")
 
 
+async def resolve_safe_redirect_url(
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    timeout: float = 15.0,
+    allow_private: bool = False,
+    max_redirects: int = 5,
+    stop_predicate: Callable[[str], bool] | None = None,
+    secrets_to_redact: Sequence[str] = (),
+    proxy: str | None = None,
+) -> tuple[str, HttpResponse | None]:
+    """Follow HTTP redirects with per-hop SSRF validation, stopping early when `stop_predicate` matches."""
+    target_url = str(url or "").strip()
+    req_headers: dict[str, str] = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if headers:
+        for k, v in headers.items():
+            if v is not None and str(v) != "":
+                req_headers[str(k)] = str(v)
+
+    effective_proxy = _resolve_proxy_url(proxy) if _http_transport is None else None
+    proxy_host = _extract_proxy_host(effective_proxy)
+    all_secrets = list(secrets_to_redact)
+    if effective_proxy:
+        all_secrets.append(effective_proxy)
+
+    async def _prepare_hop(raw_hop_url: str) -> str:
+        if _http_transport is not None or effective_proxy is not None:
+            return await validate_url_async(
+                raw_hop_url, allow_private=allow_private, require_dns=True
+            )
+        normalized, _ = _validate_parsed_url(raw_hop_url, allow_private=allow_private)
+        return normalized
+
+    current_url = await _prepare_hop(target_url)
+    initial_origin = _origin_tuple(current_url)
+    if callable(stop_predicate) and stop_predicate(current_url):
+        return current_url, None
+
+    local_session: aiohttp.ClientSession | None = None
+    active_session: aiohttp.ClientSession | None = None
+    if _http_transport is None:
+        pool = _SHARED_HTTP_SESSIONS.get()
+        session_key = (bool(allow_private), proxy_host or "")
+        if pool is not None:
+            active_session = pool.get(session_key)
+            if active_session is None or active_session.closed:
+                connector = aiohttp.TCPConnector(
+                    resolver=_CheckedResolver(
+                        allow_private, allowed_proxy_host=proxy_host
+                    ),
+                    use_dns_cache=False,
+                )
+                active_session = aiohttp.ClientSession(
+                    connector=connector, trust_env=False
+                )
+                pool[session_key] = active_session
+        else:
+            connector = aiohttp.TCPConnector(
+                resolver=_CheckedResolver(
+                    allow_private, allowed_proxy_host=proxy_host
+                ),
+                use_dns_cache=False,
+            )
+            local_session = aiohttp.ClientSession(
+                connector=connector, trust_env=False
+            )
+            active_session = local_session
+
+    try:
+        for hop in range(max_redirects + 1):
+            if hop > 0:
+                current_url = await _prepare_hop(current_url)
+                if _origin_tuple(current_url) != initial_origin:
+                    for sensitive in ("Authorization", "authorization", "Cookie", "cookie"):
+                        req_headers.pop(sensitive, None)
+                if callable(stop_predicate) and stop_predicate(current_url):
+                    return current_url, None
+
+            try:
+                if _http_transport is not None:
+                    resp = await _http_transport(current_url, dict(req_headers), timeout)
+                    resp.url = current_url
+                else:
+                    resp = await _aiohttp_single_get(
+                        current_url,
+                        req_headers,
+                        timeout,
+                        256 * 1024,
+                        allow_private,
+                        session=active_session,
+                        proxy=effective_proxy,
+                    )
+            except (SSRFBlockedError, AdapterRateLimitError, ValueError):
+                raise
+            except Exception as exc:
+                raise RuntimeError(redact_error_text(exc, all_secrets)) from None
+
+            if resp.status in {301, 302, 303, 307, 308}:
+                if hop >= max_redirects:
+                    raise AdapterHTTPError(resp.status, "重定向次数超过安全上限")
+                location = resp.header("location", "").strip()
+                if not location:
+                    raise AdapterHTTPError(resp.status, "重定向响应缺少 Location 头")
+                current_url = urljoin(current_url, location)
+                continue
+
+            if resp.status == 429:
+                wait_s = parse_retry_after(resp.header("retry-after"), default=300.0)
+                raise AdapterRateLimitError(
+                    f"远端站点触发频率限制 (HTTP 429, retry_after={int(wait_s)}s)",
+                    retry_after=wait_s,
+                    status_code=429,
+                )
+            if resp.status >= 400:
+                raise AdapterHTTPError(resp.status, f"HTTP 请求失败 (status={resp.status})")
+            return current_url, resp
+    finally:
+        if local_session is not None and not local_session.closed:
+            await local_session.close()
+
+    raise AdapterHTTPError(310, "重定向次数超过安全上限")
+
+
 def strip_html_to_text(raw_html: str) -> str:
     """Convert raw HTML fragment into readable plain text with paragraph breaks."""
     if not raw_html:

@@ -709,7 +709,35 @@ textarea {
   font-size: 12.5px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
+}
+
+.review-risks-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.review-risks-label {
+  font-size: 12px;
+  color: var(--ds-danger);
+}
+
+.risk-tag {
+  white-space: normal;
+  line-height: 1.4;
+  max-width: 100%;
+}
+
+.umo-badges .pill {
+  cursor: pointer;
+}
+
+.umo-badges .pill.is-active-scope {
+  border-color: var(--ds-accent);
+  box-shadow: 0 0 0 1px var(--ds-accent);
 }
 
 .blocklist-bar {

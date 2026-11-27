@@ -1,4 +1,7 @@
-import { msg, tr, setText, feedback, confirmAction, formatScopeLabel, getLanguage } from './series-ui.js';
+import {
+  msg, tr, setText, feedback, confirmAction, formatScopeLabel, getLanguage,
+  getSharedScope, setSharedScope,
+} from './series-ui.js';
 
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -91,6 +94,35 @@ const PROPOSAL_STATE_LABELS = {
   revoked: '已撤回',
 };
 
+const REVIEW_RISK_SPECS = {
+  raw_url_detected: { label: '裸链接风险', detail: '内容包含未经清洗的裸 HTTP/HTTPS 链接', tone: 'danger' },
+  'injection:ignore_instructions': { label: '提示词注入', detail: '检测到疑似英文忽略规则/指令覆盖片段', tone: 'danger' },
+  'injection:system_prompt_override': { label: '系统提示覆写', detail: '检测到疑似系统提示词或边界标记注入', tone: 'danger' },
+  'injection:zh_prompt_injection': { label: '中文越狱/改人设注入', detail: '检测到疑似中文改人设或越狱指令片段', tone: 'danger' },
+  'injection:xss_or_exec': { label: '脚本执行风险', detail: '检测到疑似脚本或 HTML 事件注入', tone: 'danger' },
+  'spam:contact_spam': { label: '联系方式引流', detail: '检测到微信/QQ群等引流联系方式', tone: 'warn' },
+  'spam:promo_spam': { label: '广告推广引流', detail: '检测到营销推广或领券引流话术', tone: 'warn' },
+};
+
+function describeReviewRisk(rawRisk) {
+  const code = String(rawRisk || '').trim();
+  if (!code) return null;
+  if (REVIEW_RISK_SPECS[code]) return REVIEW_RISK_SPECS[code];
+  if (code.startsWith('injection:')) {
+    const sub = code.slice('injection:'.length).trim();
+    return { label: '提示词注入风险', detail: sub ? `命中注入检测规则（${sub}）` : '命中提示词注入检测规则', tone: 'danger' };
+  }
+  if (code.startsWith('spam:')) {
+    const sub = code.slice('spam:'.length).trim();
+    return { label: '广告/引流风险', detail: sub ? `命中引流检测规则（${sub}）` : '命中广告或联系方式引流规则', tone: 'warn' };
+  }
+  if (code.startsWith('blocked_topic:')) {
+    const topic = code.slice('blocked_topic:'.length).trim();
+    return { label: `屏蔽话题：${topic || '未命名'}`, detail: '命中当前角色的话题黑名单', tone: 'warn' };
+  }
+  return { label: code, detail: '独立审查模型标记的风险提示', tone: 'warn' };
+}
+
 const BOOK_STATUS_ITEMS = [
   ['reading', '在读'],
   ['dropped', '弃书'],
@@ -122,6 +154,8 @@ const ORIGIN_TO_WATCH_MODE = {
 const state = {
   tab: 'overview',
   identity: '',
+  sharedScope: '',
+  sharedPersona: '',
   personas: [],
   overview: null,
   sources: [],
@@ -371,7 +405,10 @@ function renderBadges(stats = {}) {
   setBadge('#badge-overview', (Number(stats.active_interests) || 0) + (Number(stats.pending_questions) || 0));
   setBadge('#badge-sources', Number(stats.sources_total) || 0);
   setBadge('#badge-logs', Number(stats.logs_total) || 0);
-  setBadge('#badge-reviews', Number(stats.pending_reviews) || 0, true);
+  const pendingReviewCount = stats.pending_reviews != null
+    ? (Number(stats.pending_reviews) || 0)
+    : (Number(stats.held_reviews) || 0);
+  setBadge('#badge-reviews', pendingReviewCount, true);
 }
 
 /* ===== Tab 1: Overview & Interests ===== */
@@ -413,11 +450,16 @@ function renderOverview(overview) {
       el('span', 'kpi-sub', `手账累计 ${Number(stats.logs_total) || 0} 篇 · 带半衰期不改人设`),
     );
 
+    const pendingReviewsNum = Number(stats.pending_reviews) || 0;
+    const heldReviewsNum = Number(stats.held_reviews) || 0;
+    const reviewSubText = heldReviewsNum > 0
+      ? `待审提案 ${pendingReviewsNum} 项（含人工复核 ${heldReviewsNum} 项）· 按群独立核销`
+      : `待审提案 ${pendingReviewsNum} 项 · 按群独立核销`;
     const questionCard = el('article', 'kpi-card');
     questionCard.append(
       el('span', 'kpi-label', msg('待讨论问题')),
       el('strong', 'kpi-value', String(Number(stats.pending_questions) || 0)),
-      el('span', 'kpi-sub', `待审提案 ${Number(stats.pending_reviews) || 0} 项 · 按群独立核销`),
+      el('span', 'kpi-sub', reviewSubText),
     );
 
     const currentlyBusy = overview?.health?.blockers?.includes('world_busy');
@@ -550,16 +592,26 @@ function renderOverview(overview) {
         if (umoStates.length === 0) {
           umoBox.append(el('span', 'pill info', '各群待聊（尚未核销）'));
         } else {
-          for (const u of umoStates) {
+          const orderedUmos = [...umoStates].sort((a, b) => {
+            const aMatch = state.sharedScope && a.umo === state.sharedScope ? 0 : 1;
+            const bMatch = state.sharedScope && b.umo === state.sharedScope ? 0 : 1;
+            return aMatch - bMatch;
+          });
+          for (const u of orderedUmos) {
             const isDone = u.status === 'discussed';
+            const isActiveScope = Boolean(state.sharedScope && u.umo === state.sharedScope);
             const badge = el(
               'span',
-              `pill ${isDone ? 'accent' : 'info'}`,
+              `pill ${isDone ? 'accent' : 'info'}${isActiveScope ? ' is-active-scope' : ''}`,
               `${formatScopeLabel(u.umo) || u.umo} · ${isDone ? tr('已聊核销') : tr('待聊')}`,
             );
-            if (isDone && u.discussed_at) {
-              badge.title = `核销时间：${formatTime(u.discussed_at)}`;
-            }
+            const tipParts = [];
+            if (isDone && u.discussed_at) tipParts.push(`核销时间：${formatTime(u.discussed_at)}`);
+            tipParts.push('点击同步为当前群聊作用域');
+            badge.title = tipParts.join(' · ');
+            badge.addEventListener('click', () => {
+              if (u.umo) setSharedScope(u.umo, { syncUrl: true });
+            });
             umoBox.append(badge);
           }
         }
@@ -1031,7 +1083,7 @@ function renderReviews() {
         for (const entry of item.audit || []) evidence.append(el('p','item-meta',`${formatTime(entry.created_at)} ${entry.actor}：${entry.from_state} → ${entry.to_state} ${entry.reason}`));
         card.append(evidence);
 
-        // Dual-LLM Review Verdict & Reason
+        // Dual-LLM Review Verdict, Reason & Risk Tags
         const verdictBox = el('div', 'verdict-box');
         const verdictText = item.review_verdict || '待复检';
         const verdictTone = /approve|pass|ok|通过/i.test(String(verdictText))
@@ -1047,6 +1099,23 @@ function renderReviews() {
         verdictBox.append(verdictHeader);
         if (item.review_reason) {
           verdictBox.append(el('span', '', `审查依据：${item.review_reason}`));
+        }
+        const reviewRisks = Array.isArray(item.review_risks)
+          ? item.review_risks.map(describeReviewRisk).filter(Boolean)
+          : [];
+        if (reviewRisks.length > 0) {
+          const risksRow = el('div', 'review-risks-row');
+          risksRow.setAttribute('aria-label', tr('审查风险标记'));
+          risksRow.append(el('strong', 'review-risks-label', '风险标记：'));
+          for (const rk of reviewRisks) {
+            const text = rk.detail && rk.detail !== '独立审查模型标记的风险提示'
+              ? `${rk.label} · ${rk.detail}`
+              : rk.label;
+            const tag = el('span', `pill ${rk.tone} risk-tag`, text);
+            tag.title = rk.detail || rk.label;
+            risksRow.append(tag);
+          }
+          verdictBox.append(risksRow);
         }
         card.append(verdictBox);
 
@@ -1137,7 +1206,8 @@ async function readRoleData(channel, params, busyNode, accept) {
 
 async function loadOverview({ silent = false } = {}) {
   if (!silent) notify('正在同步角色见闻总览…', 'info');
-  await readRoleData('overview', {}, $('#panel-overview'), data => {
+  const params = state.sharedScope ? { scope: state.sharedScope } : {};
+  await readRoleData('overview', params, $('#panel-overview'), data => {
     state.overview = data;
     if (Array.isArray(data?.books) && state.books.length === 0) {
       state.books = data.books;
@@ -1202,10 +1272,70 @@ async function refreshActiveTab({ silent = false } = {}) {
   else if (state.tab === 'reviews') await loadReviews({ silent: true });
 }
 
-function changePersona(identity) {
+function readSharedPersona() {
+  try {
+    const uiVal = window.DynamicsUI?.getSharedPersona?.();
+    if (typeof uiVal === 'string' && uiVal.trim()) return uiVal.trim();
+  } catch {}
+  try {
+    const ctx = getBridge()?.getContext?.() || {};
+    const ctxVal = ctx.persona || ctx.sharedPersona || ctx.persona_id || '';
+    if (typeof ctxVal === 'string' && ctxVal.trim()) return ctxVal.trim();
+  } catch {}
+  try {
+    const q = new URLSearchParams(location.search).get('persona');
+    if (q && q.trim()) return q.trim();
+  } catch {}
+  return '';
+}
+
+function resolvePersonaIdFromIdentity(identity) {
+  const matched = state.personas.find(p => String(p.identity) === String(identity));
+  if (matched?.persona_id) return String(matched.persona_id).trim();
+  const raw = String(identity || '').trim();
+  if (raw.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed[0]) return String(parsed[0]).trim();
+    } catch {}
+  }
+  return raw;
+}
+
+function matchPersonaIdentity(rawPersona) {
+  const target = String(rawPersona || '').trim();
+  if (!target) return '';
+  const exact = state.personas.find(
+    p => String(p.identity) === target || String(p.persona_id) === target || String(p.label) === target,
+  );
+  return exact ? String(exact.identity) : '';
+}
+
+function publishSharedPersona(identity) {
+  const personaId = resolvePersonaIdFromIdentity(identity);
+  state.sharedPersona = personaId;
+  try {
+    window.DynamicsUI?.setSharedPersona?.(personaId, { syncUrl: false, emit: true });
+  } catch {}
+}
+
+function applyExternalPersona(rawPersona) {
+  const clean = String(rawPersona || '').trim();
+  if (!clean) return false;
+  state.sharedPersona = clean;
+  const matchedIdentity = matchPersonaIdentity(clean);
+  if (matchedIdentity && matchedIdentity !== state.identity) {
+    changePersona(matchedIdentity, { syncShared: false });
+    return true;
+  }
+  return false;
+}
+
+function changePersona(identity, { syncShared = true } = {}) {
   if (identity === state.identity) return;
   roleEpoch += 1;
   state.identity = identity;
+  if (syncShared) publishSharedPersona(identity);
   state.overview = null;
   state.sources = [];
   state.books = [];
@@ -2062,18 +2192,55 @@ function bindEvents() {
       switchTab(targetTab);
     }
   });
+
+  // Series shared scope synchronization (getSharedScope / setSharedScope / dynamics-scopechange)
+  window.addEventListener('dynamics-scopechange', ev => {
+    const nextScope = String(ev?.detail?.umo ?? getSharedScope() ?? '').trim();
+    if (nextScope === state.sharedScope) return;
+    state.sharedScope = nextScope;
+    if (state.overview) renderOverview(state.overview);
+    loadOverview({ silent: true }).catch(() => {});
+  });
+
+  // Series sharedPersona compatibility listeners
+  const onSharedPersonaEvent = ev => {
+    const detail = ev?.detail;
+    const raw = typeof detail === 'string'
+      ? detail
+      : (detail?.persona ?? detail?.persona_id ?? detail?.sharedPersona ?? detail?.identity ?? '');
+    applyExternalPersona(raw);
+  };
+  window.addEventListener('dynamics-personachange', onSharedPersonaEvent);
+  window.addEventListener('dynamics-persona-change', onSharedPersonaEvent);
+  try {
+    getBridge()?.onContext?.(ctx => {
+      if (typeof ctx?.scope === 'string' && ctx.scope.trim() !== state.sharedScope) {
+        state.sharedScope = ctx.scope.trim();
+        if (state.overview) renderOverview(state.overview);
+      }
+      const nextPersona = ctx?.persona || ctx?.sharedPersona || ctx?.persona_id || '';
+      if (typeof nextPersona === 'string' && nextPersona.trim()) {
+        applyExternalPersona(nextPersona.trim());
+      }
+    });
+  } catch {}
 }
 
 async function init() {
   initTheme();
-  bindEvents();
   const params = new URLSearchParams(location.search);
+  state.sharedScope = String(getSharedScope() || params.get('umo') || '').trim();
+  state.sharedPersona = readSharedPersona();
+  bindEvents();
   const reqIdentity = params.get('identity');
   if (reqIdentity) state.identity = reqIdentity;
   const reqTab = params.get('tab');
   const validTabs = new Set(['overview', 'sources', 'logs', 'reviews']);
   try {
     await loadOverview();
+    if (!reqIdentity && state.sharedPersona) {
+      applyExternalPersona(state.sharedPersona);
+    }
     if (reqTab && validTabs.has(reqTab) && reqTab !== 'overview') {
       await switchTab(reqTab);
     }
