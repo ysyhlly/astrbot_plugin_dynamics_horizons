@@ -182,7 +182,47 @@ _LATIN_STOPWORDS = frozenset(
 )
 
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
-_LATIN_WORD_RE = re.compile(r"[a-zA-Z0-9_+#.-]{3,}")
+_LATIN_WORD_RE = re.compile(r"[a-zA-Z0-9_+#.-]{2,}")
+_SHORT_LATIN_WHITELIST = frozenset(
+    {"ai", "vr", "ar", "ui", "ux", "go", "js", "ts", "py", "db", "3d", "2d", "pc", "mv", "pv", "up", "bg"}
+)
+
+# Lightweight bilingual / domain synonym & alias clusters for smoother topic recall
+_TOPIC_ALIAS_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("arch", ("古建", "古建筑", "木构", "榫卯", "斗拱", "飞檐", "彩画", "瓦当", "梁架", "建筑", "营造", "园林")),
+    ("astro", ("天文", "星空", "星云", "星系", "望远镜", "观星", "行星", "陨石", "航天", "火箭", "宇宙", "银河", "eclipse", "nasa")),
+    ("coffee", ("咖啡", "手冲", "意式", "拿铁", "美式", "烘豆", "咖啡豆", "瑰夏", "冷萃", "拉花", "espresso", "coffee")),
+    ("tea", ("茶道", "泡茶", "乌龙", "普洱", "绿茶", "红茶", "抹茶", "茶具", "茶器", "品茶")),
+    ("game", ("游戏", "独立游戏", "单机", "steam", "手柄", "主机", "肉鸽", "roguelike", "rpg", "galgame", "开放世界", "通关", "攻略")),
+    ("film", ("电影", "影评", "导演", "片单", "纪录片", "胶片", "票房", "影史", "镜头语言", "cinema", "movie")),
+    ("anime", ("动漫", "番剧", "新番", "二次元", "漫画", "轻小说", "声优", "作画", "剧场版", "anime", "manga")),
+    ("history", ("历史", "考古", "文物", "博物馆", "古籍", "碑刻", "青铜器", "壁画", "史料", "遗迹")),
+    ("photo", ("摄影", "相机", "胶卷", "镜头", "构图", "风光", "街拍", "暗房", "曝光", "camera", "photo")),
+    ("music", ("音乐", "古典", "爵士", "摇滚", "民谣", "黑胶", "歌单", "交响", "钢琴", "吉他", "原声", "ost", "music")),
+    ("tech", ("科技", "大模型", "算法", "芯片", "开源", "编程", "代码", "ai", "llm", "python", "rust", "linux", "机器人")),
+    ("book", ("读书", "小说", "文学", "书评", "散文", "诗歌", "推理小说", "科幻", "奇幻", "童话", "传记", "名著", "阅读")),
+    ("food", ("美食", "烘焙", "料理", "甜点", "食谱", "做饭", "下厨", "蛋糕", "面包", "拉面", "火锅", "小吃")),
+    ("pet", ("猫咪", "小猫", "修狗", "小狗", "宠物", "萌宠", "撸猫", "猫猫", "狗狗")),
+    ("travel", ("旅行", "旅游", "徒步", "露营", "古城", "古镇", "山野", "海边", "铁道", "漫游", "逛展")),
+    ("art", ("绘画", "插画", "水彩", "油画", "版画", "国画", "颜料", "手账", "雕塑", "美术馆", "策展")),
+)
+
+
+def _extract_alias_clusters(text: str) -> set[str]:
+    lowered = str(text or "").casefold()
+    if not lowered:
+        return set()
+    hits: set[str] = set()
+    for cid, terms in _TOPIC_ALIAS_GROUPS:
+        for term in terms:
+            if term.isascii():
+                if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", lowered):
+                    hits.add(cid)
+                    break
+            elif term in lowered:
+                hits.add(cid)
+                break
+    return hits
 
 
 def _extract_features(text: str) -> tuple[set[str], set[str]]:
@@ -193,7 +233,9 @@ def _extract_features(text: str) -> tuple[set[str], set[str]]:
 
     for m in _LATIN_WORD_RE.finditer(lowered):
         w = m.group(0).strip("._-")
-        if len(w) >= 3 and w not in _LATIN_STOPWORDS and not w.isdigit():
+        if not w or w.isdigit() or w in _LATIN_STOPWORDS:
+            continue
+        if len(w) >= 3 or w in _SHORT_LATIN_WHITELIST:
             strong.add(w)
 
     for m in _CJK_RUN_RE.finditer(lowered):
@@ -236,7 +278,41 @@ class ProjectionCache:
         }
         self._umo_identities: dict[str, str] = {}
         self._persona_aliases: dict[str, str] = {}
+        # Zero-I/O cache of Learning member taboos: {(umo, member_id): frozenset[str]}
+        self._member_taboos: dict[tuple[str, str], frozenset[str]] = {}
         self.generation: int = 0
+
+    def update_member_taboos(
+        self, taboos: dict[tuple[str, str], list[str] | set[str] | frozenset[str]]
+    ) -> None:
+        """Atomically replace cached member dislike/boundary terms from Learning."""
+        next_map: dict[tuple[str, str], frozenset[str]] = {}
+        for key, raw_terms in (taboos or {}).items():
+            if not isinstance(key, tuple) or len(key) != 2:
+                continue
+            u, m = str(key[0] or "").strip(), str(key[1] or "").strip()
+            if not u or not m:
+                continue
+            clean = frozenset(
+                str(t or "").strip().casefold()
+                for t in (raw_terms or ())
+                if len(str(t or "").strip()) >= 2
+            )
+            if clean:
+                next_map[(u, m)] = clean
+        self._member_taboos = next_map
+
+    def _taboos_for_member(self, umo: str, member: str) -> frozenset[str]:
+        if not umo or not member:
+            return frozenset()
+        return self._member_taboos.get((umo, member), frozenset())
+
+    @staticmethod
+    def _hits_taboo(text_blob: str, taboos: frozenset[str]) -> bool:
+        if not taboos:
+            return False
+        low = str(text_blob or "").casefold()
+        return any(t and t in low for t in taboos)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
         by_id = snapshot.get("by_identity", {})
@@ -369,11 +445,13 @@ class ProjectionCache:
             for r in bucket.get("member_topics", [])
             if r["umo"] == umo and r["member_id"] == member
         }
+        member_taboos = self._taboos_for_member(umo, member)
         interests = [
             i
             for i in interests
             if i["topic"] not in blocked_member_topics
             and not suppressed.intersection(i.get("evidence_log_ids", []))
+            and not self._hits_taboo(f"{i.get('topic', '')} {i.get('summary', '')}", member_taboos)
         ]
         # Discussion reflections are private to the exact character, group and
         # member that produced them. Filter before ranking so another member's
@@ -394,6 +472,7 @@ class ProjectionCache:
                     or log_id in suppressed
                     or note_topic.casefold() in blocked_lower
                     or note_topic.casefold() in member_blocked_lower
+                    or self._hits_taboo(note_topic, member_taboos)
                 ):
                     continue
                 reflections_by_log.setdefault(log_id, []).append(note)
@@ -401,6 +480,12 @@ class ProjectionCache:
         logs = []
         for row in bucket.get("logs") or []:
             if row["log_id"] in suppressed:
+                continue
+            cit_obj = row.get("citation") or {}
+            if self._hits_taboo(
+                f"{cit_obj.get('title', '')} {row.get('digest', '')} {row.get('reflection', '')}",
+                member_taboos,
+            ):
                 continue
             # Copy the snapshot row; never write member text into the persona-wide
             # reading reflection stored on the reading log.
@@ -412,7 +497,12 @@ class ProjectionCache:
             )[:2]
             logs.append(scoped)
         books = [
-            b for b in (bucket.get("books") or []) if b.get("chapter_cursor", 0) > 0
+            b
+            for b in (bucket.get("books") or [])
+            if b.get("chapter_cursor", 0) > 0
+            and not self._hits_taboo(
+                f"{b.get('title', '')} {b.get('last_reflection', '')}", member_taboos
+            )
         ]
 
         # Filter questions strictly per-UMO: never offer expired or UMO-discussed questions,
@@ -420,7 +510,11 @@ class ProjectionCache:
         recently_discussed_topics: set[str] = set()
         eligible_questions: list[dict[str, Any]] = []
         for q in bucket.get("questions") or []:
-            if q.get("log_id") in suppressed or q.get("topic") in blocked_member_topics:
+            if (
+                q.get("log_id") in suppressed
+                or q.get("topic") in blocked_member_topics
+                or self._hits_taboo(f"{q.get('topic', '')} {q.get('question', '')}", member_taboos)
+            ):
                 continue
             if float(q.get("expires_at", 0)) <= stamp:
                 continue
@@ -453,15 +547,18 @@ class ProjectionCache:
                 questions=chosen_qs,
             )
 
-        # 2. Topic / Keyword Matching
+        # 2. Topic / Keyword Matching (with alias/synonym cluster expansion & smooth threshold)
         q_lower = q_str.casefold()
         near_lower = near_str.casefold()
         q_strong, q_bi = _extract_features(q_str)
         near_strong, near_bi = _extract_features(near_str)
+        q_aliases = _extract_alias_clusters(q_str)
+        near_aliases = _extract_alias_clusters(near_str)
         all_strong = q_strong | near_strong
         all_bi = q_bi | near_bi
+        all_aliases = q_aliases | near_aliases
 
-        if not all_strong and not all_bi:
+        if not all_strong and not all_bi and not all_aliases:
             return _empty_result("no_match")
 
         def score_text(primary_label: str, body_text: str) -> float:
@@ -476,7 +573,8 @@ class ProjectionCache:
                     score += 5.0
                 elif p_low in near_lower:
                     score += 3.0
-            t_strong, t_bi = _extract_features(f"{primary_label} {body_text}")
+            full_target = f"{primary_label} {body_text}"
+            t_strong, t_bi = _extract_features(full_target)
             q_strong_hits = q_strong & t_strong
             near_strong_hits = near_strong & t_strong
             q_bi_hits = q_bi & t_bi
@@ -498,14 +596,27 @@ class ProjectionCache:
                 and len(p_low) <= 4
             ):
                 score += 2.3
+            elif len(q_bi_hits) == 1 and p_low and any(bg in p_low for bg in q_bi_hits):
+                score += 1.4
+
+            # Semantic / domain alias cluster boost (bridges e.g. 榫卯 <-> 古建筑, 手冲 <-> 咖啡)
+            if all_aliases:
+                t_aliases = _extract_alias_clusters(full_target)
+                q_alias_hits = q_aliases & t_aliases
+                near_alias_hits = near_aliases & t_aliases
+                if q_alias_hits:
+                    score += 2.0 + 0.4 * min(2, len(q_alias_hits) - 1)
+                elif near_alias_hits:
+                    score += 1.5
             return score
 
+        match_threshold = 2.0
         scored_interests: list[tuple[float, dict[str, Any]]] = []
         for item in interests:
             s = score_text(item["topic"], item["summary"]) * (
                 0.85 + 0.15 * min(2.0, float(item.get("heat_score", 1.0)))
             )
-            if s >= 2.2:
+            if s >= match_threshold:
                 scored_interests.append((s, item))
         scored_interests.sort(key=lambda x: -x[0])
 
@@ -528,7 +639,7 @@ class ProjectionCache:
                 if len(cit.get("creator", "")) >= 2
                 else 0.0,
             )
-            if title_or_creator and s >= 2.2:
+            if title_or_creator and s >= match_threshold:
                 scored_logs.append((s, item))
         scored_logs.sort(key=lambda x: -x[0])
 
@@ -541,14 +652,14 @@ class ProjectionCache:
                 s = max(s, 3.0)
             if q.get("log_id") in matched_log_ids:
                 s = max(s, 2.8)
-            if s >= 2.2:
+            if s >= match_threshold:
                 scored_questions.append((s, q))
         scored_questions.sort(key=lambda x: -x[0])
 
         scored_books: list[tuple[float, dict[str, Any]]] = []
         for b in books:
             s = score_text(b["title"], f"{b['creator']} {b['last_reflection']}")
-            if s >= 2.2:
+            if s >= match_threshold:
                 scored_books.append((s, b))
         scored_books.sort(key=lambda x: -x[0])
 
@@ -698,6 +809,7 @@ class ProjectionCache:
         blocked_member_lower = {
             str(t).strip().casefold() for t in blocked_member_topics if str(t).strip()
         }
+        member_taboos = self._taboos_for_member(umo, member)
         if q_lower and any(bt in q_lower for bt in blocked_member_lower):
             return {"available": False, "reason": "blocked_topic"}
 
@@ -708,9 +820,16 @@ class ProjectionCache:
             and float(i.get("expires_at", 0)) > stamp
             and i["topic"] not in blocked_member_topics
             and not suppressed.intersection(i.get("evidence_log_ids", []))
+            and not self._hits_taboo(f"{i.get('topic', '')} {i.get('summary', '')}", member_taboos)
         ]
         logs = [
-            row for row in (bucket.get("logs") or []) if row["log_id"] not in suppressed
+            row
+            for row in (bucket.get("logs") or [])
+            if row["log_id"] not in suppressed
+            and not self._hits_taboo(
+                f"{(row.get('citation') or {}).get('title', '')} {row.get('digest', '')} {row.get('reflection', '')}",
+                member_taboos,
+            )
         ]
         log_title_by_id = {
             row["log_id"]: strip_raw_urls(
@@ -722,7 +841,11 @@ class ProjectionCache:
         recently_discussed_topics: set[str] = set()
         eligible_questions: list[dict[str, Any]] = []
         for q in bucket.get("questions") or []:
-            if q.get("log_id") in suppressed or q.get("topic") in blocked_member_topics:
+            if (
+                q.get("log_id") in suppressed
+                or q.get("topic") in blocked_member_topics
+                or self._hits_taboo(f"{q.get('topic', '')} {q.get('question', '')}", member_taboos)
+            ):
                 continue
             if float(q.get("expires_at", 0)) <= stamp:
                 continue
@@ -739,6 +862,7 @@ class ProjectionCache:
         ]
 
         q_strong, q_bi = _extract_features(q_str) if q_str else (set(), set())
+        q_aliases = _extract_alias_clusters(q_str) if q_str else set()
 
         def _score_match(primary: str, body: str) -> float:
             if not q_str:
@@ -755,12 +879,15 @@ class ProjectionCache:
                 and p_low in q_lower
             ):
                 score += 4.0
-            t_strong, t_bi = _extract_features(f"{primary} {body}")
+            full_target = f"{primary} {body}"
+            t_strong, t_bi = _extract_features(full_target)
             if q_strong & t_strong:
                 score += 2.6 + 0.6 * min(3, len(q_strong & t_strong) - 1)
             if len(q_bi & t_bi) >= 2:
                 score += 2.2
             elif len(q_bi & t_bi) == 1 and p_low and any(bg in p_low for bg in (q_bi & t_bi)):
+                score += 2.0
+            if q_aliases and (q_aliases & _extract_alias_clusters(full_target)):
                 score += 2.0
             return score
 

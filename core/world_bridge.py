@@ -653,3 +653,191 @@ class WorldBridge:
             }
         except Exception as exc:
             return {"synced": False, "reason": type(exc).__name__}
+
+    # ------------------------------------------------------------------
+    # Wave 2: Learning & Memory Zero-Coupling Companion Bridges
+    # ------------------------------------------------------------------
+
+    def find_learning_plugin(self) -> Any | None:
+        for name, plugin in _iter_star_instances(self.context) or ():
+            if name == "astrbot_plugin_dynamics_learning" or callable(
+                getattr(plugin, "get_horizons_social_hints", None)
+            ):
+                return plugin
+        return None
+
+    def find_memory_plugin(self) -> Any | None:
+        for name, plugin in _iter_star_instances(self.context) or ():
+            if name == "astrbot_plugin_dynamics_memory":
+                return plugin
+        return None
+
+    async def fetch_learning_social_hints(
+        self, umos: list[str], *, member_id: str = ""
+    ) -> dict[str, Any]:
+        """Zero-coupling read of `dynamics_learning.get_horizons_social_hints(umo, member_id)`."""
+        empty = {"group_interests": [], "member_taboos": {}}
+        learning = self.find_learning_plugin()
+        if learning is None:
+            return empty
+        getter = getattr(learning, "get_horizons_social_hints", None)
+        if not callable(getter):
+            return empty
+
+        clean_umos = [str(u).strip() for u in (umos or []) if str(u or "").strip()]
+        if not clean_umos:
+            return empty
+
+        from .sanitize import sanitize_untrusted_text
+
+        group_interests: list[str] = []
+        seen_interests: set[str] = set()
+        taboos: dict[tuple[str, str], set[str]] = {}
+        clean_member = str(member_id or "").strip()
+
+        for umo in dict.fromkeys(clean_umos[:12]):
+            try:
+                res = await _call_maybe_async(getter, umo, clean_member, timeout=3.0)
+            except TypeError:
+                try:
+                    res = await _call_maybe_async(getter, umo, timeout=3.0)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if not isinstance(res, dict):
+                continue
+            for raw_topic in (res.get("group_interests") or [])[:12]:
+                clean_t = strip_raw_urls(
+                    sanitize_untrusted_text(str(raw_topic or ""), max_chars=48)["text"]
+                ).strip()
+                key = clean_t.casefold()
+                if len(clean_t) >= 2 and key not in seen_interests:
+                    seen_interests.add(key)
+                    group_interests.append(clean_t)
+            for field in ("member_dislikes", "member_boundaries"):
+                mapping = res.get(field)
+                if not isinstance(mapping, dict):
+                    continue
+                for mid, raw_items in mapping.items():
+                    m_key = str(mid or "").strip()
+                    if not m_key:
+                        continue
+                    items_iter = (
+                        raw_items
+                        if isinstance(raw_items, (list, tuple, set, frozenset))
+                        else [raw_items]
+                    )
+                    bucket = taboos.setdefault((umo, m_key), set())
+                    for term in items_iter:
+                        ct = strip_raw_urls(
+                            sanitize_untrusted_text(str(term or ""), max_chars=60)["text"]
+                        ).strip()
+                        if len(ct) >= 2:
+                            bucket.add(ct.casefold())
+
+        frozen_taboos = {k: frozenset(v) for k, v in taboos.items() if v}
+        if self.projection is not None and hasattr(self.projection, "update_member_taboos"):
+            # Merge with existing cached taboos for other UMOs when querying a subset
+            merged = dict(getattr(self.projection, "_member_taboos", {}) or {})
+            for umo in clean_umos[:12]:
+                for k in [key for key in merged if key[0] == umo and (not clean_member or key[1] == clean_member)]:
+                    merged.pop(k, None)
+            merged.update(frozen_taboos)
+            self.projection.update_member_taboos(merged)
+
+        return {
+            "group_interests": group_interests[:12],
+            "member_taboos": frozen_taboos,
+        }
+
+    async def notify_learning_reflection(
+        self,
+        *,
+        umo: str,
+        member_id: str,
+        topic: str,
+        summary: str,
+        sentiment: str = "positive",
+    ) -> dict[str, Any]:
+        """Push verified deep discussion reflection back to `dynamics_learning`."""
+        learning = self.find_learning_plugin()
+        if learning is None:
+            return {"synced": False, "reason": "learning_offline"}
+        ingestor = getattr(learning, "ingest_horizons_reflection", None)
+        if not callable(ingestor):
+            return {"synced": False, "reason": "method_absent"}
+        clean_umo = str(umo or "").strip()
+        clean_member = str(member_id or "").strip()
+        clean_topic = strip_raw_urls(str(topic or "")).strip()[:64]
+        clean_summary = strip_raw_urls(str(summary or "")).strip()[:200]
+        if not clean_umo or not clean_member or not clean_topic or not clean_summary:
+            return {"synced": False, "reason": "invalid_payload"}
+        try:
+            res = ingestor(
+                clean_umo,
+                clean_member,
+                clean_topic,
+                clean_summary,
+                sentiment=str(sentiment or "positive"),
+            )
+            if inspect.isawaitable(res):
+                res = await asyncio.wait_for(res, timeout=3.0)
+            return {"synced": True, "result": res}
+        except Exception as exc:
+            return {"synced": False, "reason": type(exc).__name__}
+
+    async def sync_memory_reading_note(
+        self,
+        *,
+        identity: str,
+        log_record: dict[str, Any],
+        topic: str = "",
+    ) -> dict[str, Any]:
+        """Lightly archive an approved reading journal note into `dynamics_memory` if supported."""
+        memory = self.find_memory_plugin()
+        if memory is None:
+            return {"synced": False, "reason": "memory_offline"}
+        method_name = ""
+        ingestor = None
+        for cand in (
+            "ingest_horizons_note",
+            "record_horizons_note",
+            "ingest_external_note",
+            "add_memory_note",
+        ):
+            fn = getattr(memory, cand, None)
+            if callable(fn):
+                method_name = cand
+                ingestor = fn
+                break
+        if ingestor is None:
+            return {"synced": False, "reason": "method_absent"}
+
+        norm_id = normalize_identity(identity)
+        persona_id, _ = unpack_identity(norm_id)
+        cit = (
+            log_record.get("citation")
+            if isinstance(log_record.get("citation"), dict)
+            else {}
+        )
+        payload = {
+            "source_plugin": "astrbot_plugin_dynamics_horizons",
+            "fact_kind": "external_media",
+            "identity": norm_id,
+            "persona_id": persona_id,
+            "log_id": str(log_record.get("log_id") or ""),
+            "topic": strip_raw_urls(str(topic or "")).strip()[:48],
+            "title": strip_raw_urls(str(cit.get("title") or "")).strip()[:120],
+            "creator": strip_raw_urls(str(cit.get("creator") or "")).strip()[:60],
+            "digest": strip_raw_urls(str(log_record.get("digest") or "")).strip()[:200],
+            "reflection": strip_raw_urls(str(log_record.get("reflection") or "")).strip()[:150],
+            "created_at": float(log_record.get("created_at") or time.time()),
+        }
+        try:
+            res = ingestor(payload)
+            if inspect.isawaitable(res):
+                res = await asyncio.wait_for(res, timeout=3.0)
+            return {"synced": True, "method": method_name, "result": res}
+        except Exception as exc:
+            return {"synced": False, "reason": type(exc).__name__}

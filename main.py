@@ -400,6 +400,68 @@ def build_cache_anchor_contexts(
     ]
 
 
+def _extract_response_usage(resp: Any) -> tuple[int, int]:
+    """Best-effort extraction of `(prompt_tokens, completion_tokens)` from provider response."""
+    if resp is None:
+        return 0, 0
+    candidates = [
+        getattr(resp, "usage", None),
+        getattr(resp, "usage_metadata", None),
+        getattr(getattr(resp, "raw_completion", None), "usage", None),
+        getattr(getattr(resp, "raw_completion", None), "usage_metadata", None),
+    ]
+    for obj in candidates:
+        if obj is None:
+            continue
+        if isinstance(obj, dict):
+            pt = obj.get("prompt_tokens") or obj.get("input_tokens") or obj.get("prompt_token_count") or 0
+            ct = obj.get("completion_tokens") or obj.get("output_tokens") or obj.get("candidates_token_count") or 0
+        else:
+            pt = (
+                getattr(obj, "prompt_tokens", None)
+                or getattr(obj, "input_tokens", None)
+                or getattr(obj, "prompt_token_count", None)
+                or 0
+            )
+            ct = (
+                getattr(obj, "completion_tokens", None)
+                or getattr(obj, "output_tokens", None)
+                or getattr(obj, "candidates_token_count", None)
+                or 0
+            )
+        try:
+            p_int = max(0, int(pt or 0))
+            c_int = max(0, int(ct or 0))
+            if p_int > 0 or c_int > 0:
+                return p_int, c_int
+        except (TypeError, ValueError):
+            continue
+    return 0, 0
+
+
+def _parse_anli_command_args(raw_msg: str) -> tuple[str, str]:
+    """Parse `/安利 <链接/BV号/书名> [推荐语]` preserving multi-word notes and 《书名》."""
+    text = str(raw_msg or "").strip()
+    if not text:
+        return "", ""
+    # Strip leading command token (/安利, 安利, /anli, /推荐)
+    import re as _re
+
+    stripped = _re.sub(
+        r"^(?:[/!！.．]?)(?:安利|anli|推荐)(?:\s+|$)", "", text, count=1, flags=_re.IGNORECASE
+    ).strip()
+    if not stripped:
+        return "", ""
+    # If starts with 《...》, capture whole book title even if it contains spaces
+    book_m = _re.match(r"^(《[^》]{1,120}》)\s*(.*)$", stripped, _re.DOTALL)
+    if book_m:
+        return book_m.group(1).strip(), book_m.group(2).strip()
+    parts = stripped.split(None, 1)
+    target = parts[0].strip()
+    note = parts[1].strip() if len(parts) > 1 else ""
+    return target, note
+
+
 def _accepts_kwarg(fn: Any, name: str) -> bool:
     try:
         parameters = inspect.signature(fn).parameters
@@ -1446,6 +1508,162 @@ class Main(Star):
         return encode_json(result)
 
     # ------------------------------------------------------------------
+    # Wave 2: Group `/安利` Command, LLM Tool & Explicit Feedback Commands
+    # ------------------------------------------------------------------
+
+    @filter.command("安利", alias={"anli", "推荐"})
+    async def cmd_anli(self, event: AstrMessageEvent):
+        """群友顺手安利链接、B站视频(BV/av/b23.tv)或书名给角色案头。用法：/安利 <链接/BV号/书名> [推荐语]"""
+        if (
+            self.closed
+            or not self.ready
+            or self.engine is None
+            or not bool(self.config.get("enabled", True))
+        ):
+            yield event.plain_result("群间见闻当前尚未就绪或已停用。")
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not umo or is_series_group_excluded(self.context, umo=umo):
+            yield event.plain_result("当前群聊未开启群间见闻。")
+            return
+        sender_id_fn = getattr(event, "get_sender_id", None)
+        sender_name_fn = getattr(event, "get_sender_name", None)
+        member_id = str(sender_id_fn() or "").strip() if callable(sender_id_fn) else ""
+        member_name = (
+            str(sender_name_fn() or "").strip() if callable(sender_name_fn) else ""
+        )
+        raw_msg = str(getattr(event, "message_str", "") or "").strip()
+        target, note = _parse_anli_command_args(raw_msg)
+        _, ident = await self._resolve_event_character_scope(event, umo)
+        res = await self.engine.submit_anli_recommendation(
+            umo=umo,
+            member_id=member_id,
+            member_name=member_name,
+            raw_input=target,
+            note=note,
+            identity=ident,
+        )
+        yield event.plain_result(str(res.get("message") or "已处理你的安利。"))
+
+    @filter.llm_tool(name="recommend_horizon_content")
+    async def recommend_horizon_content(
+        self,
+        event: AstrMessageEvent,
+        target: str,
+        note: str = "",
+    ) -> str:
+        """将群友在聊天中顺口推荐的公开链接、B站视频（BV/av/b23.tv）或书名收录到角色的「群间见闻」案头待读池。角色后续在空闲清醒时精读并通过审查后，可自然聊起观后感。
+
+        Args:
+            target(str): 必填。公开文章 URL、B 站视频链接或 BV/av 号，或书名/作品名。
+            note(str): 可选。群友附带的简短推荐语或看点提示。
+        """
+        if (
+            self.closed
+            or not self.ready
+            or self.engine is None
+            or not bool(self.config.get("enabled", True))
+        ):
+            return encode_json({"ok": False, "reason": "disabled", "message": "群间见闻未就绪或已停用"})
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not umo or is_series_group_excluded(self.context, umo=umo):
+            return encode_json({"ok": False, "reason": "excluded_by_core", "message": "当前会话未开启群间见闻"})
+        sender_id_fn = getattr(event, "get_sender_id", None)
+        sender_name_fn = getattr(event, "get_sender_name", None)
+        member_id = str(sender_id_fn() or "").strip() if callable(sender_id_fn) else ""
+        member_name = (
+            str(sender_name_fn() or "").strip() if callable(sender_name_fn) else ""
+        )
+        _, ident = await self._resolve_event_character_scope(event, umo)
+        res = await self.engine.submit_anli_recommendation(
+            umo=umo,
+            member_id=member_id,
+            member_name=member_name,
+            raw_input=str(target or ""),
+            note=str(note or ""),
+            identity=ident,
+        )
+        return encode_json(res)
+
+    @filter.command("见闻退订")
+    async def cmd_opt_out_horizons(self, event: AstrMessageEvent):
+        """退订本群的见闻主动分享，或附带话题名仅屏蔽该话题。用法：/见闻退订 [话题名]"""
+        if self.closed or not self.ready or self.engine is None:
+            yield event.plain_result("群间见闻尚未就绪。")
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        sender_id_fn = getattr(event, "get_sender_id", None)
+        member_id = str(sender_id_fn() or "").strip() if callable(sender_id_fn) else ""
+        raw_msg = str(getattr(event, "message_str", "") or "").strip()
+        parts = raw_msg.split(None, 1)
+        topic = parts[1].strip() if len(parts) > 1 else ""
+        directive = f"别再给我推荐{topic}" if topic else "别再向我分享"
+        ack = await self.apply_member_feedback_text(event, directive, umo=umo, member_id=member_id)
+        yield event.plain_result(ack or "已经帮你记录退订偏好啦。")
+
+    @filter.command("见闻恢复")
+    async def cmd_opt_in_horizons(self, event: AstrMessageEvent):
+        """恢复本群的见闻主动分享，或恢复指定话题。用法：/见闻恢复 [话题名]"""
+        if self.closed or not self.ready or self.engine is None:
+            yield event.plain_result("群间见闻尚未就绪。")
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        sender_id_fn = getattr(event, "get_sender_id", None)
+        member_id = str(sender_id_fn() or "").strip() if callable(sender_id_fn) else ""
+        raw_msg = str(getattr(event, "message_str", "") or "").strip()
+        parts = raw_msg.split(None, 1)
+        topic = parts[1].strip() if len(parts) > 1 else ""
+        directive = f"恢复给我推荐{topic}" if topic else "恢复向我分享"
+        ack = await self.apply_member_feedback_text(event, directive, umo=umo, member_id=member_id)
+        yield event.plain_result(ack or "已经帮你恢复见闻分享偏好啦。")
+
+    async def apply_member_feedback_text(
+        self,
+        event: AstrMessageEvent | None,
+        text: str,
+        *,
+        umo: str = "",
+        member_id: str = "",
+    ) -> str:
+        """Process a member's natural-language opt-out/opt-in/topic-block/correction directive and return gentle receipt."""
+        if self.closed or not self.ready or self.engine is None:
+            return ""
+        clean_umo = str(umo or getattr(event, "unified_msg_origin", "") or "").strip()
+        clean_member = str(member_id or "").strip()
+        if not clean_member and event is not None:
+            fn = getattr(event, "get_sender_id", None)
+            if callable(fn):
+                clean_member = str(fn() or "").strip()
+        if not clean_umo or not clean_member:
+            return ""
+        char_scope, ident = (
+            await self._resolve_event_character_scope(event, clean_umo)
+            if event is not None
+            else (None, self._resolve_scope_identity_readonly(scope=clean_umo))
+        )
+        if not ident:
+            known_ids = await run_io(self.engine.store.known_identities)
+            personas = self.engine.world_bridge.discover_personas(
+                self.engine.store, self.engine.sessions, known_identities=known_ids
+            )
+            ident = personas[0]["identity"] if personas else normalize_identity("default")
+        from .core.feedback import enqueue
+
+        ev_payload = {
+            "kind": "message.received",
+            "umo": clean_umo,
+            "identity": ident,
+            "character_scope": char_scope or {},
+            "member": clean_member,
+            "text": str(text or ""),
+            "event_id": f"cmd_fb:{clean_umo}:{clean_member}:{int(self.engine.clock() * 1000)}",
+        }
+        res = await run_io(enqueue, self.engine, ev_payload)
+        if isinstance(res, dict) and res.get("projection_dirty"):
+            await self.engine.refresh_projection()
+        return str((res or {}).get("feedback_ack") or "")
+
+    # ------------------------------------------------------------------
     # Turn Feedback & Per-UMO Question Consumption
     # ------------------------------------------------------------------
 
@@ -1510,7 +1728,14 @@ class Main(Star):
             and reply
             and (qids or topics or event.get("log_ids") or event.get("intent_id"))
         )
-        return {"accepted": True, "queued": will_queue}
+        from .core.feedback import parse_member_feedback_command
+
+        user_txt = str(event.get("text") or event.get("user_text") or "")[:500]
+        parsed_fb = parse_member_feedback_command(user_txt)
+        out: dict[str, Any] = {"accepted": True, "queued": will_queue}
+        if parsed_fb and parsed_fb.get("ack"):
+            out["feedback_ack"] = parsed_fb["ack"]
+        return out
 
     def ingest_dynamics_event(self, event: dict[str, Any]) -> dict[str, Any]:
         if (
@@ -1940,5 +2165,9 @@ class Main(Star):
             self._assert_binding_current(role, provider_id, provider)
         except _BindingChangedError as exc:
             raise ValueError(str(exc)) from None
+        if self.engine is not None and hasattr(self.engine, "set_last_model_usage"):
+            pt, ct = _extract_response_usage(response)
+            if pt > 0 or ct > 0:
+                self.engine.set_last_model_usage(pt, ct)
         content = getattr(response, "completion_text", None)
         return decode_model_object(content)

@@ -228,6 +228,7 @@ async def process_received(engine, row, data):
             )
         except Exception as exc:
             raise DiscussionModelError("discussion_review_call_failed") from exc
+    saved_notes: list[dict[str, str]] = []
     with store.lock, store.db:
         saved = False
         for item in _rows(result, "reflections", 2):
@@ -245,7 +246,16 @@ async def process_received(engine, row, data):
                 member_quote=quote, reflection=reflection,
                 source_log_revision=anchor["source_log_revision"], occurred_at=data["occurred_at"], now=engine.clock(),
             )
-            saved = bool(recorded) or saved
+            if recorded:
+                saved = True
+                saved_notes.append(
+                    {
+                        "umo": str(row["umo"]),
+                        "member_id": str(row["member_id"]),
+                        "topic": str(anchor["topic"]),
+                        "summary": reflection[:200],
+                    }
+                )
         if saved:
             outcome = "verified"
         elif not anchors:
@@ -256,3 +266,16 @@ async def process_received(engine, row, data):
             "UPDATE feedback_jobs SET status='done',payload_json=json_set(payload_json,'$.feedback_outcome',?) "
             "WHERE event_id=?", (outcome, row["event_id"]),
         )
+    notifier = getattr(engine, "notify_learning_reflection", None)
+    if saved_notes and callable(notifier):
+        for note in saved_notes:
+            try:
+                await notifier(
+                    umo=note["umo"],
+                    member_id=note["member_id"],
+                    topic=note["topic"],
+                    summary=note["summary"],
+                    sentiment="positive",
+                )
+            except Exception:
+                pass

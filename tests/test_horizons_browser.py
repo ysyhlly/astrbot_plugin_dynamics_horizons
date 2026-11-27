@@ -387,25 +387,38 @@ window.AstrBotPluginPage = {
       return { status: 'ok', data: { sources: st.sources, books: ov.books } };
     }
     if (route === 'logs') {
-      const filtered = params.source_kind
+      let filtered = params.source_kind
         ? st.logs.filter(x => x.source_kind === params.source_kind)
         : st.logs;
+      if (params.query) {
+        const q = String(params.query).toLowerCase();
+        filtered = filtered.filter(x => JSON.stringify(x).toLowerCase().includes(q));
+      }
       const page = Number(params.page) || 1;
       return { status: 'ok', data: { items: filtered, page, total: filtered.length, page_size: 1 } };
     }
     if (route === 'reviews') {
-      const filtered = params.state
+      let filtered = params.state
         ? (
             params.state === 'pending_review' || params.state === 'pending'
               ? st.reviews.filter(x => x.state === 'pending_review' || x.state === 'held')
               : st.reviews.filter(x => x.state === params.state)
           )
         : st.reviews;
+      if (params.source_kind) {
+        filtered = filtered.filter(x => x.source_kind === params.source_kind);
+      }
+      if (params.query) {
+        const q = String(params.query).toLowerCase();
+        filtered = filtered.filter(x => JSON.stringify(x).toLowerCase().includes(q));
+      }
       return {
         status: 'ok',
         data: {
           items: filtered,
           blocked_topics: st.blocked_topics,
+          corrections: st.corrections || [],
+          corrections_count: (st.corrections || []).length,
           page: Number(params.page) || 1,
           total: filtered.length,
         },
@@ -474,8 +487,26 @@ window.AstrBotPluginPage = {
       }
       if (body.op === 'update_book_status') {
         const bk = ov.books.find(b => b.book_id === body.book_id);
-        if (bk) bk.status = body.status;
+        if (bk) {
+          if (body.status) bk.status = body.status;
+          if (typeof body.chapter_cursor === 'number') bk.chapter_cursor = body.chapter_cursor;
+        }
         return { status: 'ok', data: { updated: true } };
+      }
+      if (body.op === 'delete_book') {
+        ov.books = ov.books.filter(b => b.book_id !== body.book_id);
+        return { status: 'ok', data: { deleted: true } };
+      }
+      if (body.op === 'test_source') {
+        if (st.test_source_response) return { status: 'ok', data: st.test_source_response };
+        return {
+          status: 'ok',
+          data: {
+            ok: true,
+            count: 1,
+            preview_items: [{ title: '试抓样本条目', creator: '测试作者' }],
+          },
+        };
       }
       if (body.op === 'update') {
         const s = st.sources.find(x => x.source_id === body.source_id);
@@ -501,6 +532,33 @@ window.AstrBotPluginPage = {
       if (body.op === 'approve' || body.op === 'reject') {
         const p = st.reviews.find(x => x.proposal_id === body.proposal_id);
         if (p) p.state = body.op === 'approve' ? 'approved' : 'rejected';
+      } else if (body.op === 'edit_proposal') {
+        const p = st.reviews.find(x => x.proposal_id === body.proposal_id);
+        if (p) {
+          if (body.digest) p.digest = body.digest;
+          if (body.reflection) p.reflection = body.reflection;
+          if (body.staged_interest) p.staged_interest = body.staged_interest;
+          if (body.questions) p.questions = body.questions;
+        }
+      } else if (body.op === 'batch_approve' || body.op === 'batch_reject') {
+        const targetState = body.op === 'batch_approve' ? 'approved' : 'rejected';
+        const ids = (body.items || []).map(i => i.proposal_id);
+        for (const pid of ids) {
+          const p = st.reviews.find(x => x.proposal_id === pid);
+          if (p) p.state = targetState;
+        }
+        return { status: 'ok', data: { processed: ids.length, succeeded: ids.length, failed: 0 } };
+      } else if (body.op === 'resolve_correction') {
+        st.corrections = (st.corrections || []).filter(c => c.correction_id !== body.correction_id);
+      } else if (body.op === 'apply_preset') {
+        ov.runtime_config = Object.assign(ov.runtime_config || {}, { daily_digest_quota: 2, daily_model_call_quota: 20, review_mode: 'llm_then_human', interest_half_life_days: 8 });
+      } else if (body.op === 'cancel_intent') {
+        const it = (ov.outreach_diagnostics?.horizon_intents || []).find(x => x.intent_id === body.intent_id);
+        if (it) it.status = 'cancelled';
+      } else if (body.op === 'restore_member_outreach') {
+        if (ov.outreach_diagnostics) {
+          ov.outreach_diagnostics.opted_out_members = (ov.outreach_diagnostics.opted_out_members || []).filter(m => m.member_id !== body.member_id);
+        }
       } else if (body.op === 'block_topic') {
         if (body.topic && !st.blocked_topics.includes(body.topic)) st.blocked_topics.push(body.topic);
       } else if (body.op === 'unblock_topic') {
@@ -1092,6 +1150,186 @@ def test_wave1_held_filter_review_risks_and_series_scope_persona_sync(server, wi
         )
         page.get_by_text("熟睡休息中").wait_for()
         assert page.locator("#persona-select").input_value() == '["alice","alice-fantasy"]'
+
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        )
+        assert not page_errors and not console_errors
+        browser.close()
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_wave2_workbench_parity_presets_decay_batch_edit_and_diagnostics(server, width):
+    mock = make_mock_state()
+    id_a = '["rin","rin-main"]'
+    mock["overviews"][id_a]["stats"]["pending_corrections"] = 1
+    mock["overviews"][id_a]["runtime_config"] = {
+        "daily_digest_quota": 5,
+        "daily_model_call_quota": 50,
+        "interest_half_life_days": 6,
+        "review_mode": "llm",
+    }
+    mock["overviews"][id_a]["health"] = {
+        "blockers": [],
+        "last_error": "",
+        "analysis_provider": "openai/gpt-4.1",
+        "review_provider": "anthropic/claude-haiku",
+        "review_context_policy": "distinct_providers",
+        "model_call_quota": 50,
+        "storage_warning_mb": 512,
+        "proactive_enabled": True,
+        "proactive_scope": "all_managed_chats",
+        "diagnostics": {
+            "model_calls_today": 7,
+            "anli_today_total": 3,
+            "cost_by_stage": [
+                {"stage": "triage", "calls": 2, "prompt_tokens": 500, "completion_tokens": 120, "total_tokens": 620},
+                {"stage": "video_deep_read", "calls": 2, "prompt_tokens": 1400, "completion_tokens": 450, "total_tokens": 1850},
+            ],
+            "video_channel_stats": {
+                "total": 4,
+                "native_video": 2,
+                "keyframes": 1,
+                "videoshot": 0,
+                "subtitle_only": 1,
+                "audio_transcript": 0,
+                "degraded_count": 2,
+                "native_hit_rate": 0.5,
+                "fallback_rate": 0.5,
+            },
+            "archived_candidates": 2,
+            "storage_bytes": 1048576,
+            "review_jobs": [],
+            "world_pending": [],
+            "corrections": [{"correction_id": "corr-1"}],
+        },
+    }
+    mock["overviews"][id_a]["outreach_diagnostics"] = {
+        "horizon_intents": [
+            {
+                "intent_id": "intent-anli-1",
+                "umo": "napcat:GroupMessage:10001",
+                "recipient_user_id": "u100",
+                "recipient_name": "小明",
+                "topic": "古建筑木构榫卯",
+                "horizon_kind": "anli_reflection_reply",
+                "status": "pending",
+                "reason": "小明之前安利了斗拱视频，最近刚看完可以自然聊一句观后感。",
+                "expires_at": 1763291000,
+            }
+        ],
+        "co_discussed_topics": [
+            {
+                "umo": "napcat:GroupMessage:10001",
+                "member_id": "u100",
+                "topic": "古建筑木构榫卯",
+                "turn_count": 3,
+                "last_occurred_at": 1763031800,
+                "opted_out": False,
+            }
+        ],
+        "opted_out_members": [
+            {
+                "kind": "all",
+                "identity": id_a,
+                "umo": "napcat:GroupMessage:10001",
+                "member_id": "u200",
+                "topic": "",
+            }
+        ],
+    }
+    mock["corrections"] = [
+        {
+            "correction_id": "corr-1",
+            "identity": id_a,
+            "umo": "napcat:GroupMessage:10001",
+            "member_id": "u101",
+            "log_id": "log-1",
+            "log_title": "十分钟看懂佛光寺东大殿斗拱",
+            "statement": "这个年份说法不对，应当是唐大中十一年。",
+            "created_at": 1763032200,
+        }
+    ]
+    mock["test_source_response"] = {
+        "ok": False,
+        "status": "risk_control_backoff",
+        "error": "B站返回 -412",
+        "advice": "命中 B 站 -412 风控：建议补充只读 Cookie。",
+        "preview_items": [],
+    }
+
+    with playwright.sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": width, "height": 1000})
+        page_errors, console_errors = attach_error_guards(page)
+        page.add_init_script(
+            f"window.__mock = {json.dumps(mock, ensure_ascii=False)};\n"
+            + BRIDGE_INIT_SCRIPT
+        )
+        page.goto(server)
+
+        page.get_by_text("古建筑木构榫卯").first.wait_for()
+        # Badge combines pending_reviews (1) + pending_corrections (1) = 2
+        assert page.locator("#badge-reviews").inner_text().strip() == "2"
+
+        # 1. Health panel shows stage-split token cost & video channel hit/fallback stats
+        assert "原生直传命中率 50%" in page.locator("#health-panel").inner_text()
+        assert "阶段2 视频多模态" in page.locator("#health-panel").inner_text()
+
+        # 2. Presets & interactive decay curve preview
+        assert "低耗省流" in page.locator("#presets-decay-panel").inner_text()
+        assert page.locator("#presets-decay-panel svg.decay-curve-svg").count() == 1
+        page.locator("#presets-decay-panel .preset-card").first.get_by_role("button").click()
+        page.wait_for_function(
+            "window.__calls.some(c => c.route === 'reviews' && c.body?.op === 'apply_preset' && c.body?.preset_id === 'conservative')"
+        )
+
+        # 3. Outreach diagnostics (intents + opted_out restore)
+        diag_panel = page.locator("#outreach-diagnostics-panel")
+        assert "安利回信" in diag_panel.inner_text()
+        diag_panel.get_by_role("button", name="退订名单 (1)").click()
+        diag_panel.get_by_role("button", name="恢复分享").click()
+        page.wait_for_function(
+            "window.__calls.some(c => c.route === 'reviews' && c.body?.op === 'restore_member_outreach')"
+        )
+
+        # 4. Sources tab: connection test (-412 advice) & bookshelf cursor adjust
+        page.locator('[data-tab="sources"]').click()
+        page.locator("#btn-open-source-drawer").click()
+        page.locator("#bili-uid").fill("946974")
+        page.locator("#btn-test-source").click()
+        page.locator("#source-test-result").get_by_text("命中 B 站 -412 风控").wait_for()
+        page.locator("#btn-close-source-drawer").click()
+
+        first_book = page.locator("#bookshelf-list .book-card").first
+        first_book.locator(".book-cursor-input").fill("5")
+        first_book.get_by_role("button", name="调整进度").click()
+        page.wait_for_function(
+            "window.__calls.some(c => c.route === 'sources' && c.body?.op === 'update_book_status' && c.body?.chapter_cursor === 5)"
+        )
+
+        # 5. Logs tab: keyword search
+        page.locator('[data-tab="logs"]').click()
+        page.locator("#logs-search-input").fill("银河铁道")
+        page.locator("#btn-logs-search").click()
+        page.wait_for_function(
+            "window.__calls.some(c => c.route === 'logs' && c.params?.query === '银河铁道')"
+        )
+
+        # 6. Reviews tab: inline proposal edit, batch approve & corrections queue
+        page.locator('[data-tab="reviews"]').click()
+        assert page.locator("#corrections-count-pill").inner_text().strip() == "1"
+        assert "唐大中十一年" in page.locator("#corrections-list").inner_text()
+        page.locator("#reviews-list").get_by_role("button", name="微调编辑").first.click()
+        page.locator("#reviews-list .proposal-editor").first.get_by_role("button", name="保存微调").click()
+        page.wait_for_function(
+            "window.__calls.some(c => c.route === 'reviews' && c.body?.op === 'edit_proposal')"
+        )
+        page.locator("#reviews-select-all").check()
+        page.locator("#btn-batch-approve").click()
+        page.wait_for_function(
+            "window.__calls.some(c => c.route === 'reviews' && c.body?.op === 'batch_approve')"
+        )
 
         assert page.evaluate(
             "document.documentElement.scrollWidth <= window.innerWidth"

@@ -98,14 +98,38 @@
   },
   "proactive_scope": {
     "type": "string",
-    "description": "主动分享范围（兼容旧配置）",
+    "description": "主动分享范围（内部兼容项，无需手动配置）",
     "default": "all_managed_chats",
     "options": [
       "explicit",
       "all_managed_groups",
       "all_managed_chats"
     ],
-    "hint": "旧版兼容字段。当前由主动分享开关和白名单决定生效范围。"
+    "hint": "由「启用见闻主动分享」与「见闻主动分享白名单」自动推导，保留仅用于旧配置迁移。"
+  },
+  "anli_daily_per_member": {
+    "type": "int",
+    "description": "群友每日 /安利 投喂上限（每人）",
+    "default": 10,
+    "hint": "熟人小群宽松模式默认每人每天 10 条（仍执行 SSRF 校验与防注入清洗）。"
+  },
+  "anli_daily_per_group": {
+    "type": "int",
+    "description": "单群每日 /安利 投喂上限",
+    "default": 30,
+    "hint": "单个群聊每天最多接受的 /安利 投喂总数（默认 30 条）。"
+  },
+  "anli_reply_delay_hours": {
+    "type": "int",
+    "description": "/安利 读后感回信最小延迟（小时）",
+    "default": 0,
+    "hint": "角色精读通过后生成观后感回信意图的最小间隔小时数（0~48，默认 0 表示下一次清醒合适气氛即可自然聊起，仍遵守免打扰时段与退订）。"
+  },
+  "enable_memory_sync": {
+    "type": "bool",
+    "description": "重要阅读手记轻量写入群间记忆",
+    "default": true,
+    "hint": "开启后，审查通过的重要阅读手记会以 external_media 身份轻量同步至 dynamics_memory（已安装时），防止兴趣自然衰减后长期遗忘。"
   },
   "daily_model_call_quota": {
     "type": "int",

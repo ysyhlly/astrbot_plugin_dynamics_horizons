@@ -71,7 +71,14 @@ class EngineLifecycle:
         identity,
         lane="reading",
         media_payload=None,
+        stage="",
     ):
+        provider_id = self._provider_id(role)
+        watch_mode = (
+            str(media_payload.get("watch_mode") or "")
+            if isinstance(media_payload, dict)
+            else ""
+        )
         cid = await run_io(
             self.store.reserve_call,
             identity,
@@ -80,6 +87,9 @@ class EngineLifecycle:
             self.clock(),
             lane=lane,
             tz=self.timezone,
+            stage=stage,
+            provider_id=provider_id,
+            watch_mode=watch_mode,
         )
         try:
             if media_payload is not None and _caller_accepts_media_payload(
@@ -103,7 +113,39 @@ class EngineLifecycle:
             )
             await asyncio.shield(run_io(self.store.finish_call, cid, fail_status))
             raise
-        await run_io(self.store.finish_call, cid, "success")
+        usage = value.pop("_usage", None) if isinstance(value, dict) else None
+        if not isinstance(usage, dict):
+            getter = getattr(self, "pop_last_model_usage", None)
+            if callable(getter):
+                usage = getter()
+        p_tok = 0
+        c_tok = 0
+        if isinstance(usage, dict):
+            p_tok = max(0, int(usage.get("prompt_tokens") or 0))
+            c_tok = max(0, int(usage.get("completion_tokens") or 0))
+        if p_tok <= 0:
+            # Conservative fallback estimate (~1 token per 2.2 chars mixed CJK/JSON)
+            est_in = len(str(instruction or "")) + len(str(payload or ""))
+            p_tok = max(1, int(est_in / 2.2))
+        if c_tok <= 0:
+            est_out = len(str(value or ""))
+            c_tok = max(1, int(est_out / 2.2))
+        eff_watch = watch_mode
+        if isinstance(media_payload, dict) and media_payload.get("fallback_used"):
+            eff_watch = (
+                "subtitle_only"
+                if media_payload.get("visual_dropped")
+                else "keyframes_fallback"
+            )
+        await run_io(
+            self.store.finish_call,
+            cid,
+            "success",
+            prompt_tokens=p_tok,
+            completion_tokens=c_tok,
+            watch_mode=eff_watch,
+            stage=stage,
+        )
         return value
 
     def _provider_id(self, role: str) -> str:

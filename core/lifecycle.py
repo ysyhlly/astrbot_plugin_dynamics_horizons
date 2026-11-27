@@ -131,6 +131,33 @@ class LifecycleStore:
                     cooldown_until REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS anli_submissions(
+                    submission_id TEXT PRIMARY KEY,
+                    identity TEXT NOT NULL,
+                    umo TEXT NOT NULL,
+                    member_id TEXT NOT NULL,
+                    member_name TEXT NOT NULL DEFAULT '',
+                    candidate_id TEXT NOT NULL DEFAULT '',
+                    target_ref TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_anli_umo_day
+                    ON anli_submissions(umo, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_anli_member_day
+                    ON anli_submissions(umo, member_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS model_call_metrics(
+                    call_id TEXT PRIMARY KEY,
+                    identity TEXT NOT NULL,
+                    stage TEXT NOT NULL DEFAULT '',
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    watch_mode TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_call_metrics_day
+                    ON model_call_metrics(identity, created_at DESC);
             """)
             additions = {
                 "candidate_items": {
@@ -138,6 +165,7 @@ class LifecycleStore:
                     "pinned": "INTEGER NOT NULL DEFAULT 0",
                     "content_origin": "TEXT NOT NULL DEFAULT 'legacy_unknown'",
                     "last_offered_at": "REAL NOT NULL DEFAULT 0",
+                    "recommended_by_json": "TEXT NOT NULL DEFAULT '{}'",
                 },
                 "proposals": {
                     "revision": "INTEGER NOT NULL DEFAULT 0",
@@ -326,7 +354,19 @@ class LifecycleStore:
                 return False
         return True
 
-    def reserve_call(self, identity, role, limit, now, *, lane="reading", tz=None):
+    def reserve_call(
+        self,
+        identity,
+        role,
+        limit,
+        now,
+        *,
+        lane="reading",
+        tz=None,
+        stage="",
+        provider_id="",
+        watch_mode="",
+    ):
         start, end = shanghai_day_bounds(now, tz=tz)
         with self.lock, self.db:
             rows = self.db.execute(
@@ -345,17 +385,130 @@ class LifecycleStore:
                     raise ValueError("feedback_model_call_quota_reached")
             cid = uuid.uuid4().hex
             stored_role = f"{role}:{lane}" if lane != "reading" else role
+            eff_stage = str(stage or "").strip()[:48] or (
+                "feedback"
+                if lane == "feedback"
+                else (
+                    "review"
+                    if role == "review_provider"
+                    else ("video_deep_read" if role == "video_provider" else "deep_read")
+                )
+            )
             self.db.execute(
                 "INSERT INTO model_calls VALUES(?,?,?,?,?)",
                 (cid, identity, stored_role, "reserved", now),
             )
+            self.db.execute(
+                """
+                INSERT OR REPLACE INTO model_call_metrics(
+                    call_id, identity, stage, prompt_tokens, completion_tokens,
+                    provider_id, watch_mode, created_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    cid,
+                    identity,
+                    eff_stage,
+                    0,
+                    0,
+                    str(provider_id or "").strip()[:120],
+                    str(watch_mode or "").strip()[:48],
+                    now,
+                ),
+            )
             return cid
 
-    def finish_call(self, call_id, status):
+    def finish_call(
+        self,
+        call_id,
+        status,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        watch_mode: str = "",
+        stage: str = "",
+    ):
+        p_tok = max(0, int(prompt_tokens or 0))
+        c_tok = max(0, int(completion_tokens or 0))
+        w_mode = str(watch_mode or "").strip()[:48]
+        st_name = str(stage or "").strip()[:48]
         with self.lock, self.db:
             self.db.execute(
-                "UPDATE model_calls SET status=? WHERE call_id=?", (status, call_id)
+                "UPDATE model_calls SET status=? WHERE call_id=?",
+                (status, call_id),
             )
+            self.db.execute(
+                """
+                UPDATE model_call_metrics
+                SET prompt_tokens=CASE WHEN ?>0 THEN ? ELSE prompt_tokens END,
+                    completion_tokens=CASE WHEN ?>0 THEN ? ELSE completion_tokens END,
+                    watch_mode=CASE WHEN ?!='' THEN ? ELSE watch_mode END,
+                    stage=CASE WHEN ?!='' THEN ? ELSE stage END
+                WHERE call_id=?
+                """,
+                (p_tok, p_tok, c_tok, c_tok, w_mode, w_mode, st_name, st_name, call_id),
+            )
+
+    def count_today_anli(
+        self, umo: str, member_id: str, now: float | None = None, *, tz=None
+    ) -> tuple[int, int]:
+        """Return `(member_used_today, group_used_today)` for `/安利` quota enforcement."""
+        stamp = float(now if now is not None else time.time())
+        start, end = shanghai_day_bounds(stamp, tz=tz)
+        clean_umo = str(umo or "").strip()
+        clean_member = str(member_id or "").strip()
+        with self.lock:
+            group_used = int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM anli_submissions WHERE umo=? AND created_at>=? AND created_at<?",
+                    (clean_umo, start, end),
+                ).fetchone()[0]
+                or 0
+            )
+            member_used = int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM anli_submissions WHERE umo=? AND member_id=? AND created_at>=? AND created_at<?",
+                    (clean_umo, clean_member, start, end),
+                ).fetchone()[0]
+                or 0
+            )
+        return member_used, group_used
+
+    def record_anli_submission(
+        self,
+        *,
+        identity: str,
+        umo: str,
+        member_id: str,
+        member_name: str = "",
+        candidate_id: str = "",
+        target_ref: str = "",
+        note: str = "",
+        now: float | None = None,
+    ) -> str:
+        stamp = float(now if now is not None else time.time())
+        sid = "anli_" + uuid.uuid4().hex[:16]
+        with self.lock, self.db:
+            self.db.execute(
+                """
+                INSERT INTO anli_submissions(
+                    submission_id, identity, umo, member_id, member_name,
+                    candidate_id, target_ref, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sid,
+                    normalize_identity(identity),
+                    str(umo or "").strip()[:512],
+                    str(member_id or "").strip()[:128],
+                    str(member_name or "").strip()[:80],
+                    str(candidate_id or "").strip()[:80],
+                    str(target_ref or "").strip()[:240],
+                    str(note or "").strip()[:240],
+                    stamp,
+                ),
+            )
+        return sid
 
     def has_reading_quota(self, identity, quota, now, *, tz=None) -> bool:
         start, end = shanghai_day_bounds(now, tz=tz)
@@ -872,6 +1025,17 @@ class LifecycleStore:
                 (attempt_cutoff, lim),
             )
             removed["model_calls"] = int(cur.rowcount or 0)
+            self.db.execute(
+                """
+                DELETE FROM model_call_metrics
+                WHERE call_id IN (
+                    SELECT call_id FROM model_call_metrics
+                    WHERE created_at<?
+                    LIMIT ?
+                )
+                """,
+                (attempt_cutoff, lim),
+            )
             cur = self.db.execute(
                 """
                 DELETE FROM world_outbox
@@ -955,11 +1119,104 @@ class LifecycleStore:
 
     def diagnostics(self, identity, now, *, tz=None):
         start, end = shanghai_day_bounds(now, tz=tz)
+        week_start = start - 6 * 86400.0
         with self.lock:
             calls = self.db.execute(
                 "SELECT count(*) FROM model_calls WHERE identity=? AND created_at>=? AND created_at<? AND status!='exempt'",
                 (identity, start, end),
             ).fetchone()[0]
+            stage_rows = self.db.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN COALESCE(m.stage, '') != '' THEN m.stage
+                        WHEN c.role LIKE '%:feedback' THEN 'feedback'
+                        WHEN c.role = 'review_provider' THEN 'review'
+                        WHEN c.role = 'video_provider' THEN 'video_deep_read'
+                        ELSE 'deep_read'
+                    END AS eff_stage,
+                    COUNT(*) AS calls,
+                    SUM(CASE WHEN c.status='success' THEN 1 ELSE 0 END) AS success_calls,
+                    SUM(CASE WHEN c.status='failed' THEN 1 ELSE 0 END) AS failed_calls,
+                    SUM(COALESCE(m.prompt_tokens, 0)) AS prompt_tokens,
+                    SUM(COALESCE(m.completion_tokens, 0)) AS completion_tokens
+                FROM model_calls c
+                LEFT JOIN model_call_metrics m ON m.call_id=c.call_id
+                WHERE c.identity=? AND c.created_at>=? AND c.created_at<? AND c.status!='exempt'
+                GROUP BY eff_stage
+                ORDER BY calls DESC, eff_stage ASC
+                """,
+                (identity, week_start, end),
+            ).fetchall()
+            cost_by_stage = [
+                {
+                    "stage": str(r["eff_stage"] or "deep_read"),
+                    "calls": int(r["calls"] or 0),
+                    "success": int(r["success_calls"] or 0),
+                    "failed": int(r["failed_calls"] or 0),
+                    "prompt_tokens": int(r["prompt_tokens"] or 0),
+                    "completion_tokens": int(r["completion_tokens"] or 0),
+                    "total_tokens": int(r["prompt_tokens"] or 0)
+                    + int(r["completion_tokens"] or 0),
+                }
+                for r in stage_rows
+            ]
+            # Video channel hit / fallback statistics from reading_logs media_meta_json
+            video_rows = self.db.execute(
+                "SELECT media_meta_json FROM reading_logs WHERE identity=? AND status='active' AND media_meta_json!='{}'",
+                (identity,),
+            ).fetchall()
+            v_counts = {
+                "native_video": 0,
+                "keyframes": 0,
+                "videoshot": 0,
+                "subtitle_only": 0,
+                "audio_transcript": 0,
+            }
+            for vr in video_rows:
+                try:
+                    mm = json.loads(vr["media_meta_json"] or "{}")
+                except Exception:
+                    continue
+                if not isinstance(mm, dict):
+                    continue
+                inner = mm.get("media_meta") if isinstance(mm.get("media_meta"), dict) else {}
+                wm = str(mm.get("watch_mode") or inner.get("watch_mode") or "").strip()
+                origin = str(mm.get("content_origin") or inner.get("content_origin") or "").strip()
+                if wm == "dynamic" or origin == "bilibili_dynamic":
+                    continue
+                if wm == "native_video" or origin == "bilibili_native_video":
+                    v_counts["native_video"] += 1
+                elif wm in {"keyframes_subtitle", "keyframes_only"} or origin in {
+                    "bilibili_vision_subtitle",
+                    "bilibili_vision_frames",
+                }:
+                    v_counts["keyframes"] += 1
+                elif wm in {"videoshot_subtitle", "videoshot_only"} or origin in {
+                    "bilibili_videoshot_subtitle",
+                    "bilibili_videoshot",
+                }:
+                    v_counts["videoshot"] += 1
+                elif wm == "subtitle_only" or origin == "bilibili_subtitle":
+                    v_counts["subtitle_only"] += 1
+                elif wm == "audio_transcript" or origin == "bilibili_audio_transcript":
+                    v_counts["audio_transcript"] += 1
+            v_total = sum(v_counts.values())
+            degraded = v_counts["keyframes"] + v_counts["videoshot"] + v_counts["subtitle_only"] + v_counts["audio_transcript"]
+            video_channel_stats = {
+                **v_counts,
+                "total": v_total,
+                "degraded_count": degraded,
+                "native_hit_rate": round(v_counts["native_video"] / v_total, 4) if v_total > 0 else 0.0,
+                "fallback_rate": round(degraded / v_total, 4) if v_total > 0 else 0.0,
+            }
+            anli_today_total = int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM anli_submissions WHERE identity=? AND created_at>=? AND created_at<?",
+                    (identity, start, end),
+                ).fetchone()[0]
+                or 0
+            )
             tasks = [
                 dict(r)
                 for r in self.db.execute(
@@ -1000,6 +1257,9 @@ class LifecycleStore:
         return {
             "corrections": corrections,
             "model_calls_today": calls,
+            "cost_by_stage": cost_by_stage,
+            "video_channel_stats": video_channel_stats,
+            "anli_today_total": anli_today_total,
             "feedback_jobs": feedback,
             "reading_tasks": tasks,
             "review_jobs": jobs,

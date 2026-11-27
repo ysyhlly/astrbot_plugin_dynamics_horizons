@@ -313,13 +313,54 @@ class HorizonsWebAPI:
                 tz=eng.timezone,
             )
 
+            outreach_diag = await run_io(
+                eng.store.list_outreach_diagnostics, active_identity, now=now
+            )
+            pending_corrections = await run_io(
+                eng.store.list_pending_corrections, active_identity
+            )
+            health_obj = await eng.health_async(active_identity, wake)
+            presets_list = [
+                {
+                    "id": pid,
+                    "label": spec["label"],
+                    "summary": spec["summary"],
+                    "values": dict(spec["values"]),
+                }
+                for pid, spec in getattr(eng, "HORIZONS_PRESETS", {}).items()
+            ]
+            runtime_cfg = {
+                "daily_digest_quota": int(eng.daily_quota),
+                "daily_model_call_quota": int(
+                    self.plugin.config.get("daily_model_call_quota", 50) or 50
+                ),
+                "interest_half_life_days": float(eng.half_life_days),
+                "question_ttl_hours": float(eng.question_ttl_hours),
+                "poll_interval_seconds": int(
+                    self.plugin.config.get("poll_interval_seconds", 900) or 900
+                ),
+                "digest_interval_seconds": int(
+                    self.plugin.config.get("digest_interval_seconds", 3600) or 3600
+                ),
+                "review_mode": eng.review_mode,
+                "anli_daily_per_member": int(
+                    self.plugin.config.get("anli_daily_per_member", 10) or 10
+                ),
+                "anli_daily_per_group": int(
+                    self.plugin.config.get("anli_daily_per_group", 30) or 30
+                ),
+            }
+
             return {
-                "health": await eng.health_async(active_identity, wake),
+                "health": health_obj,
                 "enabled": bool(self.plugin.config.get("enabled", True)),
                 "ready": bool(self.plugin.ready and not self.plugin.closed),
                 "review_mode": eng.review_mode,
                 "personas": personas,
                 "active_identity": active_identity,
+                "runtime_config": runtime_cfg,
+                "presets": presets_list,
+                "outreach_diagnostics": outreach_diag,
                 "stats": {
                     "sources_total": counts["sources_total"],
                     "sources_enabled": counts["sources_enabled"],
@@ -330,6 +371,7 @@ class HorizonsWebAPI:
                     "pending_questions": counts["pending_questions"],
                     "pending_reviews": counts["pending_reviews"],
                     "held_reviews": int(counts.get("held_reviews", 0) or 0),
+                    "pending_corrections": len(pending_corrections),
                     "daily_quota": eng.daily_quota,
                     "daily_used": daily_used,
                     "last_poll_at": eng.last_poll_at,
@@ -415,6 +457,11 @@ class HorizonsWebAPI:
                         "enabled": s["enabled"],
                         "status": s["status"],
                         "last_error": s["last_error"],
+                        "error_advice": eng.format_source_error_advice(
+                            s["last_error"], s["source_kind"]
+                        )
+                        if s["last_error"] and hasattr(eng, "format_source_error_advice")
+                        else "",
                         "last_poll_at": s["last_poll_at"],
                         "cooldown_until": s["cooldown_until"],
                         "config": s["config"],
@@ -776,16 +823,45 @@ class HorizonsWebAPI:
                     )
                 return {"books": books if isinstance(books, list) else []}
 
+            if action == "test_source":
+                kind = str(body.get("source_kind") or "").strip()
+                raw_cfg = (
+                    body.get("config") if isinstance(body.get("config"), dict) else {}
+                )
+                return await eng.test_source_connection(kind, raw_cfg)
+
+            if action == "delete_book":
+                book_id = clean_text(body.get("book_id"), "book_id", 80)
+                deleted = await run_io(
+                    eng.store.delete_book,
+                    book_id,
+                    expected_identity=identity,
+                    now=eng.clock(),
+                )
+                await eng.refresh_projection()
+                return deleted
+
             if action == "update_book_status":
                 book_id = clean_text(body.get("book_id"), "book_id", 80)
-                status = clean_text(body.get("status"), "status", 24)
-                if status not in BOOK_STATUSES:
-                    raise ValueError(f"无效的书籍状态: {status}")
-                cursor = (
-                    body.get("chapter_cursor")
-                    if isinstance(body.get("chapter_cursor"), int)
-                    else None
-                )
+                raw_status = str(body.get("status") or "").strip()
+                if raw_status:
+                    if raw_status not in BOOK_STATUSES:
+                        raise ValueError(f"无效的书籍状态: {raw_status}")
+                    status = raw_status
+                else:
+                    existing_book = await run_io(eng.store.get_book, book_id)
+                    if existing_book is None:
+                        raise ValueError("书籍不存在")
+                    status = str(existing_book.get("status") or "reading")
+                raw_cursor = body.get("chapter_cursor")
+                cursor: int | None = None
+                if raw_cursor is not None and raw_cursor != "":
+                    if isinstance(raw_cursor, bool):
+                        raise ValueError("章节游标必须是非负整数")
+                    try:
+                        cursor = max(0, int(raw_cursor))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("章节游标必须是非负整数") from exc
                 updated = await run_io(
                     eng.store.update_book_status,
                     book_id,
@@ -813,10 +889,12 @@ class HorizonsWebAPI:
             filter_id = "" if req_id == "all" else active_identity
             page = _coerce_int(_query_param("page", "1"), 1, 1, 10000)
             source_kind = _query_param("source_kind", "")
+            query = _query_param("query", "")
             result = await run_io(
                 eng.store.list_logs,
                 identity=filter_id,
                 source_kind=source_kind,
+                query=query,
                 page=page,
                 page_size=20,
             )
@@ -836,20 +914,27 @@ class HorizonsWebAPI:
             active_identity, _ = self._resolve_active_identity(req_id)
             filter_id = "" if req_id == "all" else active_identity
             state = _query_param("state", "")
+            source_kind = _query_param("source_kind", "")
+            query = _query_param("query", "")
             page = _coerce_int(_query_param("page", "1"), 1, 1, 10000)
             result = await run_io(
                 eng.store.list_proposals,
                 identity=filter_id,
                 state=state,
+                source_kind=source_kind,
+                query=query,
                 page=page,
                 page_size=20,
             )
             blocked = await run_io(eng.store.list_blocked_topics, filter_id)
+            corrections = await run_io(eng.store.list_pending_corrections, filter_id)
             items = [_normalize_media_fields(it) for it in result.get("items") or []]
             return {
                 "identity": active_identity,
                 "items": items,
                 "blocked_topics": blocked,
+                "corrections": corrections,
+                "corrections_count": len(corrections),
                 "page": result["page"],
                 "page_size": result["page_size"],
                 "total": result["total"],
@@ -970,6 +1055,123 @@ class HorizonsWebAPI:
                 blocked = await run_io(eng.store.unblock_topic, topic, ident)
                 await eng.refresh_projection()
                 return {"blocked_topics": blocked, "topic": topic}
+
+            if action == "edit_proposal":
+                pid = clean_text(
+                    body.get("proposal_id") or body.get("id"), "proposal_id", 80
+                )
+                edited = await run_io(
+                    eng.store.edit_proposal,
+                    pid,
+                    digest=body.get("digest") if "digest" in body else None,
+                    reflection=body.get("reflection") if "reflection" in body else None,
+                    staged_interest=body.get("staged_interest")
+                    if "staged_interest" in body
+                    else None,
+                    questions=body.get("questions") if "questions" in body else None,
+                    actor=actor,
+                    expected_revision=revision,
+                    expected_identity=identity,
+                    now=eng.clock(),
+                )
+                await eng.refresh_projection()
+                return {"proposal": edited}
+
+            if action in {"batch_approve", "batch_reject"}:
+                raw_items = body.get("items")
+                targets: list[tuple[str, int | None]] = []
+                if isinstance(raw_items, list):
+                    for entry in raw_items[:50]:
+                        if isinstance(entry, dict) and entry.get("proposal_id"):
+                            ev_rev = entry.get("revision")
+                            targets.append(
+                                (
+                                    str(entry["proposal_id"]).strip()[:80],
+                                    ev_rev if type(ev_rev) is int and ev_rev >= 0 else None,
+                                )
+                            )
+                        elif isinstance(entry, str) and entry.strip():
+                            targets.append((entry.strip()[:80], None))
+                elif isinstance(body.get("proposal_ids"), list):
+                    for pid_val in body["proposal_ids"][:50]:
+                        if isinstance(pid_val, str) and pid_val.strip():
+                            targets.append((pid_val.strip()[:80], None))
+                if not targets:
+                    raise ValueError("请先勾选要批量处理的提案")
+                reason = str(
+                    body.get("reason")
+                    or ("管理员批量批准" if action == "batch_approve" else "管理员批量拒绝")
+                ).strip()[:300]
+                succeeded: list[str] = []
+                errors: list[dict[str, str]] = []
+                for pid_val, rev_val in targets:
+                    try:
+                        if action == "batch_approve":
+                            await eng.approve_proposal(
+                                pid_val,
+                                reviewed_by=actor,
+                                reason=reason,
+                                expected_revision=rev_val,
+                                expected_identity=identity,
+                            )
+                        else:
+                            await run_io(
+                                eng.store.record_review_verdict,
+                                pid_val,
+                                state="rejected",
+                                expected_revision=rev_val,
+                                expected_identity=identity,
+                                verdict="reject",
+                                reason=reason,
+                                risks=[],
+                                reviewed_by=actor,
+                                now=eng.clock(),
+                            )
+                        succeeded.append(pid_val)
+                    except Exception as exc:
+                        errors.append({"proposal_id": pid_val, "error": str(exc)[:160]})
+                await eng.refresh_projection()
+                return {
+                    "processed": len(targets),
+                    "succeeded": len(succeeded),
+                    "failed": len(errors),
+                    "succeeded_ids": succeeded,
+                    "errors": errors,
+                }
+
+            if action == "cancel_intent":
+                iid = clean_text(body.get("intent_id"), "intent_id", 120)
+                res = await run_io(
+                    eng.store.update_intent,
+                    iid,
+                    "cancelled",
+                    now=eng.clock(),
+                )
+                return res
+
+            if action == "restore_member_outreach":
+                target_id = clean_text(
+                    body.get("identity") or "", "identity", 120
+                )
+                target_umo = clean_text(body.get("umo"), "umo", 240)
+                target_member = clean_text(body.get("member_id"), "member_id", 128)
+                target_topic = str(body.get("topic") or "").strip()[:80]
+                res = await run_io(
+                    eng.store.restore_member_outreach,
+                    target_id,
+                    target_umo,
+                    target_member,
+                    topic=target_topic,
+                    now=eng.clock(),
+                )
+                await eng.refresh_projection()
+                return res
+
+            if action == "apply_preset":
+                preset_id = clean_text(body.get("preset_id"), "preset_id", 32)
+                applied = eng.apply_preset(preset_id)
+                await eng.refresh_projection()
+                return applied
 
             if action == "trigger_digest":
                 ident = str(body.get("identity") or "").strip()

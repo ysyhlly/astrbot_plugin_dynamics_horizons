@@ -160,12 +160,82 @@ const state = {
   overview: null,
   sources: [],
   books: [],
-  logs: { items: [], page: 1, total: 0, page_size: PAGE_SIZE, source_kind: '' },
-  reviews: { items: [], blocked_topics: [], page: 1, total: 0, page_size: PAGE_SIZE, state: 'pending_review' },
+  logs: { items: [], page: 1, total: 0, page_size: PAGE_SIZE, source_kind: '', query: '' },
+  reviews: {
+    items: [],
+    blocked_topics: [],
+    corrections: [],
+    page: 1,
+    total: 0,
+    page_size: PAGE_SIZE,
+    state: 'pending_review',
+    source_kind: '',
+    query: '',
+    selectedIds: new Set(),
+  },
+  outreachTab: 'intents',
+  decayPreviewDays: null,
   editingSource: null,
   drawerKind: 'bilibili',
   drawerDirty: false,
 };
+
+const STAGE_LABELS = {
+  triage: '阶段1 挑拣',
+  deep_read: '阶段2 精读',
+  video_deep_read: '阶段2 视频多模态',
+  merged_digest: '合并挑拣+精读',
+  merged_digest_review: '合并精读+自审',
+  review: '阶段3 独立审查',
+  feedback: '讨论回执核验',
+  discussion: '交流后记',
+};
+
+const DEFAULT_PRESETS = [
+  {
+    id: 'conservative',
+    label: '低耗省流',
+    summary: '每日最多精读 2 篇、模型调用上限 20 次，模型初审后人工把关。',
+    values: { daily_digest_quota: 2, daily_model_call_quota: 20, interest_half_life_days: 8, review_mode: 'llm_then_human' },
+  },
+  {
+    id: 'balanced',
+    label: '均衡推荐',
+    summary: '每日最多精读 5 篇、模型调用上限 50 次，独立审查通过自动生效。',
+    values: { daily_digest_quota: 5, daily_model_call_quota: 50, interest_half_life_days: 6, review_mode: 'llm' },
+  },
+  {
+    id: 'active',
+    label: '深度活跃',
+    summary: '每日最多精读 10 篇、模型调用上限 100 次，更高频追踪热点与书架连载。',
+    values: { daily_digest_quota: 10, daily_model_call_quota: 100, interest_half_life_days: 5, review_mode: 'llm' },
+  },
+];
+
+function formatSourceErrorAdvice(error, sourceKind = '') {
+  const raw = String(error || '').trim();
+  if (!raw) return '';
+  const low = raw.toLowerCase();
+  if (raw.includes('-412') || low.includes('412') || raw.includes('风控') || low.includes('risk_control')) {
+    return '命中 B 站 -412 风控：建议补充只读 Cookie (SESSDATA/buvid3)，适当拉长轮询间隔并等待退避冷却。';
+  }
+  if (raw.includes('-352') || low.includes('v_voucher')) {
+    return '命中 B 站人机核验 (-352)：建议更换只读 Cookie，系统已自动进入退避冷却。';
+  }
+  if (low.includes('429') || low.includes('rate_limit') || low.includes('too many')) {
+    return '目标站点限流 (429)：建议调大轮询间隔（>= 1800 秒）并等待冷却结束。';
+  }
+  if (low.includes('ssrf') || raw.includes('内网') || raw.includes('私有') || low.includes('localhost')) {
+    return '命中 SSRF 防护：仅允许公网 HTTP/HTTPS；若为自建局域网 OPDS 请勾选 allow_private_opds。';
+  }
+  if (low.includes('timeout') || raw.includes('超时')) {
+    return '连接超时：请检查服务器出站网络/代理或目标站点连通性。';
+  }
+  if (sourceKind === 'bilibili') {
+    return 'B 站只读拉取异常：请核对 UID/链接有效性，必要时补充只读 Cookie 后重试。';
+  }
+  return '请核对地址、凭据与网络连通性后重试。';
+}
 
 const epochs = {};
 let roleEpoch = 0;
@@ -405,15 +475,288 @@ function renderBadges(stats = {}) {
   setBadge('#badge-overview', (Number(stats.active_interests) || 0) + (Number(stats.pending_questions) || 0));
   setBadge('#badge-sources', Number(stats.sources_total) || 0);
   setBadge('#badge-logs', Number(stats.logs_total) || 0);
-  const pendingReviewCount = stats.pending_reviews != null
-    ? (Number(stats.pending_reviews) || 0)
-    : (Number(stats.held_reviews) || 0);
+  const pendingReviewCount = (
+    stats.pending_reviews != null
+      ? (Number(stats.pending_reviews) || 0)
+      : (Number(stats.held_reviews) || 0)
+  ) + (Number(stats.pending_corrections) || 0);
   setBadge('#badge-reviews', pendingReviewCount, true);
 }
 
 /* ===== Tab 1: Overview & Interests ===== */
+function renderPresetsAndDecay(overview) {
+  const box = $('#presets-decay-panel');
+  if (!box) return;
+  const presets = Array.isArray(overview?.presets) && overview.presets.length
+    ? overview.presets
+    : DEFAULT_PRESETS;
+  const rc = overview?.runtime_config || {};
+  const currentHalfLife = Math.max(2, Math.min(14, Number(rc.interest_half_life_days) || 6));
+  if (state.decayPreviewDays == null) state.decayPreviewDays = currentHalfLife;
+
+  const head = el('div', 'panel-card-head');
+  const titleWrap = el('div', 'panel-head-title');
+  titleWrap.append(
+    el('h3', '', '运营预设与兴趣衰减曲线'),
+    el('span', 'panel-head-sub', '一键切换配额节奏 · 预览半衰期自然冷却'),
+  );
+  head.append(titleWrap, el('span', 'pill info', `当前半衰期 ${currentHalfLife} 天`));
+
+  const grid = el('div', 'presets-decay-grid');
+  const presetsRow = el('div', 'presets-row');
+  for (const preset of presets) {
+    const vals = preset.values || {};
+    const isCurrent = Number(rc.daily_digest_quota) === Number(vals.daily_digest_quota)
+      && Number(rc.daily_model_call_quota) === Number(vals.daily_model_call_quota)
+      && String(rc.review_mode || '') === String(vals.review_mode || '');
+    const card = el('div', `preset-card${isCurrent ? ' is-current' : ''}`);
+    card.append(
+      el('strong', '', preset.label || preset.id),
+      el('p', '', preset.summary || ''),
+      actionButton(isCurrent ? '当前方案' : '一键应用', async () => {
+        await apiPost('reviews', { op: 'apply_preset', identity: state.identity, preset_id: preset.id });
+        state.decayPreviewDays = Number(vals.interest_half_life_days) || currentHalfLife;
+        notify(`已应用「${preset.label}」运营预设。`, 'success');
+        await loadOverview({ silent: true });
+      }, isCurrent ? 'wb-button' : 'wb-button primary'),
+    );
+    presetsRow.append(card);
+  }
+
+  // Interactive half-life decay curve SVG preview
+  const previewBox = el('div', 'decay-preview-box');
+  const previewHead = el('div', 'decay-preview-head');
+  const daysVal = Math.max(2, Math.min(14, Number(state.decayPreviewDays) || currentHalfLife));
+  const labelNode = el('strong', '', `衰减曲线预览（半衰期 ${daysVal} 天）`);
+  const coolDay = (daysVal * 2).toFixed(0);
+  const subNode = el('span', 'panel-head-sub', `约第 ${coolDay} 天自然冷却 (<25%)`);
+  previewHead.append(labelNode, subNode);
+
+  const slider = el('input');
+  slider.type = 'range';
+  slider.id = 'decay-half-life-slider';
+  slider.min = '2';
+  slider.max = '14';
+  slider.step = '1';
+  slider.value = String(daysVal);
+  slider.setAttribute('aria-label', '预览兴趣半衰期天数');
+
+  const svgHost = el('div', 'decay-svg-host');
+  const drawCurve = halfLife => {
+    const w = 320;
+    const h = 104;
+    const padL = 24;
+    const padR = 10;
+    const padT = 10;
+    const padB = 20;
+    const plotW = w - padL - padR;
+    const plotH = h - padT - padB;
+    const maxDays = 14;
+    const pts = [];
+    for (let d = 0; d <= maxDays; d += 0.5) {
+      const heat = Math.pow(0.5, d / halfLife);
+      const x = padL + (d / maxDays) * plotW;
+      const y = padT + (1 - heat) * plotH;
+      pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+    }
+    const coolY = (padT + (1 - 0.25) * plotH).toFixed(1);
+    const halfX = (padL + (Math.min(maxDays, halfLife) / maxDays) * plotW).toFixed(1);
+    const halfY = (padT + 0.5 * plotH).toFixed(1);
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    svg.setAttribute('class', 'decay-curve-svg');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', `半衰期 ${halfLife} 天兴趣衰减曲线`);
+    const mk = (tag, attrs) => {
+      const n = document.createElementNS(ns, tag);
+      for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
+      return n;
+    };
+    svg.append(
+      mk('line', { x1: padL, y1: padT + plotH, x2: w - padR, y2: padT + plotH, stroke: 'currentColor', 'stroke-opacity': '0.2' }),
+      mk('line', { x1: padL, y1: coolY, x2: w - padR, y2: coolY, stroke: '#d97706', 'stroke-dasharray': '4 3', 'stroke-opacity': '0.7' }),
+      mk('polyline', { fill: 'none', stroke: 'var(--ds-accent, #2e7d5b)', 'stroke-width': '2.4', points: pts.join(' ') }),
+      mk('circle', { cx: halfX, cy: halfY, r: '3.5', fill: 'var(--ds-accent, #2e7d5b)' }),
+    );
+    const t0 = mk('text', { x: padL, y: h - 4, 'font-size': '10', fill: 'currentColor', opacity: '0.65' });
+    t0.textContent = '0天';
+    const tMid = mk('text', { x: halfX, y: h - 4, 'font-size': '10', fill: 'currentColor', opacity: '0.75', 'text-anchor': 'middle' });
+    tMid.textContent = `${halfLife}天(50%)`;
+    const tEnd = mk('text', { x: w - padR, y: h - 4, 'font-size': '10', fill: 'currentColor', opacity: '0.65', 'text-anchor': 'end' });
+    tEnd.textContent = '14天';
+    const tCool = mk('text', { x: w - padR, y: Number(coolY) - 3, 'font-size': '9.5', fill: '#d97706', 'text-anchor': 'end' });
+    tCool.textContent = '冷却线 25%';
+    svg.append(t0, tMid, tEnd, tCool);
+    svgHost.replaceChildren(svg);
+  };
+  drawCurve(daysVal);
+  slider.addEventListener('input', () => {
+    const nextDays = Math.max(2, Math.min(14, Number(slider.value) || 6));
+    state.decayPreviewDays = nextDays;
+    labelNode.textContent = `衰减曲线预览（半衰期 ${nextDays} 天）`;
+    subNode.textContent = `约第 ${(nextDays * 2).toFixed(0)} 天自然冷却 (<25%)`;
+    drawCurve(nextDays);
+  });
+
+  previewBox.append(previewHead, slider, svgHost);
+  grid.append(presetsRow, previewBox);
+  box.replaceChildren(head, grid);
+}
+
+function renderOutreachDiagnostics(overview) {
+  const box = $('#outreach-diagnostics-panel');
+  if (!box) return;
+  const diag = overview?.outreach_diagnostics || {};
+  const intents = Array.isArray(diag.horizon_intents) ? diag.horizon_intents : [];
+  const coTopics = Array.isArray(diag.co_discussed_topics) ? diag.co_discussed_topics : [];
+  const optedOut = Array.isArray(diag.opted_out_members) ? diag.opted_out_members : [];
+
+  const disclosure = el('details', 'archive-disclosure');
+  if (intents.some(i => i.status === 'pending') || optedOut.length > 0) {
+    disclosure.open = true;
+  }
+  const summary = el('summary', 'archive-summary-bar');
+  const left = el('div', 'health-summary-left');
+  left.append(
+    el('span', 'health-summary-title', '主动分享队列 · 共同话题 · 退订名单'),
+    el('span', 'pill info', `分享队列 ${intents.length}`),
+    el('span', 'pill accent', `共同话题 ${coTopics.length}`),
+    el('span', `pill ${optedOut.length ? 'warn' : ''}`, `退订/屏蔽 ${optedOut.length}`),
+  );
+  summary.append(left, el('span', 'health-toggle-label', '展开诊断'));
+
+  const body = el('div', 'archive-body');
+  const tabs = el('div', 'segmented-group');
+  tabs.setAttribute('role', 'group');
+  tabs.setAttribute('aria-label', '主动分享诊断视图切换');
+  const content = el('div', 'stack-list');
+
+  const renderTabBody = () => {
+    content.replaceChildren();
+    for (const btn of tabs.querySelectorAll('button')) {
+      btn.setAttribute('aria-pressed', String(btn.dataset.outreachTab === state.outreachTab));
+    }
+    if (state.outreachTab === 'intents') {
+      if (!intents.length) {
+        content.append(el('div', 'empty-state', '当前暂无主动分享或 /安利 回信候选队列。'));
+        return;
+      }
+      for (const it of intents) {
+        const card = el('article', 'item-card');
+        const head = el('div', 'item-head');
+        const tg = el('div', 'item-title-group');
+        const kindLabel = it.horizon_kind === 'anli_reflection_reply' ? '安利回信' : '共聊分享';
+        tg.append(
+          el('span', `pill ${it.horizon_kind === 'anli_reflection_reply' ? 'accent' : 'info'}`, kindLabel),
+          el('h4', 'item-title', it.topic || '见闻分享'),
+          el('span', `pill ${it.status === 'pending' ? 'warm' : it.status === 'sent' ? 'accent' : ''}`, it.status),
+        );
+        const acts = el('div', 'item-actions');
+        if (it.status === 'pending') {
+          acts.append(
+            actionButton('取消发送', async () => {
+              await apiPost('reviews', { op: 'cancel_intent', identity: state.identity, intent_id: it.intent_id });
+              notify('已取消该条待发主动分享意图。', 'info');
+              await loadOverview({ silent: true });
+            }, 'wb-button danger'),
+          );
+        }
+        head.append(tg, acts);
+        const meta = el('div', 'item-meta');
+        meta.append(
+          el('span', '', `会话：${formatScopeLabel(it.umo) || it.umo}`),
+          el('span', '', `对象：${it.recipient_name ? `${it.recipient_name} (${it.recipient_user_id})` : it.recipient_user_id}`),
+          el('span', '', `过期：${formatTime(it.expires_at)}`),
+        );
+        card.append(head);
+        if (it.reason) card.append(el('p', 'item-body', it.reason));
+        card.append(meta);
+        content.append(card);
+      }
+    } else if (state.outreachTab === 'co_topics') {
+      if (!coTopics.length) {
+        content.append(el('div', 'empty-state', '当前暂无已核实的共同话题证据。'));
+        return;
+      }
+      for (const ct of coTopics) {
+        const card = el('article', 'item-card');
+        const head = el('div', 'item-head');
+        const tg = el('div', 'item-title-group');
+        tg.append(
+          el('span', 'pill accent', ct.topic || '未命名'),
+          el('span', 'pill info', `互动 ${ct.turn_count} 轮`),
+          ...(ct.opted_out ? [el('span', 'pill warn', '已退订')] : []),
+        );
+        head.append(tg);
+        const meta = el('div', 'item-meta');
+        meta.append(
+          el('span', '', `会话：${formatScopeLabel(ct.umo) || ct.umo}`),
+          el('span', '', `成员：${ct.member_id}`),
+          el('span', '', `最近互动：${formatTime(ct.last_occurred_at)}`),
+        );
+        card.append(head, meta);
+        content.append(card);
+      }
+    } else {
+      if (!optedOut.length) {
+        content.append(el('div', 'empty-state', '当前没有退订主动分享或屏蔽特定话题的成员。'));
+        return;
+      }
+      for (const m of optedOut) {
+        const card = el('article', 'item-card');
+        const head = el('div', 'item-head');
+        const tg = el('div', 'item-title-group');
+        tg.append(
+          el('span', 'pill warn', m.kind === 'topic' ? `屏蔽话题：${m.topic}` : '全量退订主动分享'),
+          el('span', '', `${formatScopeLabel(m.umo) || m.umo} · ${m.member_id}`),
+        );
+        const acts = el('div', 'item-actions');
+        acts.append(
+          actionButton('恢复分享', async () => {
+            await apiPost('reviews', {
+              op: 'restore_member_outreach',
+              identity: m.identity || state.identity,
+              umo: m.umo,
+              member_id: m.member_id,
+              topic: m.topic || '',
+            });
+            notify('已恢复该成员的见闻分享偏好。', 'success');
+            await loadOverview({ silent: true });
+          }),
+        );
+        head.append(tg, acts);
+        card.append(head);
+        content.append(card);
+      }
+    }
+  };
+
+  for (const [key, label] of [
+    ['intents', `主动分享队列 (${intents.length})`],
+    ['co_topics', `共同话题 (${coTopics.length})`],
+    ['opted_out', `退订名单 (${optedOut.length})`],
+  ]) {
+    const btn = el('button', '', label);
+    btn.type = 'button';
+    btn.dataset.outreachTab = key;
+    btn.setAttribute('aria-pressed', String(state.outreachTab === key));
+    btn.addEventListener('click', () => {
+      state.outreachTab = key;
+      renderTabBody();
+    });
+    tabs.append(btn);
+  }
+  renderTabBody();
+  body.append(tabs, content);
+  disclosure.append(summary, body);
+  box.replaceChildren(disclosure);
+}
+
 function renderOverview(overview) {
   renderHealth(overview?.health);
+  renderPresetsAndDecay(overview);
+  renderOutreachDiagnostics(overview);
   renderArchiveControls();
   const stats = overview?.stats || {};
   const wl = overview?.world_link || {};
@@ -749,6 +1092,10 @@ function renderSourcesAndBooks() {
           el('p', 'item-body', summarizeSourceConfig(src)),
           srcMeta,
         );
+        const advice = src.error_advice || (src.last_error ? formatSourceErrorAdvice(src.last_error, src.source_kind) : '');
+        if (advice) {
+          card.append(el('p', 'advice-note', `风控/排查建议：${advice}`));
+        }
         srcList.append(card);
       }
     }
@@ -772,7 +1119,21 @@ function renderSourcesAndBooks() {
         titleGroup.append(el('h4', 'item-title', book.title || '未命名书目'));
         if (book.creator) titleGroup.append(el('span', 'pill', book.creator));
         titleGroup.append(el('span','pill info',book.reading_label || (book.chapter_cursor ? '正在阅读' : '书架待读')));
-        head.append(titleGroup);
+        const bookActions = el('div', 'item-actions');
+        bookActions.append(
+          actionButton(msg('删除书籍'), async () => {
+            const ok = await confirmAction(`确定要从书架删除《${book.title || '该书目'}》吗？已批准的历史阅读手账不会被删除。`);
+            if (!ok) return;
+            await apiPost('sources', {
+              op: 'delete_book',
+              identity: book.identity || state.identity,
+              book_id: book.book_id,
+            });
+            notify(`已从书架移除《${book.title}》。`, 'info');
+            await Promise.all([loadSources({ silent: true }), loadOverview({ silent: true })]);
+          }, 'wb-button danger'),
+        );
+        head.append(titleGroup, bookActions);
 
         const cursor = Math.max(0, Number(book.chapter_cursor) || 0);
         const total = Math.max(0, Number(book.total_chapters) || 0);
@@ -785,6 +1146,32 @@ function renderSourcesAndBooks() {
         fill.style.width = `${pct}%`;
         track.append(fill);
         progressRow.append(el('span', '', chapterLabel), track, el('span', '', total > 0 ? `${pct}%` : '连载中'));
+
+        const cursorRow = el('div', 'book-cursor-row');
+        const cursorControls = el('div', 'book-cursor-controls');
+        const cursorInput = el('input', 'book-cursor-input');
+        cursorInput.type = 'number';
+        cursorInput.min = '0';
+        if (total > 0) cursorInput.max = String(total);
+        cursorInput.value = String(cursor);
+        cursorInput.setAttribute('aria-label', `调整《${book.title || '书目'}》章节游标`);
+        cursorControls.append(
+          el('span', 'page-info', '章节游标'),
+          cursorInput,
+          actionButton('调整进度', async () => {
+            const nextCursor = Math.max(0, Number.parseInt(cursorInput.value, 10) || 0);
+            await apiPost('sources', {
+              op: 'update_book_status',
+              identity: book.identity || state.identity,
+              book_id: book.book_id,
+              status: book.status || 'reading',
+              chapter_cursor: nextCursor,
+            });
+            notify(`已将《${book.title}》阅读游标调整至第 ${nextCursor} 章。`, 'success');
+            await Promise.all([loadSources({ silent: true }), loadOverview({ silent: true })]);
+          }),
+        );
+        cursorRow.append(cursorControls);
 
         const switcher = el('div', 'segmented-group');
         switcher.setAttribute('role', 'group');
@@ -805,7 +1192,7 @@ function renderSourcesAndBooks() {
           switcher.append(btn);
         }
 
-        card.append(head, progressRow, switcher);
+        card.append(head, progressRow, cursorRow, switcher);
         shelf.append(card);
       }
     }
@@ -1005,11 +1392,93 @@ function renderLogs() {
 }
 
 /* ===== Tab 4: Reviews & Topic Blocklist ===== */
+function syncBatchSelectionUI() {
+  const actionableItems = (state.reviews.items || []).filter(
+    item => ['pending_review', 'pending', 'held'].includes(item.state || 'pending_review')
+      && item.review_reason !== 'source_changed',
+  );
+  const validSet = new Set(actionableItems.map(i => i.proposal_id));
+  for (const id of [...state.reviews.selectedIds]) {
+    if (!validSet.has(id)) state.reviews.selectedIds.delete(id);
+  }
+  const count = state.reviews.selectedIds.size;
+  const countNode = $('#reviews-selected-count');
+  if (countNode) countNode.textContent = `已选 ${count} 项`;
+  const selectAll = $('#reviews-select-all');
+  if (selectAll) {
+    selectAll.disabled = actionableItems.length === 0;
+    selectAll.checked = actionableItems.length > 0 && count === actionableItems.length;
+  }
+  const btnApprove = $('#btn-batch-approve');
+  const btnReject = $('#btn-batch-reject');
+  if (btnApprove) btnApprove.disabled = count === 0;
+  if (btnReject) btnReject.disabled = count === 0;
+}
+
+function renderCorrectionsQueue() {
+  const corrections = Array.isArray(state.reviews.corrections) && state.reviews.corrections.length
+    ? state.reviews.corrections
+    : (Array.isArray(state.overview?.health?.diagnostics?.corrections) ? state.overview.health.diagnostics.corrections : []);
+  const pill = $('#corrections-count-pill');
+  if (pill) pill.textContent = String(corrections.length);
+  const list = $('#corrections-list');
+  if (!list) return;
+  list.replaceChildren();
+  if (!corrections.length) {
+    list.append(el('div', 'empty-state', '当前没有待处理的群友纠错记录。'));
+    return;
+  }
+  for (const corr of corrections) {
+    const card = el('article', 'item-card');
+    const head = el('div', 'item-head');
+    const tg = el('div', 'item-title-group');
+    tg.append(
+      el('span', 'pill warn', '群友纠错'),
+      el('h4', 'item-title', corr.log_title ? `关联手账：《${corr.log_title}》` : `关联手账：${corr.log_id || '未知'}`),
+    );
+    const acts = el('div', 'item-actions');
+    acts.append(
+      actionButton('确认并撤销原手记', async () => {
+        await apiPost('reviews', {
+          op: 'resolve_correction',
+          correction_id: corr.correction_id,
+          identity: corr.identity || state.identity,
+          resolution: 'revoke',
+        });
+        notify('已确认纠错并撤销原阅读手账。', 'success');
+        await Promise.all([loadReviews({ silent: true }), loadOverview({ silent: true })]);
+      }, 'wb-button danger'),
+      actionButton('驳回纠错', async () => {
+        await apiPost('reviews', {
+          op: 'resolve_correction',
+          correction_id: corr.correction_id,
+          identity: corr.identity || state.identity,
+          resolution: 'dismiss',
+        });
+        notify('已驳回该条纠错请求。', 'info');
+        await Promise.all([loadReviews({ silent: true }), loadOverview({ silent: true })]);
+      }),
+    );
+    head.append(tg, acts);
+    card.append(head, el('p', 'item-body', corr.statement || ''));
+    const meta = el('div', 'item-meta');
+    meta.append(
+      el('span', '', `会话：${formatScopeLabel(corr.umo) || corr.umo}`),
+      el('span', '', `成员：${corr.member_id || ''}`),
+      ...(corr.created_at ? [el('span', '', formatTime(corr.created_at))] : []),
+    );
+    card.append(meta);
+    list.append(card);
+  }
+}
+
 function renderReviews() {
   const { items, blocked_topics, page, total, page_size, state: filterState } = state.reviews;
   for (const btn of $$('#reviews-filter-group [data-review-state]')) {
     btn.setAttribute('aria-pressed', String((btn.dataset.reviewState || '') === filterState));
   }
+  const kindSel = $('#reviews-source-kind');
+  if (kindSel) kindSel.value = state.reviews.source_kind || '';
 
   const revCount = $('#reviews-count-pill');
   if (revCount) revCount.textContent = String(Number(total) || items.length);
@@ -1024,12 +1493,26 @@ function renderReviews() {
         const card = el('article', 'item-card');
         const head = el('div', 'item-head');
         const titleGroup = el('div', 'item-title-group');
+        const st = item.state || 'pending_review';
+        const actionable = ['pending_review', 'pending', 'held'].includes(st)
+          && item.review_reason !== 'source_changed';
+        if (actionable) {
+          const cb = el('input', 'review-select-cb');
+          cb.type = 'checkbox';
+          cb.checked = state.reviews.selectedIds.has(item.proposal_id);
+          cb.setAttribute('aria-label', `选择提案 ${item.title || item.proposal_id}`);
+          cb.addEventListener('change', () => {
+            if (cb.checked) state.reviews.selectedIds.add(item.proposal_id);
+            else state.reviews.selectedIds.delete(item.proposal_id);
+            syncBatchSelectionUI();
+          });
+          titleGroup.append(cb);
+        }
         if (item.source_kind) {
           titleGroup.append(el('span', 'pill', KIND_LABELS[item.source_kind] || item.source_kind));
         }
         titleGroup.append(el('h4', 'item-title', item.title || '未命名阅读提案'));
 
-        const st = item.state || 'pending_review';
         const stTone = st === 'approved' ? 'accent' : st === 'rejected' ? 'danger' : 'warn';
         titleGroup.append(
           el('span', `pill ${stTone}`, PROPOSAL_STATE_LABELS[st] || st),
@@ -1042,10 +1525,15 @@ function renderReviews() {
           proposal_id: item.proposal_id,
           revision: item.revision,
         };
-        const actionable = ['pending_review', 'pending', 'held'].includes(st)
-          && item.review_reason !== 'source_changed';
+        let editorBox = null;
         if (actionable) {
+          const editBtn = el('button', 'wb-button', '微调编辑');
+          editBtn.type = 'button';
+          editBtn.addEventListener('click', () => {
+            if (editorBox) editorBox.hidden = !editorBox.hidden;
+          });
           actions.append(
+            editBtn,
             actionButton(msg('批准'), async () => {
               await apiPost('reviews', {
                 op: 'approve',
@@ -1075,6 +1563,67 @@ function renderReviews() {
         }));
         head.append(titleGroup, actions);
         card.append(head);
+
+        if (actionable) {
+          editorBox = el('div', 'proposal-editor');
+          editorBox.hidden = true;
+          const digestInput = el('textarea');
+          digestInput.rows = 2;
+          digestInput.value = item.digest || '';
+          const reflInput = el('textarea');
+          reflInput.rows = 2;
+          reflInput.value = item.reflection || '';
+          const topicInput = el('input');
+          topicInput.type = 'text';
+          topicInput.value = (item.staged_interest && typeof item.staged_interest === 'object')
+            ? (item.staged_interest.topic || '')
+            : '';
+          const qsInput = el('textarea');
+          qsInput.rows = 2;
+          qsInput.placeholder = '每行一条待讨论问题，留空则不生成待讨论问题';
+          qsInput.value = (Array.isArray(item.questions) ? item.questions : [])
+            .map(q => (typeof q === 'object' ? (q.question || q.text || '') : String(q || '')))
+            .filter(Boolean)
+            .join('\n');
+
+          const f1 = el('label', 'form-field');
+          f1.append(el('span', '', '核对摘要（<=200字）'), digestInput);
+          const f2 = el('label', 'form-field');
+          f2.append(el('span', '', '角色随感（<=150字）'), reflInput);
+          const f3 = el('label', 'form-field');
+          f3.append(el('span', '', '拟更新兴趣话题'), topicInput);
+          const f4 = el('label', 'form-field');
+          f4.append(el('span', '', '待讨论问题（可润色，每行 1 条）'), qsInput);
+          const edActions = el('div', 'item-actions');
+          edActions.append(
+            actionButton('保存微调', async () => {
+              const nextTopic = topicInput.value.trim();
+              const nextQs = qsInput.value
+                .split(/\r?\n/)
+                .map(s => s.trim())
+                .filter(Boolean)
+                .map(qText => ({ topic: nextTopic || item.title || '近期见闻', question: qText }));
+              await apiPost('reviews', {
+                op: 'edit_proposal',
+                ...target,
+                digest: digestInput.value.trim(),
+                reflection: reflInput.value.trim(),
+                staged_interest: nextTopic
+                  ? {
+                      topic: nextTopic,
+                      summary: (item.staged_interest && item.staged_interest.summary) || reflInput.value.trim(),
+                    }
+                  : {},
+                questions: nextQs,
+              });
+              notify('已保存提案微调内容。', 'success');
+              await loadReviews({ silent: true });
+            }, 'wb-button primary'),
+            actionButton('收起', async () => { editorBox.hidden = true; }),
+          );
+          editorBox.append(f1, f2, f3, f4, edActions);
+          card.append(editorBox);
+        }
         const evidence = el('details','log-pane');
         evidence.append(el('summary','','阅读证据与审核历史'));
         evidence.append(el('p','',`内容来源：${item.evidence?.content_origin || item.content_origin || '旧记录，原文未留档'} · 抓取：${formatTime(item.evidence?.fetched_at)}`));
@@ -1158,7 +1707,9 @@ function renderReviews() {
   if (prev) prev.disabled = page <= 1;
   if (next) next.disabled = page >= maxPage;
 
-  // Blocked Topics
+  // Blocked Topics & Corrections Queue
+  syncBatchSelectionUI();
+  renderCorrectionsQueue();
   const topics = Array.isArray(blocked_topics) ? blocked_topics : [];
   const blkCount = $('#blocked-count-pill');
   if (blkCount) blkCount.textContent = String(topics.length);
@@ -1231,7 +1782,9 @@ async function loadSources({ silent = false } = {}) {
 async function loadLogs({ silent = false } = {}) {
   if (!silent) notify('正在读取阅读手账…', 'info');
   await readRoleData('logs', {
-    page: state.logs.page, source_kind: state.logs.source_kind,
+    page: state.logs.page,
+    source_kind: state.logs.source_kind,
+    ...(state.logs.query ? { query: state.logs.query } : {}),
   }, $('#logs-list'), data => {
     state.logs.items = Array.isArray(data?.items) ? data.items : [];
     state.logs.page = Number(data?.page) || state.logs.page;
@@ -1245,7 +1798,10 @@ async function loadLogs({ silent = false } = {}) {
 async function loadReviews({ silent = false } = {}) {
   if (!silent) notify('正在读取审查队列与屏蔽词…', 'info');
   await readRoleData('reviews', {
-    state: state.reviews.state, page: state.reviews.page,
+    state: state.reviews.state,
+    page: state.reviews.page,
+    ...(state.reviews.source_kind ? { source_kind: state.reviews.source_kind } : {}),
+    ...(state.reviews.query ? { query: state.reviews.query } : {}),
   }, $('#reviews-list'), data => {
     if (data?.identity && state.identity && data.identity !== state.identity) {
       throw new Error('审查队列属于其他角色，请刷新后重试。');
@@ -1255,6 +1811,8 @@ async function loadReviews({ silent = false } = {}) {
       ? data.items.filter(item => !item.identity || item.identity === identity)
       : [];
     state.reviews.blocked_topics = Array.isArray(data?.blocked_topics) ? data.blocked_topics : [];
+    state.reviews.corrections = Array.isArray(data?.corrections) ? data.corrections : [];
+    state.reviews.selectedIds.clear();
     state.reviews.page = Number(data?.page) || state.reviews.page;
     state.reviews.total = Number(data?.total ?? state.reviews.items.length);
     if (data?.page_size) state.reviews.page_size = Number(data.page_size);
@@ -1340,7 +1898,9 @@ function changePersona(identity, { syncShared = true } = {}) {
   state.sources = [];
   state.books = [];
   Object.assign(state.logs, { items: [], page: 1, total: 0 });
-  Object.assign(state.reviews, { items: [], blocked_topics: [], page: 1, total: 0 });
+  Object.assign(state.reviews, { items: [], blocked_topics: [], corrections: [], page: 1, total: 0 });
+  state.reviews.selectedIds.clear();
+  state.decayPreviewDays = null;
   state.editingSource = null;
   const ebookInput = $('#ebook-file-input');
   if (ebookInput) ebookInput.value = '';
@@ -1349,9 +1909,9 @@ function changePersona(identity, { syncShared = true } = {}) {
   const archive = $('#archive-panel');
   if (archive) delete archive.dataset.ready;
   for (const id of [
-    'kpi-grid', 'interests-list', 'questions-list', 'health-panel', 'archive-panel',
-    'sources-list', 'bookshelf-list', 'logs-list', 'reviews-list', 'blocked-topics-list',
-    'pub-book-results',
+    'kpi-grid', 'interests-list', 'questions-list', 'health-panel', 'presets-decay-panel',
+    'outreach-diagnostics-panel', 'archive-panel', 'sources-list', 'bookshelf-list',
+    'logs-list', 'reviews-list', 'corrections-list', 'blocked-topics-list', 'pub-book-results',
   ]) {
     const node = $(`#${id}`);
     node?.replaceChildren();
@@ -1371,7 +1931,7 @@ function changePersona(identity, { syncShared = true } = {}) {
     const node = $(`#${id}`);
     if (node) node.textContent = '';
   }
-  for (const id of ['reviews', 'blocked', 'interests', 'questions', 'sources', 'books']) {
+  for (const id of ['reviews', 'blocked', 'corrections', 'interests', 'questions', 'sources', 'books']) {
     const count = $(`#${id}-count-pill`);
     if (count) count.textContent = '0';
   }
@@ -1434,6 +1994,12 @@ function openSourceDrawer(kind = 'bilibili', existing = null) {
   state.drawerKind = existing?.source_kind || kind || 'bilibili';
   state.drawerDirty = false;
   $('#source-drawer-error').textContent = '';
+  const testBox = $('#source-test-result');
+  if (testBox) {
+    testBox.hidden = true;
+    testBox.className = 'test-result-box';
+    testBox.replaceChildren();
+  }
 
   const cfg = existing?.config || {};
   $('#source-drawer-title').textContent = existing
@@ -1475,6 +2041,114 @@ function openSourceDrawer(kind = 'bilibili', existing = null) {
   if (dialog && !dialog.open) dialog.showModal();
 }
 
+function buildSourceConfigFromDrawer(kind) {
+  const prevCfg = state.editingSource?.config || {};
+  let config = {};
+  if (kind === 'bilibili') {
+    const mode = $('#bili-mode').value;
+    const uid = $('#bili-uid').value.trim();
+    if (mode === 'up' && !uid) throw new Error('指定关注 UP 主模式需要填写 UID。');
+    config = { mode };
+    if (mode === 'up') config.uid = uid;
+    if (mode === 'popular') config.popular_kind = $('#bili-popular-kind').value;
+    const cookieInput = $('#bili-cookie').value.trim();
+    if (cookieInput && !isMaskedSecret(cookieInput)) {
+      config.cookie = cookieInput;
+    } else if (state.editingSource && prevCfg.cookie) {
+      config.cookie = '******';
+    }
+  } else if (kind === 'ebook') {
+    const provider = prevCfg.provider === 'local' && state.editingSource ? 'local' : $('#ebook-provider').value;
+    config = provider === 'local' ? { ...prevCfg, provider: 'local' } : { provider };
+    if (provider === 'wikisource') {
+      const page = $('#ebook-page').value.trim();
+      if (!page) throw new Error('请填写维基文库页面标题。');
+      config.page = page;
+      config.title = page;
+    } else if (provider === 'gutendex') {
+      const bookRef = $('#ebook-book-id').value.trim();
+      if (!bookRef) throw new Error('请填写 Gutendex 书籍正整数 ID 或下载链接。');
+      if (/^https?:\/\//i.test(bookRef)) config.download_url = bookRef;
+      else config.book_id = bookRef;
+    } else if (provider === 'opds') {
+      const url = $('#ebook-opds-url').value.trim();
+      if (!url) throw new Error('请填写 OPDS 书库链接。');
+      config.url = url;
+      config.allow_private_opds = $('#ebook-allow-private').checked;
+      config.credential_origins = $('#ebook-credential-origins').value.split(/\n/).map(v => v.trim()).filter(Boolean);
+      const username = $('#ebook-opds-user').value.trim();
+      const password = $('#ebook-opds-pass').value.trim();
+      if (username) config.username = username;
+      if (password && !isMaskedSecret(password)) {
+        config.password = password;
+      } else if (state.editingSource && prevCfg.password) {
+        config.password = '******';
+      }
+    }
+  } else if (kind === 'feed') {
+    const url = $('#feed-url').value.trim();
+    if (!url) throw new Error('请填写 RSS / Atom / JSON Feed 订阅地址。');
+    config = { url };
+  } else if (kind === 'manual') {
+    config = {
+      title: $('#manual-title').value.trim(),
+      creator: $('#manual-creator').value.trim(),
+      url: $('#manual-url').value.trim(),
+      text: $('#manual-text').value.trim(),
+    };
+  }
+  return config;
+}
+
+async function runSourceConnectionTest() {
+  const errNode = $('#source-drawer-error');
+  const box = $('#source-test-result');
+  const btn = $('#btn-test-source');
+  if (!box || !btn) return;
+  errNode.textContent = '';
+  btn.disabled = true;
+  box.hidden = false;
+  box.className = 'test-result-box';
+  box.replaceChildren(el('p', '', '正在执行连接测试并试抓 1 条样本…'));
+  try {
+    const kind = state.drawerKind;
+    const config = buildSourceConfigFromDrawer(kind);
+    const res = await apiPost('sources', {
+      op: 'test_source',
+      identity: state.identity,
+      source_kind: kind,
+      config,
+    });
+    box.replaceChildren();
+    if (res?.ok) {
+      box.className = 'test-result-box is-ok';
+      const previews = Array.isArray(res.preview_items) ? res.preview_items : [];
+      box.append(el('strong', '', `连接成功（试抓到 ${Number(res.count ?? previews.length)} 条候选）`));
+      for (const item of previews.slice(0, 2)) {
+        const line = [item.title, item.creator, item.bvid].filter(Boolean).join(' · ');
+        box.append(el('p', '', `样本：${line}`));
+      }
+      if (res.advice) box.append(el('p', 'advice-note', `提示：${res.advice}`));
+    } else {
+      box.className = 'test-result-box is-err';
+      box.append(el('strong', '', `连接测试未通过：${res?.error || res?.status || '未知异常'}`));
+      const advice = res?.advice || formatSourceErrorAdvice(res?.error || res?.status, kind);
+      if (advice) box.append(el('p', 'advice-note', `处置建议：${advice}`));
+    }
+  } catch (err) {
+    if (err !== ROLE_CHANGED) {
+      box.className = 'test-result-box is-err';
+      const errMsg = err?.message || tr('请求失败');
+      box.replaceChildren(
+        el('strong', '', `连接测试失败：${errMsg}`),
+        el('p', 'advice-note', `处置建议：${formatSourceErrorAdvice(errMsg, state.drawerKind)}`),
+      );
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function submitSourceForm(ev) {
   ev.preventDefault();
   const errNode = $('#source-drawer-error');
@@ -1508,69 +2182,7 @@ async function submitSourceForm(ev) {
     const name = $('#src-name').value.trim();
     if (!name) throw new Error('请填写信息源名称。');
     const enabled = $('#src-enabled').checked;
-    const prevCfg = state.editingSource?.config || {};
-    let config = {};
-
-    if (kind === 'bilibili') {
-      const mode = $('#bili-mode').value;
-      const uid = $('#bili-uid').value.trim();
-      if (mode === 'up' && !uid) throw new Error('指定关注 UP 主模式需要填写 UID。');
-      config = { mode };
-      if (mode === 'up') config.uid = uid;
-      if (mode === 'popular') config.popular_kind = $('#bili-popular-kind').value;
-      const cookieInput = $('#bili-cookie').value.trim();
-      if (cookieInput && !isMaskedSecret(cookieInput)) {
-        config.cookie = cookieInput;
-      } else if (state.editingSource && prevCfg.cookie) {
-        config.cookie = '******';
-      }
-    } else if (kind === 'ebook') {
-      const provider = prevCfg.provider === 'local' && state.editingSource ? 'local' : $('#ebook-provider').value;
-      if (provider === 'local') {
-        config = { ...prevCfg, provider: 'local' };
-      } else {
-        config = { provider };
-      }
-      if (provider === 'wikisource') {
-        const page = $('#ebook-page').value.trim();
-        if (!page) throw new Error('请填写维基文库页面标题。');
-        config.page = page;
-        config.title = page;
-      } else if (provider === 'gutendex') {
-        const bookRef = $('#ebook-book-id').value.trim();
-        if (!bookRef) throw new Error('请填写 Gutendex 书籍正整数 ID 或下载链接。');
-        if (/^https?:\/\//i.test(bookRef)) {
-          config.download_url = bookRef;
-        } else {
-          config.book_id = bookRef;
-        }
-      } else if (provider === 'opds') {
-        const url = $('#ebook-opds-url').value.trim();
-        if (!url) throw new Error('请填写 OPDS 书库链接。');
-        config.url = url;
-        config.allow_private_opds = $('#ebook-allow-private').checked;
-        config.credential_origins = $('#ebook-credential-origins').value.split(/\n/).map(v=>v.trim()).filter(Boolean);
-        const username = $('#ebook-opds-user').value.trim();
-        const password = $('#ebook-opds-pass').value.trim();
-        if (username) config.username = username;
-        if (password && !isMaskedSecret(password)) {
-          config.password = password;
-        } else if (state.editingSource && prevCfg.password) {
-          config.password = '******';
-        }
-      }
-    } else if (kind === 'feed') {
-      const url = $('#feed-url').value.trim();
-      if (!url) throw new Error('请填写 RSS / Atom / JSON Feed 订阅地址。');
-      config = { url };
-    } else if (kind === 'manual') {
-      config = {
-        title: $('#manual-title').value.trim(),
-        creator: $('#manual-creator').value.trim(),
-        url: $('#manual-url').value.trim(),
-        text: $('#manual-text').value.trim(),
-      };
-    }
+    const config = buildSourceConfigFromDrawer(kind);
 
     const payload = state.editingSource
       ? {
@@ -1818,20 +2430,77 @@ function renderHealth(h) {
   }
 
   const schedBox = el('div', 'health-detail-box');
-  const sharingScope = {
-    disabled: statusMsg('sharingDisabled'),
-    all_managed_chats: statusMsg('sharingAllChats'),
-    all_managed_groups: msg('主动分享：所有已接管群；仅向有真实共同话题证据且未退订的成员分享'),
-    explicit: statusMsg('sharingSelectedChats'),
-  };
+  const sharingSummary = h.proactive_enabled === false || h.proactive_scope === 'disabled'
+    ? statusMsg('sharingDisabled')
+    : h.proactive_scope === 'explicit'
+      ? statusMsg('sharingSelectedChats')
+      : statusMsg('sharingAllChats');
   schedBox.append(
     el('strong', '', msg('调度与主动分享')),
     el('p', '', msg('下次采集：{0}；下次阅读检查：{1}', formatTime(h.next_poll_at), formatTime(h.next_digest_at))),
     el('p', '', msg('今日模型调用 {0}/{1} · 已归档候选 {2} · 存储 {3} MB', callsToday, quota, d.archived_candidates || 0, storageMb)),
-    el('p', '', sharingScope[h.proactive_scope] || sharingScope.disabled),
+    el('p', '', sharingSummary),
   );
+  if (Number(d.anli_today_total) > 0) {
+    schedBox.append(el('p', 'health-meta-line', `今日群友 /安利 投喂：${Number(d.anli_today_total)} 条`));
+  }
 
   grid.append(modelBox, schedBox);
+
+  // Stage-split Token/Call Cost & Video Channel Hit/Fallback Stats
+  const costRows = Array.isArray(d.cost_by_stage) ? d.cost_by_stage : [];
+  const vStats = d.video_channel_stats && typeof d.video_channel_stats === 'object' ? d.video_channel_stats : null;
+  if (costRows.length > 0 || (vStats && Number(vStats.total) > 0)) {
+    const costBox = el('div', 'health-detail-box');
+    costBox.append(el('strong', '', '分阶段调用与 Token 成本（近 7 日）'));
+    if (costRows.length > 0) {
+      const table = el('table', 'cost-table');
+      const thead = el('thead');
+      const hr = el('tr');
+      for (const htxt of ['阶段', '调用', 'Prompt', 'Completion', '总 Token']) {
+        hr.append(el('th', '', htxt));
+      }
+      thead.append(hr);
+      const tbody = el('tbody');
+      for (const row of costRows) {
+        const trNode = el('tr');
+        trNode.append(
+          el('td', '', STAGE_LABELS[row.stage] || row.stage),
+          el('td', '', `${row.calls} 次`),
+          el('td', '', String(Number(row.prompt_tokens) || 0)),
+          el('td', '', String(Number(row.completion_tokens) || 0)),
+          el('td', '', String(Number(row.total_tokens) || 0)),
+        );
+        tbody.append(trNode);
+      }
+      table.append(thead, tbody);
+      costBox.append(table);
+    } else {
+      costBox.append(el('p', 'health-meta-line', '近 7 日暂无分阶段模型调用记录。'));
+    }
+
+    const videoBox = el('div', 'health-detail-box');
+    videoBox.append(el('strong', '', '视频通道命中与降级率'));
+    if (vStats && Number(vStats.total) > 0) {
+      const hitPct = Math.round((Number(vStats.native_hit_rate) || 0) * 100);
+      const fbPct = Math.round((Number(vStats.fallback_rate) || 0) * 100);
+      videoBox.append(
+        el('p', '', `原生直传命中率 ${hitPct}% · 降级率 ${fbPct}%（共 ${vStats.total} 条视频手账）`),
+      );
+      const bars = el('div', 'video-channel-bars');
+      bars.append(
+        el('span', 'pill accent', `原生直传 ${Number(vStats.native_video) || 0}`),
+        el('span', 'pill info', `关键帧抽帧 ${Number(vStats.keyframes) || 0}`),
+        el('span', 'pill', `雪碧图 ${Number(vStats.videoshot) || 0}`),
+        el('span', 'pill warn', `纯字幕/转写 ${(Number(vStats.subtitle_only) || 0) + (Number(vStats.audio_transcript) || 0)}`),
+      );
+      videoBox.append(bars);
+    } else {
+      videoBox.append(el('p', 'health-meta-line', '暂无视频精读通道统计样本。'));
+    }
+    grid.append(costBox, videoBox);
+  }
+
   body.append(grid);
 
   if (h.last_error) {
@@ -1884,20 +2553,15 @@ function renderHealth(h) {
   for (const job of d.world_pending || []) {
     body.append(el('p', 'item-meta', `书签同步 ${job.operation} · ${job.attempts} 次 · ${job.last_error || '待处理'}`));
   }
-  for (const correction of pendingCorrections) {
-    const line = el('div', 'item-card', `${correction.umo} / ${correction.member_id}：${correction.statement}`);
-    for (const [label, resolution] of [['确认并撤销原手记', 'revoke'], ['驳回纠错', 'dismiss']]) {
-      line.append(actionButton(label, async () => {
-        await apiPost('reviews', {
-          op: 'resolve_correction',
-          correction_id: correction.correction_id,
-          identity: correction.identity || state.identity,
-          resolution,
-        });
-        await loadOverview({ silent: true });
-      }));
-    }
-    body.append(line);
+  if (pendingCorrections.length > 0) {
+    const corrHint = el('div', 'item-actions');
+    corrHint.append(
+      el('span', 'pill warn', `待处理群友纠错 ${pendingCorrections.length} 项`),
+      actionButton('前往「审查与黑名单」处理', async () => {
+        await switchTab('reviews');
+      }),
+    );
+    body.append(corrHint);
   }
 
   disclosure.append(summary, body);
@@ -2039,6 +2703,7 @@ function bindEvents() {
   $('#btn-open-manual-drawer')?.addEventListener('click', () => openSourceDrawer('manual', null));
   $('#btn-close-source-drawer')?.addEventListener('click', () => $('#source-drawer')?.close());
   $('#btn-cancel-source')?.addEventListener('click', () => $('#source-drawer')?.close());
+  $('#btn-test-source')?.addEventListener('click', runSourceConnectionTest);
   $('#source-form')?.addEventListener('input', () => { state.drawerDirty = true; });
   $('#source-form')?.addEventListener('submit', submitSourceForm);
 
@@ -2088,7 +2753,19 @@ function bindEvents() {
     }
   });
 
-  // Logs Filter & Pagination
+  // Logs Search, Filter & Pagination
+  const triggerLogsSearch = () => {
+    state.logs.query = $('#logs-search-input')?.value.trim() || '';
+    state.logs.page = 1;
+    loadLogs().catch(err => notify(err?.message || tr('读取失败'), 'error'));
+  };
+  $('#btn-logs-search')?.addEventListener('click', triggerLogsSearch);
+  $('#logs-search-input')?.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      triggerLogsSearch();
+    }
+  });
   for (const btn of $$('#logs-filter-group [data-log-kind]')) {
     btn.addEventListener('click', () => {
       state.logs.source_kind = btn.dataset.logKind || '';
@@ -2107,7 +2784,62 @@ function bindEvents() {
     loadLogs().catch(err => notify(err?.message || tr('读取失败'), 'error'));
   });
 
-  // Reviews Filter, Pagination & Blocklist
+  // Reviews Search, Source Filter, Batch Actions, Pagination & Blocklist
+  const triggerReviewsSearch = () => {
+    state.reviews.query = $('#reviews-search-input')?.value.trim() || '';
+    state.reviews.source_kind = $('#reviews-source-kind')?.value || '';
+    state.reviews.page = 1;
+    loadReviews().catch(err => notify(err?.message || tr('读取失败'), 'error'));
+  };
+  $('#btn-reviews-search')?.addEventListener('click', triggerReviewsSearch);
+  $('#reviews-source-kind')?.addEventListener('change', triggerReviewsSearch);
+  $('#reviews-search-input')?.addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      triggerReviewsSearch();
+    }
+  });
+  $('#reviews-select-all')?.addEventListener('change', ev => {
+    const checked = Boolean(ev.target.checked);
+    state.reviews.selectedIds.clear();
+    if (checked) {
+      for (const item of state.reviews.items || []) {
+        const st = item.state || 'pending_review';
+        if (['pending_review', 'pending', 'held'].includes(st) && item.review_reason !== 'source_changed') {
+          state.reviews.selectedIds.add(item.proposal_id);
+        }
+      }
+    }
+    for (const cb of $$('#reviews-list .review-select-cb')) cb.checked = checked;
+    syncBatchSelectionUI();
+  });
+  const runBatchReview = async opName => {
+    const ids = [...state.reviews.selectedIds];
+    if (!ids.length) return;
+    const itemMap = new Map((state.reviews.items || []).map(i => [i.proposal_id, i]));
+    const items = ids.map(pid => ({ proposal_id: pid, revision: itemMap.get(pid)?.revision }));
+    const btn = opName === 'batch_approve' ? $('#btn-batch-approve') : $('#btn-batch-reject');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await apiPost('reviews', {
+        op: opName,
+        identity: state.identity,
+        items,
+      });
+      notify(
+        `${opName === 'batch_approve' ? '批量批准' : '批量拒绝'}完成：成功 ${Number(res?.succeeded) || 0} 项${Number(res?.failed) ? `，失败 ${res.failed} 项` : ''}。`,
+        Number(res?.failed) ? 'warning' : 'success',
+      );
+      await Promise.all([loadReviews({ silent: true }), loadOverview({ silent: true })]);
+    } catch (err) {
+      if (err !== ROLE_CHANGED) notify(err?.message || tr('请求失败'), 'error');
+    } finally {
+      syncBatchSelectionUI();
+    }
+  };
+  $('#btn-batch-approve')?.addEventListener('click', () => runBatchReview('batch_approve'));
+  $('#btn-batch-reject')?.addEventListener('click', () => runBatchReview('batch_reject'));
+
   for (const btn of $$('#reviews-filter-group [data-review-state]')) {
     btn.addEventListener('click', () => {
       state.reviews.state = btn.dataset.reviewState || '';

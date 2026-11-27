@@ -1074,19 +1074,56 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 else int(row["chapter_cursor"])
             )
             cursor = max(0, cursor)
+            total_ch = int(row["total_chapters"] or 0)
+            if total_ch > 0:
+                cursor = min(cursor, total_ch)
             refl = (
                 strip_raw_urls(reflection)[:160]
                 if reflection is not None
                 else row["last_reflection"]
             )
-            self.db.execute(
-                "UPDATE books SET status=?, chapter_cursor=?, last_reflection=?, updated_at=? WHERE book_id=?",
-                (status, cursor, refl, stamp, str(book_id)),
-            )
+            if chapter_cursor is not None:
+                self.db.execute(
+                    "UPDATE books SET status=?, chapter_cursor=?, progress_verified=1, last_reflection=?, updated_at=? WHERE book_id=?",
+                    (status, cursor, refl, stamp, str(book_id)),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE books SET status=?, chapter_cursor=?, last_reflection=?, updated_at=? WHERE book_id=?",
+                    (status, cursor, refl, stamp, str(book_id)),
+                )
             updated = self.db.execute(
                 "SELECT * FROM books WHERE book_id=?", (str(book_id),)
             ).fetchone()
         return self._format_book_row(updated)
+
+    def delete_book(
+        self, book_id: str, *, expected_identity: str = "", now: float | None = None
+    ) -> dict[str, Any]:
+        """Safely delete a bookshelf entry & its local chapters without deleting approved reading logs."""
+        stamp = float(now if now is not None else time.time())
+        with self.lock, self.db:
+            row = self.db.execute(
+                "SELECT * FROM books WHERE book_id=?", (str(book_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("书籍不存在")
+            check_review_target(row, expected_identity)
+            self.db.execute(
+                "DELETE FROM book_chapters WHERE book_id=?", (str(book_id),)
+            )
+            self.db.execute(
+                "UPDATE candidate_items SET status='skipped', archived=1 WHERE book_id=? AND status='unread'",
+                (str(book_id),),
+            )
+            self.db.execute(
+                "UPDATE reading_tasks SET status='cancelled', evidence_json='{}', updated_at=? WHERE book_id=? AND status IN ('running','pending_review','failed','interrupted')",
+                (stamp, str(book_id)),
+            )
+            self.db.execute(
+                "DELETE FROM books WHERE book_id=?", (str(book_id),)
+            )
+        return {"deleted": True, "book_id": str(book_id), "title": str(row["title"])}
 
     # ------------------------------------------------------------------
     # Candidate Pool
@@ -1094,6 +1131,18 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
 
     @staticmethod
     def _format_candidate_row(row: sqlite3.Row) -> dict[str, Any]:
+        meta = json.loads(row["meta_json"] or "{}")
+        rec_by: dict[str, Any] = {}
+        try:
+            keys = row.keys()
+            if "recommended_by_json" in keys and row["recommended_by_json"]:
+                parsed = json.loads(row["recommended_by_json"])
+                if isinstance(parsed, dict) and parsed:
+                    rec_by = parsed
+        except Exception:
+            rec_by = {}
+        if not rec_by and isinstance(meta.get("recommended_by"), dict):
+            rec_by = dict(meta["recommended_by"])
         return {
             "candidate_id": row["candidate_id"],
             "source_id": row["source_id"],
@@ -1115,7 +1164,8 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             "full_text": row["full_text"],
             "fingerprint": row["fingerprint"],
             "status": row["status"],
-            "meta": json.loads(row["meta_json"] or "{}"),
+            "meta": meta,
+            "recommended_by": rec_by,
             "created_at": float(row["created_at"]),
         }
 
@@ -1261,17 +1311,49 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     "SELECT * FROM candidate_items WHERE candidate_id=?", (cid,)
                 ).fetchone()
                 if row is not None:
+                    raw_rec = (
+                        raw.get("recommended_by")
+                        if isinstance(raw.get("recommended_by"), dict)
+                        else (
+                            clean["meta"].get("recommended_by")
+                            if isinstance(clean["meta"].get("recommended_by"), dict)
+                            else {}
+                        )
+                    )
+                    rec_payload: dict[str, Any] = {}
+                    if raw_rec and raw_rec.get("umo") and raw_rec.get("member_id"):
+                        rec_payload = {
+                            "umo": str(raw_rec.get("umo") or "").strip()[:512],
+                            "member_id": str(raw_rec.get("member_id") or "").strip()[:128],
+                            "member_name": strip_raw_urls(
+                                sanitize_untrusted_text(
+                                    str(raw_rec.get("member_name") or ""), max_chars=48
+                                )["text"]
+                            )[:48],
+                            "note": strip_raw_urls(
+                                sanitize_untrusted_text(
+                                    str(raw_rec.get("note") or ""), max_chars=200
+                                )["text"]
+                            )[:200],
+                            "recommended_at": float(raw_rec.get("recommended_at") or stamp),
+                        }
+                    pin_flag = 1 if (raw.get("pinned") is True or bool(rec_payload)) else 0
                     self.db.execute(
-                        "UPDATE candidate_items SET content_origin=? WHERE candidate_id=?",
+                        "UPDATE candidate_items SET content_origin=?, recommended_by_json=?, pinned=MAX(pinned, ?) WHERE candidate_id=?",
                         (
                             str(
                                 raw.get("content_origin")
                                 or clean["meta"].get("content_origin")
                                 or "unknown"
                             ),
+                            encode_json(rec_payload),
+                            pin_flag,
                             cid,
                         ),
                     )
+                    row = self.db.execute(
+                        "SELECT * FROM candidate_items WHERE candidate_id=?", (cid,)
+                    ).fetchone()
                 if row is not None and status == "unread":
                     inserted.append(self._format_candidate_row(row))
         return inserted
@@ -1608,11 +1690,15 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         *,
         identity: str = "",
         state: str = "",
+        source_kind: str = "",
+        query: str = "",
         page: int = 1,
         page_size: int = 20,
     ) -> dict[str, Any]:
         norm = normalize_identity(identity) if identity else ""
         clean_state = str(state or "").strip()
+        clean_kind = str(source_kind or "").strip()
+        clean_query = str(query or "").strip()[:120]
         where = "WHERE 1=1"
         params: list[Any] = []
         if norm:
@@ -1623,6 +1709,13 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         elif clean_state in PROPOSAL_STATES:
             where += " AND state=?"
             params.append(clean_state)
+        if clean_kind and clean_kind != "all" and clean_kind in SOURCE_KINDS:
+            where += " AND source_kind=?"
+            params.append(clean_kind)
+        if clean_query:
+            pat = f"%{_escape_like(clean_query)}%"
+            where += " AND (title LIKE ? ESCAPE '\\' OR digest LIKE ? ESCAPE '\\' OR reflection LIKE ? ESCAPE '\\' OR staged_interest_json LIKE ? ESCAPE '\\' OR questions_json LIKE ? ESCAPE '\\')"
+            params.extend([pat, pat, pat, pat, pat])
         p = max(1, min(10000, int(page or 1)))
         ps = max(1, min(100, int(page_size or 20)))
         with self.lock:
@@ -1799,6 +1892,122 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             ).fetchone()
         return self._format_proposal_row(updated)
 
+    def edit_proposal(
+        self,
+        proposal_id: str,
+        *,
+        digest: str | None = None,
+        reflection: str | None = None,
+        staged_interest: dict[str, Any] | None = None,
+        questions: list[dict[str, Any]] | None = None,
+        actor: str = "human",
+        expected_revision: int | None = None,
+        expected_identity: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Allow admin fine-tuning of a pending/held proposal (e.g. polishing questions) before approval."""
+        stamp = float(now if now is not None else time.time())
+        with self.lock, self.db:
+            row = self.db.execute(
+                "SELECT * FROM proposals WHERE proposal_id=?", (str(proposal_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError("提案不存在")
+            check_review_target(row, expected_identity, expected_revision)
+            if row["state"] not in {"pending_review", "held"}:
+                raise ReviewConflict("仅待审或人工复核提案允许微调编辑")
+            self.check_review_source(row)
+            norm_id = row["identity"]
+
+            next_digest = row["digest"]
+            if digest is not None:
+                cleaned = strip_raw_urls(
+                    sanitize_untrusted_text(str(digest), max_chars=200)["text"]
+                )[:200]
+                if not cleaned:
+                    raise ValueError("摘要不能为空")
+                next_digest = cleaned
+
+            next_refl = row["reflection"]
+            if reflection is not None:
+                cleaned_r = strip_raw_urls(
+                    sanitize_untrusted_text(str(reflection), max_chars=150)["text"]
+                )[:150]
+                if not cleaned_r:
+                    raise ValueError("角色随感不能为空")
+                next_refl = cleaned_r
+
+            next_si_json = row["staged_interest_json"]
+            if staged_interest is not None:
+                si = staged_interest if isinstance(staged_interest, dict) else {}
+                c_topic = strip_raw_urls(
+                    sanitize_untrusted_text(str(si.get("topic") or ""), max_chars=48)["text"]
+                )[:48]
+                c_summary = strip_raw_urls(
+                    sanitize_untrusted_text(
+                        str(si.get("summary") or ""), max_chars=140
+                    )["text"]
+                )[:140]
+                next_si_json = encode_json(
+                    {"topic": c_topic, "summary": c_summary} if c_topic else {}
+                )
+
+            next_qs_json = row["questions_json"]
+            if questions is not None:
+                norm_qs: list[dict[str, str]] = []
+                default_topic = ""
+                try:
+                    parsed_si = json.loads(next_si_json or "{}")
+                    if isinstance(parsed_si, dict):
+                        default_topic = str(parsed_si.get("topic") or "")
+                except Exception:
+                    default_topic = ""
+                for q in (questions or [])[:3]:
+                    if isinstance(q, str):
+                        qt = default_topic or row["title"][:32]
+                        qx = q
+                    elif isinstance(q, dict):
+                        qt = str(q.get("topic") or default_topic or row["title"][:32])
+                        qx = str(q.get("question") or "")
+                    else:
+                        continue
+                    qt_clean = strip_raw_urls(
+                        sanitize_untrusted_text(qt, max_chars=48)["text"]
+                    )[:48]
+                    qx_clean = strip_raw_urls(
+                        sanitize_untrusted_text(qx, max_chars=120)["text"]
+                    )[:120]
+                    if qx_clean and not self.is_topic_blocked(f"{qt_clean} {qx_clean}", norm_id):
+                        norm_qs.append(
+                            {"topic": qt_clean or "近期见闻", "question": qx_clean}
+                        )
+                next_qs_json = encode_json(norm_qs)
+
+            self.db.execute(
+                """
+                UPDATE proposals
+                SET digest=?, reflection=?, staged_interest_json=?, questions_json=?,
+                    revision=revision+1, updated_at=?
+                WHERE proposal_id=?
+                """,
+                (
+                    next_digest,
+                    next_refl,
+                    next_si_json,
+                    next_qs_json,
+                    stamp,
+                    str(proposal_id),
+                ),
+            )
+            self.db.execute(
+                "INSERT INTO review_audit(proposal_id,from_state,to_state,actor,reason,created_at) VALUES(?,?,?,?,?,?)",
+                (proposal_id, row["state"], row["state"], str(actor)[:64], "管理员微调编辑提案", stamp),
+            )
+            updated = self.db.execute(
+                "SELECT * FROM proposals WHERE proposal_id=?", (str(proposal_id),)
+            ).fetchone()
+        return self._format_proposal_row(updated)
+
     def approve_proposal_atomic(
         self,
         proposal_id: str,
@@ -1809,6 +2018,8 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         half_life_days: float = 6.0,
         question_ttl_hours: float = 72.0,
         proactive_sessions: list[str] | None = None,
+        member_taboos: dict[tuple[str, str], set[str] | frozenset[str] | list[str]] | None = None,
+        anli_reply_delay_hours: float = 0.0,
         expected_revision: int | None = None,
         expected_identity: str = "",
         now: float | None = None,
@@ -2056,13 +2267,41 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     "occurred_at": stamp,
                 },
             )
+            # Resolve optional /安利 recommender metadata from proposal evidence or candidate_items
+            recommended_by: dict[str, Any] = {}
+            if isinstance(proposal_evidence.get("recommended_by"), dict):
+                recommended_by = dict(proposal_evidence["recommended_by"])
+            if not recommended_by and row["candidate_id"]:
+                cand_rec = self.db.execute(
+                    "SELECT recommended_by_json, meta_json FROM candidate_items WHERE candidate_id=?",
+                    (row["candidate_id"],),
+                ).fetchone()
+                if cand_rec is not None:
+                    try:
+                        parsed_rec = json.loads(cand_rec["recommended_by_json"] or "{}")
+                        if isinstance(parsed_rec, dict) and parsed_rec.get("umo") and parsed_rec.get("member_id"):
+                            recommended_by = parsed_rec
+                    except Exception:
+                        pass
+                    if not recommended_by:
+                        try:
+                            cmeta = json.loads(cand_rec["meta_json"] or "{}")
+                            if isinstance(cmeta, dict) and isinstance(cmeta.get("recommended_by"), dict):
+                                recommended_by = dict(cmeta["recommended_by"])
+                        except Exception:
+                            pass
+
             # Generate gated low-frequency proactive sharing candidates on proactive_sessions
             created_intents = self._create_proactive_intents_in_tx(
                 identity=identity,
                 topic=topic,
                 log_id=log_id,
                 title=citation["title"],
+                reflection=row["reflection"],
                 proactive_sessions=proactive_sessions or [],
+                member_taboos=member_taboos,
+                recommended_by=recommended_by,
+                anli_reply_delay_hours=anli_reply_delay_hours,
                 now=stamp,
             )
 
@@ -2087,17 +2326,130 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         topic: str,
         log_id: str,
         title: str,
+        reflection: str = "",
         proactive_sessions: list[str],
+        member_taboos: dict[tuple[str, str], set[str] | frozenset[str] | list[str]] | None = None,
+        recommended_by: dict[str, Any] | None = None,
+        anli_reply_delay_hours: float = 0.0,
         now: float,
     ) -> list[dict[str, Any]]:
         allowed_umos = [
             str(u).strip() for u in proactive_sessions if str(u or "").strip()
         ]
-        if not topic or not allowed_umos:
-            return []
         persona_id, instance_id = unpack_identity(identity)
         created: list[dict[str, Any]] = []
+        taboo_map = member_taboos or {}
+
+        def _member_hits_taboo(u_key: str, m_id: str, text_blob: str) -> bool:
+            raw_terms = taboo_map.get((u_key, m_id))
+            if not raw_terms:
+                return False
+            low = str(text_blob or "").casefold()
+            return any(
+                len(str(t or "").strip()) >= 2 and str(t).strip().casefold() in low
+                for t in raw_terms
+            )
+
+        # 0. Dedicated /安利 reflection reply intent to the recommender (still respects opt-out/blocks/taboos/quiet_hours)
+        rec = recommended_by if isinstance(recommended_by, dict) else {}
+        rec_umo = str(rec.get("umo") or "").strip()
+        rec_member = str(rec.get("member_id") or "").strip()
+        if (
+            rec_umo
+            and rec_member
+            and rec_member not in {"bot", "system"}
+            and rec_umo in allowed_umos
+            and self.outreach_binding_valid(rec_umo, identity)
+        ):
+            rec_topic = strip_raw_urls(topic or title)[:48] or "安利读物"
+            rec_name = strip_raw_urls(str(rec.get("member_name") or "")).strip()[:32]
+            rec_note = strip_raw_urls(str(rec.get("note") or "")).strip()[:120]
+            pref = self.db.execute(
+                "SELECT opted_out FROM member_outreach_prefs WHERE identity=? AND umo=? AND member_id=?",
+                (identity, rec_umo, rec_member),
+            ).fetchone()
+            member_opted_out = bool(pref is not None and pref["opted_out"])
+            topic_blocked = bool(
+                self.is_topic_blocked(rec_topic, identity)
+                or self.db.execute(
+                    "SELECT 1 FROM member_topic_prefs WHERE identity=? AND umo=? AND member_id=? AND topic=? AND blocked=1",
+                    (identity, rec_umo, rec_member, rec_topic),
+                ).fetchone()
+            )
+            taboo_hit = _member_hits_taboo(
+                rec_umo, rec_member, f"{rec_topic} {title} {reflection}"
+            )
+            if not member_opted_out and not topic_blocked and not taboo_hit:
+                delay_sec = max(0.0, min(48.0, float(anli_reply_delay_hours or 0.0))) * 3600.0
+                not_before_ts = now + delay_sec
+                expires_ts = not_before_ts + 48 * 3600.0
+                platform = rec_umo.split(":", 2)[0]
+                anchor = compact_json([identity, rec_umo, rec_member, "anli_reply", log_id])
+                intent_id = "horizon:" + sha256_hex(anchor)[:32]
+                who = rec_name or "群友"
+                note_part = f"（对方当时还提到「{rec_note}」）" if rec_note else ""
+                refl_hint = strip_raw_urls(reflection)[:80]
+                reason_text = (
+                    f"{who}之前安利了《{strip_raw_urls(title)[:48]}》{note_part}，"
+                    f"最近刚看完并留了点感想（{refl_hint or '有些新想法'}），若当下气氛合适可自然回一句观后感，不要附带任何链接。"
+                )
+                src_ev = f"anli_log:{log_id}"
+                payload = {
+                    "schema_version": 1,
+                    "intent_id": intent_id,
+                    "provider": "dynamics_horizons",
+                    "kind": "social_chat",
+                    "horizon_kind": "anli_reflection_reply",
+                    "status": "pending",
+                    "scope": {
+                        "platform": platform,
+                        "umo": rec_umo,
+                        "persona_id": persona_id,
+                        "instance_id": instance_id,
+                    },
+                    "target_umo": rec_umo,
+                    "recipient_user_id": rec_member,
+                    "recipient_name": rec_name,
+                    "topic": rec_topic,
+                    "log_id": log_id,
+                    "reason": strip_raw_urls(reason_text)[:240],
+                    "evidence_quote": rec_note[:200] or f"安利了《{strip_raw_urls(title)[:48]}》",
+                    "source_event_id": src_ev,
+                    "source_ids": [src_ev],
+                    "source_occurred_at": float(rec.get("recommended_at") or now),
+                    "not_before": not_before_ts,
+                    "expires_at": expires_ts,
+                    "created_at": now,
+                }
+                self.db.execute(
+                    """
+                    INSERT OR IGNORE INTO horizon_intents(
+                        intent_id, identity, umo, recipient_user_id, topic, log_id,
+                        status, payload_json, not_before, expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        identity,
+                        rec_umo,
+                        rec_member,
+                        rec_topic,
+                        log_id,
+                        encode_json(payload),
+                        not_before_ts,
+                        expires_ts,
+                        now,
+                        now,
+                    ),
+                )
+                created.append(payload)
+
+        if not topic or not allowed_umos:
+            return created
+        anli_umos = {str(item.get("target_umo") or "") for item in created}
         for umo in dict.fromkeys(allowed_umos):
+            if umo in anli_umos:
+                continue
             if not self.outreach_binding_valid(umo, identity):
                 continue
             # Per-UMO daily/pending/topic cooldowns to prevent group spam bursts
@@ -2159,6 +2511,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                         "SELECT 1 FROM member_topic_prefs WHERE identity=? AND umo=? AND member_id=? AND topic=? AND blocked=1",
                         (identity, umo, member_id, topic),
                     ).fetchone()
+                    or _member_hits_taboo(umo, member_id, f"{topic} {title} {reflection}")
                 ):
                     continue
                 if self.db.execute(
@@ -2273,10 +2626,12 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         *,
         identity: str = "",
         source_kind: str = "",
+        query: str = "",
         page: int = 1,
         page_size: int = 20,
     ) -> dict[str, Any]:
         norm = normalize_identity(identity) if identity else ""
+        clean_query = str(query or "").strip()[:120]
         where = "WHERE 1=1"
         params: list[Any] = []
         if norm:
@@ -2285,6 +2640,15 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         if source_kind and source_kind != "all" and source_kind in SOURCE_KINDS:
             where += " AND source_kind=?"
             params.append(source_kind)
+        if clean_query:
+            pat = f"%{_escape_like(clean_query)}%"
+            where += (
+                " AND (citation_json LIKE ? ESCAPE '\\' OR digest LIKE ? ESCAPE '\\'"
+                " OR reflection LIKE ? ESCAPE '\\'"
+                " OR EXISTS (SELECT 1 FROM discussion_reflections dr WHERE dr.log_id=reading_logs.log_id"
+                " AND dr.status='active' AND (dr.topic LIKE ? ESCAPE '\\' OR dr.member_quote LIKE ? ESCAPE '\\' OR dr.reflection LIKE ? ESCAPE '\\')))"
+            )
+            params.extend([pat, pat, pat, pat, pat, pat])
         p = max(1, min(10000, int(page or 1)))
         ps = max(1, min(100, int(page_size or 20)))
         with self.lock:
@@ -2636,10 +3000,12 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         discussed_qids: list[str] = []
         topics_recorded: list[str] = []
         prefs_changed = False
+        feedback_ack = ""
 
         with self.lock, self.db:
             # 1. Explicit proactive contact opt-out / opt-in per (identity, umo, member)
             if clean_member and clean_member not in {"bot", "system"} and compact_user:
+                from .feedback import parse_member_feedback_command
 
                 def direct_request(cues):
                     phrases = "|".join(re.escape(cue) for cue in cues)
@@ -2652,7 +3018,15 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                         )
                     )
 
-                if direct_request(_OPT_OUT_CUES):
+                parsed_fb = parse_member_feedback_command(str(user_text or ""))
+                is_opt_out = direct_request(_OPT_OUT_CUES) or bool(
+                    parsed_fb and parsed_fb["kind"] == "opt_out"
+                )
+                is_opt_in = direct_request(_OPT_IN_CUES) or bool(
+                    parsed_fb and parsed_fb["kind"] == "opt_in"
+                )
+
+                if is_opt_out:
                     self.db.execute(
                         "INSERT OR REPLACE INTO member_outreach_prefs VALUES (?, ?, ?, 1, ?)",
                         (norm_id, clean_umo, clean_member, stamp),
@@ -2669,7 +3043,12 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                         (stamp, norm_id, clean_umo, clean_member),
                     )
                     prefs_changed = True
-                elif direct_request(_OPT_IN_CUES):
+                    feedback_ack = (
+                        parsed_fb["ack"]
+                        if parsed_fb and parsed_fb.get("ack")
+                        else "好呀，我已经记下了，之后不会再主动给你推见闻啦；以后想恢复随时跟我说一声就行。"
+                    )
+                elif is_opt_in:
                     self.db.execute(
                         "INSERT OR REPLACE INTO member_outreach_prefs VALUES (?, ?, ?, 0, ?)",
                         (norm_id, clean_umo, clean_member, stamp),
@@ -2679,6 +3058,11 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                         (norm_id, clean_umo, clean_member),
                     )
                     prefs_changed = True
+                    feedback_ack = (
+                        parsed_fb["ack"]
+                        if parsed_fb and parsed_fb.get("ack")
+                        else "明白啦，已经帮你恢复见闻分享啦，有合适的新鲜事再自然跟你聊。"
+                    )
 
             if not delivered or not verified:
                 return {
@@ -2686,6 +3070,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     "discussed_questions": [],
                     "topics_recorded": [],
                     "prefs_changed": prefs_changed,
+                    "feedback_ack": feedback_ack,
                 }
             receipt_key = sha256_hex(
                 [norm_id, clean_umo, clean_member, event_id or turn_id]
@@ -3098,6 +3483,166 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 (status, encode_json(item), stamp, str(intent_id)),
             )
         return {"schema_version": 1, "status": status, "changed": True, "intent": item}
+
+    def list_outreach_diagnostics(
+        self, identity: str = "", *, now: float | None = None
+    ) -> dict[str, Any]:
+        """Return proactive sharing queue (`horizon_intents`), co-discussed topics, and opted-out members."""
+        norm = normalize_identity(identity) if identity else ""
+        id_clause = " WHERE identity=?" if norm else ""
+        id_params = (norm,) if norm else ()
+        with self.lock:
+            intent_rows = self.db.execute(
+                f"SELECT * FROM horizon_intents{id_clause} ORDER BY created_at DESC LIMIT 30",
+                id_params,
+            ).fetchall()
+            intents: list[dict[str, Any]] = []
+            for r in intent_rows:
+                try:
+                    pl = json.loads(r["payload_json"] or "{}")
+                except Exception:
+                    pl = {}
+                intents.append(
+                    {
+                        "intent_id": r["intent_id"],
+                        "identity": r["identity"],
+                        "umo": r["umo"],
+                        "recipient_user_id": r["recipient_user_id"],
+                        "recipient_name": str(pl.get("recipient_name") or ""),
+                        "topic": r["topic"],
+                        "log_id": r["log_id"],
+                        "horizon_kind": str(pl.get("horizon_kind") or "co_discussed_topic_share"),
+                        "status": r["status"],
+                        "reason": str(pl.get("reason") or "")[:200],
+                        "not_before": float(r["not_before"]),
+                        "expires_at": float(r["expires_at"]),
+                        "created_at": float(r["created_at"]),
+                    }
+                )
+            co_rows = self.db.execute(
+                f"SELECT * FROM co_discussed_topics{id_clause} ORDER BY last_occurred_at DESC LIMIT 30",
+                id_params,
+            ).fetchall()
+            co_topics = [
+                {
+                    "identity": r["identity"],
+                    "umo": r["umo"],
+                    "member_id": r["member_id"],
+                    "topic": r["topic"],
+                    "turn_count": int(r["turn_count"]),
+                    "bot_reply_count": int(r["bot_reply_count"]),
+                    "last_occurred_at": float(r["last_occurred_at"]),
+                    "opted_out": bool(r["opted_out"]),
+                }
+                for r in co_rows
+            ]
+            out_where = "WHERE opted_out=1" + (" AND identity=?" if norm else "")
+            out_rows = self.db.execute(
+                f"SELECT identity, umo, member_id, updated_at FROM member_outreach_prefs {out_where} ORDER BY updated_at DESC LIMIT 50",
+                id_params,
+            ).fetchall()
+            tp_where = "WHERE blocked=1" + (" AND identity=?" if norm else "")
+            tp_rows = self.db.execute(
+                f"SELECT identity, umo, member_id, topic, updated_at FROM member_topic_prefs {tp_where} ORDER BY updated_at DESC LIMIT 50",
+                id_params,
+            ).fetchall()
+            opted_out: list[dict[str, Any]] = [
+                {
+                    "kind": "all",
+                    "identity": r["identity"],
+                    "umo": r["umo"],
+                    "member_id": r["member_id"],
+                    "topic": "",
+                    "updated_at": float(r["updated_at"]),
+                }
+                for r in out_rows
+            ]
+            opted_out.extend(
+                {
+                    "kind": "topic",
+                    "identity": r["identity"],
+                    "umo": r["umo"],
+                    "member_id": r["member_id"],
+                    "topic": r["topic"],
+                    "updated_at": float(r["updated_at"]),
+                }
+                for r in tp_rows
+            )
+        return {
+            "horizon_intents": intents,
+            "co_discussed_topics": co_topics,
+            "opted_out_members": opted_out,
+        }
+
+    def restore_member_outreach(
+        self,
+        identity: str,
+        umo: str,
+        member_id: str,
+        *,
+        topic: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        norm = normalize_identity(identity)
+        clean_umo = str(umo or "").strip()
+        clean_member = str(member_id or "").strip()
+        clean_topic = str(topic or "").strip()
+        stamp = float(now if now is not None else time.time())
+        with self.lock, self.db:
+            if clean_topic:
+                self.db.execute(
+                    "UPDATE member_topic_prefs SET blocked=0, updated_at=? WHERE identity=? AND umo=? AND member_id=? AND topic=?",
+                    (stamp, norm, clean_umo, clean_member, clean_topic),
+                )
+            else:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO member_outreach_prefs VALUES (?, ?, ?, 0, ?)",
+                    (norm, clean_umo, clean_member, stamp),
+                )
+                self.db.execute(
+                    "UPDATE co_discussed_topics SET opted_out=0 WHERE identity=? AND umo=? AND member_id=?",
+                    (norm, clean_umo, clean_member),
+                )
+        return {"restored": True, "umo": clean_umo, "member_id": clean_member, "topic": clean_topic}
+
+    def list_pending_corrections(self, identity: str = "") -> list[dict[str, Any]]:
+        norm = normalize_identity(identity) if identity else ""
+        where = "WHERE c.status='pending'" + (" AND c.identity=?" if norm else "")
+        params = (norm,) if norm else ()
+        with self.lock:
+            rows = self.db.execute(
+                f"""
+                SELECT c.*, l.citation_json, l.digest AS log_digest
+                FROM corrections c
+                LEFT JOIN reading_logs l ON l.log_id=c.log_id
+                {where}
+                ORDER BY c.created_at DESC LIMIT 50
+                """,
+                params,
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            title = ""
+            try:
+                cit = json.loads(r["citation_json"] or "{}")
+                title = str(cit.get("title") or "")
+            except Exception:
+                title = ""
+            out.append(
+                {
+                    "correction_id": r["correction_id"],
+                    "identity": r["identity"],
+                    "umo": r["umo"],
+                    "member_id": r["member_id"],
+                    "log_id": r["log_id"],
+                    "log_title": strip_raw_urls(title)[:120],
+                    "log_digest": strip_raw_urls(str(r["log_digest"] or ""))[:140],
+                    "statement": r["statement"],
+                    "status": r["status"],
+                    "created_at": float(r["created_at"]),
+                }
+            )
+        return out
 
     # ------------------------------------------------------------------
     # Projection Snapshot & Overview Aggregates

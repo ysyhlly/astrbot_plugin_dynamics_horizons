@@ -112,6 +112,8 @@
 
           <section id="health-panel" class="panel-card health-card-compact" aria-label="运行状态与恢复" data-series-aria-label="运行状态与恢复"></section>
 
+          <section id="presets-decay-panel" class="panel-card" aria-label="运营预设与衰减曲线预览" data-series-aria-label="运营预设与衰减曲线预览"></section>
+
           <div class="overview-columns">
             <section class="panel-card" aria-labelledby="heading-interests">
               <div class="panel-card-head">
@@ -135,6 +137,8 @@
               <div id="questions-list" class="stack-list"></div>
             </section>
           </div>
+
+          <section id="outreach-diagnostics-panel" class="panel-card" aria-label="主动分享与退订诊断" data-series-aria-label="主动分享与退订诊断"></section>
 
           <section id="archive-panel" class="panel-card archive-card-compact" aria-label="候选与归档" data-series-aria-label="候选与归档"></section>
         </section>
@@ -187,12 +191,18 @@
                 </div>
               </details>
             </div>
-            <div id="logs-filter-group" class="segmented-group" role="group" aria-label="阅读手账来源筛选" data-series-aria-label="阅读手账来源筛选">
-              <button type="button" data-log-kind="" aria-pressed="true" data-series-text="全部">全部</button>
-              <button type="button" data-log-kind="bilibili" aria-pressed="false" data-series-text="B站">B站</button>
-              <button type="button" data-log-kind="ebook" aria-pressed="false" data-series-text="电子书">电子书</button>
-              <button type="button" data-log-kind="feed" aria-pressed="false" data-series-text="订阅">订阅</button>
-              <button type="button" data-log-kind="manual" aria-pressed="false" data-series-text="投喂">投喂</button>
+            <div class="view-actions logs-toolbar">
+              <div class="search-inline">
+                <input id="logs-search-input" type="search" maxlength="120" aria-label="搜索阅读手账关键词" placeholder="搜索标题、作者、摘要或交流后记…" data-series-aria-label="搜索阅读手账关键词" data-series-placeholder="搜索标题、作者、摘要或交流后记…">
+                <button id="btn-logs-search" type="button" class="wb-button" data-series-text="搜索">搜索</button>
+              </div>
+              <div id="logs-filter-group" class="segmented-group" role="group" aria-label="阅读手账来源筛选" data-series-aria-label="阅读手账来源筛选">
+                <button type="button" data-log-kind="" aria-pressed="true" data-series-text="全部">全部</button>
+                <button type="button" data-log-kind="bilibili" aria-pressed="false" data-series-text="B站">B站</button>
+                <button type="button" data-log-kind="ebook" aria-pressed="false" data-series-text="电子书">电子书</button>
+                <button type="button" data-log-kind="feed" aria-pressed="false" data-series-text="订阅">订阅</button>
+                <button type="button" data-log-kind="manual" aria-pressed="false" data-series-text="投喂">投喂</button>
+              </div>
             </div>
           </div>
 
@@ -228,8 +238,34 @@
 
           <section class="panel-card" aria-labelledby="heading-review-queue">
             <div class="panel-card-head">
-              <h3 id="heading-review-queue" data-series-text="提案审查队列">提案审查队列</h3>
-              <span id="reviews-count-pill" class="pill">0</span>
+              <div class="panel-head-title">
+                <h3 id="heading-review-queue" data-series-text="提案审查队列">提案审查队列</h3>
+                <span id="reviews-count-pill" class="pill">0</span>
+              </div>
+              <div class="reviews-search-tools">
+                <select id="reviews-source-kind" aria-label="按来源筛选提案" data-series-aria-label="按来源筛选提案">
+                  <option value="" data-series-text="全部来源">全部来源</option>
+                  <option value="bilibili" data-series-text="B站只读源">B站只读源</option>
+                  <option value="ebook" data-series-text="电子书源">电子书源</option>
+                  <option value="feed" data-series-text="标准订阅">标准订阅</option>
+                  <option value="manual" data-series-text="手动投喂/安利">手动投喂/安利</option>
+                </select>
+                <div class="search-inline">
+                  <input id="reviews-search-input" type="search" maxlength="120" aria-label="搜索审查提案" placeholder="搜索标题、摘要、随感或话题…" data-series-aria-label="搜索审查提案" data-series-placeholder="搜索标题、摘要、随感或话题…">
+                  <button id="btn-reviews-search" type="button" class="wb-button" data-series-text="筛选">筛选</button>
+                </div>
+              </div>
+            </div>
+            <div id="reviews-batch-bar" class="batch-bar">
+              <label class="checkbox-field batch-select-all">
+                <input id="reviews-select-all" type="checkbox">
+                <span data-series-text="全选本页可操作提案">全选本页可操作提案</span>
+              </label>
+              <span id="reviews-selected-count" class="page-info">已选 0 项</span>
+              <div class="item-actions">
+                <button id="btn-batch-approve" type="button" class="wb-button primary" disabled data-series-text="批量批准">批量批准</button>
+                <button id="btn-batch-reject" type="button" class="wb-button danger" disabled data-series-text="批量拒绝">批量拒绝</button>
+              </div>
             </div>
             <div id="reviews-list" class="stack-list"></div>
             <div id="reviews-pagination" class="pagination-bar">
@@ -237,6 +273,17 @@
               <button id="reviews-prev" type="button" class="wb-button" data-series-text="上一页">上一页</button>
               <button id="reviews-next" type="button" class="wb-button" data-series-text="下一页">下一页</button>
             </div>
+          </section>
+
+          <section id="corrections-card" class="panel-card" aria-labelledby="heading-corrections">
+            <div class="panel-card-head">
+              <div class="panel-head-title">
+                <h3 id="heading-corrections" data-series-text="群友纠错队列">群友纠错队列</h3>
+                <span class="panel-head-sub" data-series-text="核实后可一键撤销原手记或驳回">核实后可一键撤销原手记或驳回</span>
+              </div>
+              <span id="corrections-count-pill" class="pill warn">0</span>
+            </div>
+            <div id="corrections-list" class="stack-list"></div>
           </section>
 
           <section id="blocklist-card" class="panel-card" aria-labelledby="heading-blocklist">
@@ -387,8 +434,10 @@
       </div>
 
       <p id="source-drawer-error" data-ui-state="error" role="alert"></p>
+      <div id="source-test-result" class="test-result-box" hidden></div>
 
       <footer class="dialog-footer">
+        <button id="btn-test-source" type="button" class="wb-button" data-series-text="连接测试（试抓 1 条）">连接测试（试抓 1 条）</button>
         <button id="btn-cancel-source" type="button" class="wb-button" data-series-text="取消">取消</button>
         <button id="btn-submit-source" type="submit" class="wb-button primary" data-series-text="保存">保存</button>
       </footer>
