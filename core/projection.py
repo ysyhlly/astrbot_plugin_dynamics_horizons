@@ -280,6 +280,8 @@ class ProjectionCache:
         self._persona_aliases: dict[str, str] = {}
         # Zero-I/O cache of Learning member taboos: {(umo, member_id): frozenset[str]}
         self._member_taboos: dict[tuple[str, str], frozenset[str]] = {}
+        # Precomputed per-snapshot feature token sets (never mutates snapshot dicts)
+        self._feature_index: dict[str, dict[str, Any]] = {}
         self.generation: int = 0
 
     def update_member_taboos(
@@ -314,6 +316,96 @@ class ProjectionCache:
         low = str(text_blob or "").casefold()
         return any(t and t in low for t in taboos)
 
+    @staticmethod
+    def _build_text_features(
+        primary_label: str, body_text: str
+    ) -> tuple[str, frozenset[str], frozenset[str], frozenset[str]]:
+        p_low = str(primary_label or "").strip().casefold()
+        full_target = f"{primary_label} {body_text}"
+        t_strong, t_bi = _extract_features(full_target)
+        t_aliases = _extract_alias_clusters(full_target)
+        return (
+            p_low,
+            frozenset(t_strong),
+            frozenset(t_bi),
+            frozenset(t_aliases),
+        )
+
+    @classmethod
+    def _build_feature_index(cls, by_id: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Precompute CJK n-gram & alias token sets once per snapshot build."""
+        index: dict[str, dict[str, Any]] = {}
+        for ident, bucket in (by_id or {}).items():
+            if not isinstance(bucket, dict):
+                continue
+            interests_idx: dict[str, tuple[str, frozenset[str], frozenset[str], frozenset[str]]] = {}
+            for item in bucket.get("interests") or ():
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("interest_id") or item.get("topic") or "")
+                if key:
+                    interests_idx[key] = cls._build_text_features(
+                        str(item.get("topic") or ""),
+                        str(item.get("summary") or ""),
+                    )
+
+            logs_idx: dict[
+                str,
+                tuple[
+                    tuple[str, frozenset[str], frozenset[str], frozenset[str]],
+                    tuple[str, frozenset[str], frozenset[str], frozenset[str]] | None,
+                ],
+            ] = {}
+            for row in bucket.get("logs") or ():
+                if not isinstance(row, dict):
+                    continue
+                log_id = str(row.get("log_id") or "")
+                if not log_id:
+                    continue
+                cit = row.get("citation") or {}
+                title = str(cit.get("title") or "")
+                creator = str(cit.get("creator") or "")
+                base_feat = cls._build_text_features(
+                    title,
+                    f"{row.get('digest', '')} {row.get('reflection', '')}",
+                )
+                creator_feat = (
+                    cls._build_text_features(creator, title)
+                    if len(creator) >= 2
+                    else None
+                )
+                logs_idx[log_id] = (base_feat, creator_feat)
+
+            questions_idx: dict[str, tuple[str, frozenset[str], frozenset[str], frozenset[str]]] = {}
+            for q in bucket.get("questions") or ():
+                if not isinstance(q, dict):
+                    continue
+                qid = str(q.get("question_id") or "")
+                if qid:
+                    questions_idx[qid] = cls._build_text_features(
+                        str(q.get("topic") or ""),
+                        str(q.get("question") or ""),
+                    )
+
+            books_idx: dict[str, tuple[str, frozenset[str], frozenset[str], frozenset[str]]] = {}
+            for b in bucket.get("books") or ():
+                if not isinstance(b, dict):
+                    continue
+                bid = str(b.get("book_id") or b.get("title") or "")
+                if bid:
+                    books_idx[bid] = cls._build_text_features(
+                        str(b.get("title") or ""),
+                        f"{b.get('creator', '')} {b.get('last_reflection', '')}",
+                    )
+
+            index[ident] = {
+                "interests": interests_idx,
+                "logs": logs_idx,
+                "questions": questions_idx,
+                "books": books_idx,
+            }
+        return index
+
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
         by_id = snapshot.get("by_identity", {})
         aliases = dict(self._persona_aliases)
@@ -321,6 +413,7 @@ class ProjectionCache:
             persona_id, _ = unpack_identity(ident)
             aliases.setdefault(persona_id, ident)
             aliases[ident] = ident
+        self._feature_index = self._build_feature_index(by_id)
         self._persona_aliases = aliases
         self._snapshot = snapshot
         self.generation += 1
@@ -566,9 +659,13 @@ class ProjectionCache:
         if not all_strong and not all_bi and not all_aliases:
             return _empty_result("no_match")
 
-        def score_text(primary_label: str, body_text: str) -> float:
+        def score_precomputed(
+            p_low: str,
+            t_strong: set[str] | frozenset[str],
+            t_bi: set[str] | frozenset[str],
+            t_aliases: set[str] | frozenset[str],
+        ) -> float:
             score = 0.0
-            p_low = primary_label.strip().casefold()
             if (
                 len(p_low) >= 2
                 and p_low not in _CJK_STOPWORDS
@@ -578,8 +675,6 @@ class ProjectionCache:
                     score += 5.0
                 elif p_low in near_lower:
                     score += 3.0
-            full_target = f"{primary_label} {body_text}"
-            t_strong, t_bi = _extract_features(full_target)
             q_strong_hits = q_strong & t_strong
             near_strong_hits = near_strong & t_strong
             q_bi_hits = q_bi & t_bi
@@ -605,8 +700,7 @@ class ProjectionCache:
                 score += 1.4
 
             # Semantic / domain alias cluster boost (bridges e.g. 榫卯 <-> 古建筑, 手冲 <-> 咖啡)
-            if all_aliases:
-                t_aliases = _extract_alias_clusters(full_target)
+            if all_aliases and t_aliases:
                 q_alias_hits = q_aliases & t_aliases
                 near_alias_hits = near_aliases & t_aliases
                 if q_alias_hits:
@@ -615,10 +709,29 @@ class ProjectionCache:
                     score += 1.5
             return score
 
+        def score_text(primary_label: str, body_text: str) -> float:
+            p_low, t_strong, t_bi, t_aliases = self._build_text_features(
+                primary_label, body_text
+            )
+            return score_precomputed(p_low, t_strong, t_bi, t_aliases)
+
+        feat_bucket = self._feature_index.get(ident) or {}
+        interests_feat = feat_bucket.get("interests") or {}
+        logs_feat = feat_bucket.get("logs") or {}
+        questions_feat = feat_bucket.get("questions") or {}
+        books_feat = feat_bucket.get("books") or {}
+
         match_threshold = 2.0
         scored_interests: list[tuple[float, dict[str, Any]]] = []
         for item in interests:
-            s = score_text(item["topic"], item["summary"]) * (
+            ikey = str(item.get("interest_id") or item.get("topic") or "")
+            cached = interests_feat.get(ikey)
+            raw_s = (
+                score_precomputed(*cached)
+                if cached is not None
+                else score_text(item["topic"], item["summary"])
+            )
+            s = raw_s * (
                 0.85 + 0.15 * min(2.0, float(item.get("heat_score", 1.0)))
             )
             if s >= match_threshold:
@@ -634,16 +747,41 @@ class ProjectionCache:
             scoped_discussion_text = " ".join(
                 f"{note.get('topic', '')} {note.get('member_quote', '')} {note.get('reflection', '')}"
                 for note in item.get("discussion_reflections", [])
-            )
-            s = max(
-                score_text(
-                    cit.get("title", ""),
-                    f"{item['digest']} {item['reflection']} {scoped_discussion_text}",
-                ),
-                score_text(cit.get("creator", ""), cit.get("title", ""))
-                if len(cit.get("creator", "")) >= 2
-                else 0.0,
-            )
+            ).strip()
+            cached_pair = logs_feat.get(str(item.get("log_id") or ""))
+            if cached_pair is not None:
+                base_feat, creator_feat = cached_pair
+                if scoped_discussion_text:
+                    d_strong, d_bi = _extract_features(scoped_discussion_text)
+                    d_aliases = (
+                        _extract_alias_clusters(scoped_discussion_text)
+                        if all_aliases
+                        else set()
+                    )
+                    base_score = score_precomputed(
+                        base_feat[0],
+                        base_feat[1] | d_strong,
+                        base_feat[2] | d_bi,
+                        base_feat[3] | d_aliases,
+                    )
+                else:
+                    base_score = score_precomputed(*base_feat)
+                creator_score = (
+                    score_precomputed(*creator_feat)
+                    if creator_feat is not None
+                    else 0.0
+                )
+                s = max(base_score, creator_score)
+            else:
+                s = max(
+                    score_text(
+                        cit.get("title", ""),
+                        f"{item['digest']} {item['reflection']} {scoped_discussion_text}",
+                    ),
+                    score_text(cit.get("creator", ""), cit.get("title", ""))
+                    if len(cit.get("creator", "")) >= 2
+                    else 0.0,
+                )
             if title_or_creator and s >= match_threshold:
                 scored_logs.append((s, item))
         scored_logs.sort(key=lambda x: -x[0])
@@ -652,7 +790,12 @@ class ProjectionCache:
         matched_topic_names = {i["topic"].casefold() for _, i in scored_interests}
         matched_log_ids = {log_item["log_id"] for _, log_item in scored_logs}
         for q in eligible_questions:
-            s = score_text(q["topic"], q["question"])
+            cached = questions_feat.get(str(q.get("question_id") or ""))
+            s = (
+                score_precomputed(*cached)
+                if cached is not None
+                else score_text(q["topic"], q["question"])
+            )
             if q["topic"].casefold() in matched_topic_names:
                 s = max(s, 3.0)
             if q.get("log_id") in matched_log_ids:
@@ -663,7 +806,13 @@ class ProjectionCache:
 
         scored_books: list[tuple[float, dict[str, Any]]] = []
         for b in books:
-            s = score_text(b["title"], f"{b['creator']} {b['last_reflection']}")
+            bkey = str(b.get("book_id") or b.get("title") or "")
+            cached = books_feat.get(bkey)
+            s = (
+                score_precomputed(*cached)
+                if cached is not None
+                else score_text(b["title"], f"{b['creator']} {b['last_reflection']}")
+            )
             if s >= match_threshold:
                 scored_books.append((s, b))
         scored_books.sort(key=lambda x: -x[0])

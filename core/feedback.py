@@ -392,19 +392,55 @@ def _reschedule_remaining_jobs(engine, remaining_rows, busy_exc: BaseException) 
             )
 
 
+def _load_due_feedback_jobs(store, now: float) -> list[dict]:
+    with store.lock:
+        return [
+            dict(r)
+            for r in store.db.execute(
+                "SELECT * FROM feedback_jobs WHERE status='pending' AND next_at<=? ORDER BY created_at LIMIT 8",
+                (now,),
+            )
+        ]
+
+
+def _load_feedback_context(store, row: dict, data: dict, now: float):
+    with store.lock:
+        questions = [
+            dict(r)
+            for r in store.db.execute(
+                "SELECT question_id,topic,question FROM discussion_questions WHERE identity=? AND status='active' AND expires_at>?",
+                (row["identity"], now),
+            )
+            if r["question_id"] in data["question_ids"]
+        ]
+        contexts = opening_contexts(store, row, data)
+    return questions, contexts
+
+
+def _finalize_feedback_job(store, row: dict, data: dict, contexts, result: dict, recorded: dict, topics: list, qids: list) -> None:
+    with store.lock, store.db:
+        data["verified_anchors"] = verified_openings(store, row, data, contexts, result)
+        if recorded.get("topics_recorded") or recorded.get("discussed_questions") or data["verified_anchors"]:
+            outcome = "verified"
+        elif topics or qids:
+            outcome = "not_recorded"
+        elif any(result.get(key) for key in ("topics", "questions", "openings")):
+            outcome = "insufficient_evidence"
+        else:
+            outcome = "unrelated"
+        data["feedback_outcome"] = outcome
+        store.db.execute(
+            "UPDATE feedback_jobs SET status='done',payload_json=? WHERE event_id=?",
+            (encode_json(data), row["event_id"]),
+        )
+
+
 async def process_jobs(engine):
     review_pid = _review_provider_id(engine)
     if provider_circuit_remaining(getattr(engine, "context", None), review_pid) > 0.0:
         return
     store = engine.store
-    with store.lock:
-        rows = [
-            dict(r)
-            for r in store.db.execute(
-                "SELECT * FROM feedback_jobs WHERE status='pending' AND next_at<=? ORDER BY created_at LIMIT 8",
-                (engine.clock(),),
-            )
-        ]
+    rows = await run_io(_load_due_feedback_jobs, store, engine.clock())
     for idx, row in enumerate(rows):
         data = json.loads(row["payload_json"])
         if data.get("kind") == "discussion_reply":
@@ -412,28 +448,25 @@ async def process_jobs(engine):
                 await process_received(engine, row, data)
             except DiscussionModelError as exc:
                 cause = exc.__cause__ or exc
-                _retry_job(engine, row, cause, "model")
+                await run_io(_retry_job, engine, row, cause, "model")
                 busy_exc = _extract_busy_error(cause)
                 if busy_exc is not None:
-                    _reschedule_remaining_jobs(engine, rows[idx + 1 :], busy_exc)
+                    await run_io(
+                        _reschedule_remaining_jobs, engine, rows[idx + 1 :], busy_exc
+                    )
                     break
             except Exception as exc:
-                _retry_job(engine, row, exc)
+                await run_io(_retry_job, engine, row, exc)
                 busy_exc = _extract_busy_error(exc)
                 if busy_exc is not None:
-                    _reschedule_remaining_jobs(engine, rows[idx + 1 :], busy_exc)
+                    await run_io(
+                        _reschedule_remaining_jobs, engine, rows[idx + 1 :], busy_exc
+                    )
                     break
             continue
-        with store.lock:
-            questions = [
-                dict(r)
-                for r in store.db.execute(
-                    "SELECT question_id,topic,question FROM discussion_questions WHERE identity=? AND status='active' AND expires_at>?",
-                    (row["identity"], engine.clock()),
-                )
-                if r["question_id"] in data["question_ids"]
-            ]
-            contexts = opening_contexts(store, row, data)
+        questions, contexts = await run_io(
+            _load_feedback_context, store, row, data, engine.clock()
+        )
         try:
             phase = "model"
             result = await engine.call_model(
@@ -497,26 +530,24 @@ async def process_jobs(engine):
                 half_life_days=engine.half_life_days,
                 now=row["created_at"],
             )
-            with store.lock, store.db:
-                data["verified_anchors"] = verified_openings(store, row, data, contexts, result)
-                if recorded.get("topics_recorded") or recorded.get("discussed_questions") or data["verified_anchors"]:
-                    outcome = "verified"
-                elif topics or qids:
-                    outcome = "not_recorded"
-                elif any(result.get(key) for key in ("topics", "questions", "openings")):
-                    outcome = "insufficient_evidence"
-                else:
-                    outcome = "unrelated"
-                data["feedback_outcome"] = outcome
-                store.db.execute(
-                    "UPDATE feedback_jobs SET status='done',payload_json=? WHERE event_id=?",
-                    (encode_json(data), row["event_id"]),
-                )
+            await run_io(
+                _finalize_feedback_job,
+                store,
+                row,
+                data,
+                contexts,
+                result,
+                recorded,
+                topics,
+                qids,
+            )
         except Exception as exc:
-            _retry_job(engine, row, exc, phase)
+            await run_io(_retry_job, engine, row, exc, phase)
             busy_exc = _extract_busy_error(exc)
             if busy_exc is not None:
-                _reschedule_remaining_jobs(engine, rows[idx + 1 :], busy_exc)
+                await run_io(
+                    _reschedule_remaining_jobs, engine, rows[idx + 1 :], busy_exc
+                )
                 break
 
 

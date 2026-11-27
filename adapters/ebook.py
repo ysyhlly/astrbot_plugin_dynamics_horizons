@@ -37,6 +37,19 @@ from .ssrf import (
     validate_url_sync,
 )
 
+try:
+    from ..series_panels import get_series_resource_limits
+except Exception:  # pragma: no cover - isolated import fallback
+
+    def get_series_resource_limits(
+        _ctx=None, *, profile: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "profile": profile or "standard",
+            "horizons_ebook_cache_max": 6,
+            "horizons_ebook_max_mb": 20,
+        }
+
 EBOOK_PROVIDERS = ("wikisource", "gutendex", "opds", "local")
 
 MAX_RAW_EBOOK_BYTES = 25 * 1024 * 1024
@@ -49,12 +62,52 @@ _XML_ENTITY_RE = re.compile(r"<!ENTITY\b", re.IGNORECASE)
 _WIKI_LANG_RE = re.compile(r"^[a-z]{2,8}(?:-[a-z0-9]{2,8})?$")
 
 _REMOTE_EBOOK_CACHE_DIR: Path | None = None
+_EBOOK_CONTEXT: Any = None
 _REMOTE_EBOOK_CACHE_TTL_SEC = 6 * 3600.0
 _REMOTE_EBOOK_CACHE_MAX_ITEMS = 16
 
 
+def configure_ebook_runtime(
+    *,
+    data_dir: str | Path | None = None,
+    context: Any = None,
+) -> Path | None:
+    """Configure disk-backed ebook cache directory (out of /tmp tmpfs) and series context."""
+    global _REMOTE_EBOOK_CACHE_DIR, _EBOOK_CONTEXT
+    if context is not None:
+        _EBOOK_CONTEXT = context
+    if data_dir is not None:
+        clean = str(data_dir).strip()
+        if clean:
+            cache_dir = Path(clean) / "cache" / "ebooks"
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            _REMOTE_EBOOK_CACHE_DIR = cache_dir
+        else:
+            _REMOTE_EBOOK_CACHE_DIR = None
+    return _REMOTE_EBOOK_CACHE_DIR
+
+
+def _effective_ebook_limits(context: Any = None) -> tuple[int, int]:
+    """Return `(max_cache_items, max_ebook_bytes)` from the active resource profile."""
+    ctx = context if context is not None else _EBOOK_CONTEXT
+    limits = get_series_resource_limits(ctx)
+    max_items = max(
+        1,
+        min(
+            _REMOTE_EBOOK_CACHE_MAX_ITEMS,
+            int(limits.get("horizons_ebook_cache_max", 6)),
+        ),
+    )
+    max_mb = max(1, int(limits.get("horizons_ebook_max_mb", 20)))
+    max_bytes = min(MAX_RAW_EBOOK_BYTES, max_mb * 1024 * 1024)
+    return max_items, max_bytes
+
+
 def _get_remote_ebook_cache_dir() -> Path:
-    """Return a private per-process temp cache directory, auto-cleaned on exit."""
+    """Return configured disk cache dir, or a private per-process temp cache directory."""
     global _REMOTE_EBOOK_CACHE_DIR
     if _REMOTE_EBOOK_CACHE_DIR is not None:
         return _REMOTE_EBOOK_CACHE_DIR
@@ -72,6 +125,7 @@ def _read_remote_ebook_cache(key: str) -> tuple[bytes, str] | None:
     cache_dir = _REMOTE_EBOOK_CACHE_DIR
     if cache_dir is None:
         return None
+    _, max_bytes = _effective_ebook_limits()
     meta_path = cache_dir / f"{key}.json"
     body_path = cache_dir / f"{key}.bin"
     try:
@@ -83,8 +137,10 @@ def _read_remote_ebook_cache(key: str) -> tuple[bytes, str] | None:
             meta_path.unlink(missing_ok=True)
             body_path.unlink(missing_ok=True)
             return None
+        if body_path.stat().st_size > max_bytes:
+            return None
         raw = body_path.read_bytes()
-        if not raw or len(raw) > MAX_RAW_EBOOK_BYTES:
+        if not raw or len(raw) > max_bytes:
             return None
         os.utime(body_path, None)
         return raw, str(meta.get("content_type") or "")
@@ -93,7 +149,8 @@ def _read_remote_ebook_cache(key: str) -> tuple[bytes, str] | None:
 
 
 def _write_remote_ebook_cache(key: str, raw: bytes, content_type: str) -> None:
-    if not raw or len(raw) > MAX_RAW_EBOOK_BYTES:
+    max_items, max_bytes = _effective_ebook_limits()
+    if not raw or len(raw) > max_bytes:
         return
     try:
         cache_dir = _get_remote_ebook_cache_dir()
@@ -122,7 +179,7 @@ def _write_remote_ebook_cache(key: str, raw: bytes, content_type: str) -> None:
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
-        for stale in bins[_REMOTE_EBOOK_CACHE_MAX_ITEMS:]:
+        for stale in bins[max_items:]:
             stale.unlink(missing_ok=True)
             stale.with_suffix(".json").unlink(missing_ok=True)
     except Exception:
@@ -642,9 +699,10 @@ def parse_local_ebook(
     if not isinstance(raw_bytes, (bytes, bytearray)) or not raw_bytes:
         raise ValueError("电子书文件内容不能为空")
     data = bytes(raw_bytes)
-    if len(data) > MAX_RAW_EBOOK_BYTES:
+    _, eff_max_bytes = _effective_ebook_limits()
+    if len(data) > eff_max_bytes:
         raise ValueError(
-            f"电子书文件体积超过安全上限 ({MAX_RAW_EBOOK_BYTES // (1024 * 1024)}MB)"
+            f"电子书文件体积超过安全上限 ({eff_max_bytes // (1024 * 1024)}MB)"
         )
 
     try:
@@ -1396,10 +1454,11 @@ async def _load_gutendex_book(
     if cached is not None:
         raw, ctype = cached
     else:
+        _, eff_max_bytes = _effective_ebook_limits()
         file_resp = await safe_http_get(
             dl_url,
             timeout=timeout,
-            max_bytes=12 * 1024 * 1024,
+            max_bytes=min(12 * 1024 * 1024, eff_max_bytes),
             allow_private=False,
         )
         ctype = file_resp.header("content-type", "").lower()
@@ -1942,11 +2001,12 @@ async def fetch_ebook_content(
             raw_body, cached_ctype = cached
             acq_type = (cached_ctype or str(meta.get("acquisition_type") or "")).lower()
         else:
+            _, eff_max_bytes = _effective_ebook_limits()
             resp = await safe_http_get(
                 acq_url,
                 headers=headers,
                 timeout=timeout,
-                max_bytes=MAX_RAW_EBOOK_BYTES,
+                max_bytes=eff_max_bytes,
                 allow_private=allow_private,
                 secrets_to_redact=secrets,
             )

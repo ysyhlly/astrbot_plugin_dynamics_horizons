@@ -7,9 +7,16 @@ import inspect
 import math
 
 from .. import series_panels as _series_panels
-from ..series_panels import is_provider_budget_busy_error, is_series_group_excluded
+from ..series_panels import (
+    get_series_resource_limits,
+    is_provider_budget_busy_error,
+    is_series_group_excluded,
+)
 from .contract import chat_umo_kind, make_identity
 from .io import run_io
+
+_HEAVY_MAINTENANCE_INTERVAL_SECONDS = 3600.0
+_DECAY_SETTLE_INTERVAL_SECONDS = 300.0
 
 try:
     from ..adapters.video_media import cleanup_stale_temp_dirs
@@ -191,28 +198,41 @@ class EngineLifecycle:
             if not src or not src["enabled"] or src["identity"] != identity:
                 raise ValueError("reading_source_changed")
 
-    async def process_maintenance(self):
+    async def process_maintenance(self, *, force_heavy: bool = False):
         now = self.clock()
         prune_cp = getattr(self, "prune_media_checkpoints", None)
         if callable(prune_cp):
             prune_cp(now=now)
-        if callable(cleanup_stale_temp_dirs):
-            active_dirs_fn = getattr(self, "active_media_checkpoint_dirs", None)
-            protected = active_dirs_fn() if callable(active_dirs_fn) else ()
-            await run_io(cleanup_stale_temp_dirs, protected_dirs=protected)
-        await run_io(
-            self.store.archive_candidates,
-            now,
-            max(1, int(self.config.get("archive_after_days", 90))),
-            max(1, int(self.config.get("active_candidate_limit", 5000))),
+        last_heavy = getattr(self, "_last_heavy_maintenance_at", None)
+        need_heavy = (
+            force_heavy
+            or last_heavy is None
+            or (now - float(last_heavy)) >= _HEAVY_MAINTENANCE_INTERVAL_SECONDS
         )
-        await run_io(
-            self.store.prune_terminal_records,
-            now,
-            retention_days=max(
-                7.0, float(self.config.get("terminal_retention_days", 30) or 30)
-            ),
-        )
+        if need_heavy:
+            if callable(cleanup_stale_temp_dirs):
+                active_dirs_fn = getattr(self, "active_media_checkpoint_dirs", None)
+                protected = active_dirs_fn() if callable(active_dirs_fn) else ()
+                await run_io(cleanup_stale_temp_dirs, protected_dirs=protected)
+            archive_days = max(1, int(self.config.get("archive_after_days", 90)))
+            await run_io(
+                self.store.archive_candidates,
+                now,
+                archive_days,
+                max(1, int(self.config.get("active_candidate_limit", 5000))),
+            )
+            await run_io(
+                self.store.prune_terminal_records,
+                now,
+                retention_days=max(
+                    7.0, float(self.config.get("terminal_retention_days", 30) or 30)
+                ),
+                archive_after_days=float(archive_days),
+            )
+            ckpt_fn = getattr(self.store, "checkpoint_and_vacuum", None)
+            if callable(ckpt_fn):
+                await run_io(ckpt_fn)
+            self._last_heavy_maintenance_at = now
         if not self.config.get("enabled", True) or self.closed:
             return
         sub_fn = getattr(self, "subscribe_series_event_bus", None)
@@ -275,18 +295,40 @@ class EngineLifecycle:
                 self.clock(),
             )
 
+    async def _maybe_refresh_projection_after_maintenance(self) -> bool:
+        """Skip no-op settle_decay writes & 22-query projection rebuilds when nothing mutated."""
+        now = self.clock()
+        cur_seq = getattr(self.store, "mutation_seq", None)
+        last_seq = getattr(self, "_last_projection_mutation_seq", -1)
+        if cur_seq is None or cur_seq != last_seq:
+            await self.refresh_projection()
+            return True
+        last_decay = float(getattr(self, "_last_decay_settled_at", 0.0) or 0.0)
+        if (now - last_decay) >= _DECAY_SETTLE_INTERVAL_SECONDS:
+            await run_io(self.store.settle_decay, now, self.half_life_days)
+            self._last_decay_settled_at = now
+            after_seq = getattr(self.store, "mutation_seq", None)
+            if after_seq is None or after_seq != cur_seq:
+                await self.refresh_projection()
+                return True
+        return False
+
     async def maintenance_loop(self):
         maint_lock = getattr(self, "_maintenance_lock", None) or self.lock
         while not self.closed:
             try:
                 async with maint_lock:
                     await self.process_maintenance()
-                    await self.refresh_projection()
+                    await self._maybe_refresh_projection_after_maintenance()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.last_error = type(exc).__name__
-            await asyncio.sleep(30)
+            limits = get_series_resource_limits(getattr(self, "context", None))
+            interval = max(
+                15.0, float(limits.get("horizons_maintenance_interval_s", 60.0))
+            )
+            await asyncio.sleep(interval)
 
     @property
     def proactive_scope(self) -> str:

@@ -973,11 +973,15 @@ class LifecycleStore:
         retention_days: float = 30.0,
         attempt_days: float = 30.0,
         evidence_days: float | None = None,
+        archive_after_days: float = 90.0,
+        terminal_delete_days: float = 60.0,
         batch_limit: int = 2000,
     ) -> dict[str, int]:
         """Bounded retention GC for completed/expired terminal rows to prevent unbounded SQLite growth."""
         cutoff = float(now) - max(1.0, float(retention_days)) * 86400.0
         held_cutoff = float(now) - max(60.0, float(retention_days)) * 86400.0
+        archive_cutoff = float(now) - max(1.0, float(archive_after_days)) * 86400.0
+        delete_cutoff = float(now) - max(60.0, float(terminal_delete_days)) * 86400.0
         # Never prune records within the recent 7 Shanghai days so daily quota counts stay exact.
         attempt_cutoff = float(now) - max(7.0, float(attempt_days)) * 86400.0
         ev_days = (
@@ -1128,6 +1132,79 @@ class LifecycleStore:
                 (cutoff, lim),
             )
             removed["proposal_evidence"] = int(cur.rowcount or 0)
+            # Physical deletion of aged archived candidate_items (> archive_after_days)
+            cur = self.db.execute(
+                """
+                DELETE FROM candidate_items
+                WHERE candidate_id IN (
+                    SELECT candidate_id FROM candidate_items c
+                    WHERE c.archived=1 AND c.pinned=0 AND c.created_at<?
+                      AND NOT EXISTS (SELECT 1 FROM proposals p WHERE p.candidate_id=c.candidate_id)
+                      AND NOT EXISTS (SELECT 1 FROM reading_tasks t WHERE t.candidate_id=c.candidate_id)
+                    LIMIT ?
+                )
+                """,
+                (archive_cutoff, lim),
+            )
+            removed["archived_candidates"] = int(cur.rowcount or 0)
+            # Physical deletion of aged terminal reading_tasks (> 60d, not linked to active reading_logs)
+            cur = self.db.execute(
+                """
+                DELETE FROM reading_tasks
+                WHERE task_id IN (
+                    SELECT t.task_id FROM reading_tasks t
+                    WHERE t.status IN ('approved', 'rejected', 'read_no_note', 'cancelled', 'failed')
+                      AND t.updated_at<?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM proposals p
+                          JOIN reading_logs l
+                            ON (l.proposal_id=p.proposal_id OR l.log_id=p.applied_log_id)
+                          WHERE l.status='active'
+                            AND (p.task_id=t.task_id OR (t.proposal_id!='' AND p.proposal_id=t.proposal_id))
+                      )
+                    LIMIT ?
+                )
+                """,
+                (delete_cutoff, lim),
+            )
+            removed["reading_tasks"] = int(cur.rowcount or 0)
+            # Physical deletion of aged terminal proposals (> 60d, not linked to active reading_logs)
+            cur = self.db.execute(
+                """
+                DELETE FROM proposals
+                WHERE proposal_id IN (
+                    SELECT p.proposal_id FROM proposals p
+                    WHERE p.state IN ('approved', 'rejected', 'revoked')
+                      AND p.updated_at<?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM reading_logs l
+                          WHERE l.status='active'
+                            AND (l.proposal_id=p.proposal_id OR l.log_id=p.applied_log_id)
+                      )
+                    LIMIT ?
+                )
+                """,
+                (delete_cutoff, lim),
+            )
+            removed["proposals"] = int(cur.rowcount or 0)
+            if removed["proposals"] > 0:
+                self.db.execute(
+                    "DELETE FROM review_jobs WHERE kind IN ('done', 'held', 'exhausted') "
+                    "AND NOT EXISTS (SELECT 1 FROM proposals p WHERE p.proposal_id=review_jobs.proposal_id)"
+                )
+            # Physical deletion of aged review_audit (> 60d)
+            cur = self.db.execute(
+                """
+                DELETE FROM review_audit
+                WHERE audit_id IN (
+                    SELECT audit_id FROM review_audit
+                    WHERE created_at<?
+                    LIMIT ?
+                )
+                """,
+                (delete_cutoff, lim),
+            )
+            removed["review_audit"] = int(cur.rowcount or 0)
         return removed
 
     def diagnostics(self, identity, now, *, tz=None):

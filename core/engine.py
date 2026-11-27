@@ -22,10 +22,12 @@ from astrbot.api import logger
 from ..series_panels import (
     find_provider_silently,
     get_series_defaults,
+    get_series_resource_limits,
     get_series_shared_config,
     inherit_umos,
     is_provider_budget_busy_error,
     resolve_series_provider,
+    resolve_series_resource_profile,
     resolve_series_timezone,
     series_llm_call,
 )
@@ -513,6 +515,9 @@ class HorizonsEngine(EngineLifecycle):
         self._umo_vibe_state: dict[str, dict[str, Any]] = {}
         self._umo_quiet_windows: dict[str, dict[str, Any]] = {}
         self._event_bus_tokens: list[tuple[Any, str]] = []
+        self._last_heavy_maintenance_at: float | None = None
+        self._last_projection_mutation_seq: int = -1
+        self._last_decay_settled_at: float = 0.0
 
     def set_last_model_usage(
         self, prompt_tokens: int = 0, completion_tokens: int = 0
@@ -619,8 +624,24 @@ class HorizonsEngine(EngineLifecycle):
         if isinstance(mb, dict):
             cleanup_media_bundle(mb)
 
+    def _media_checkpoint_max_entries(self) -> int:
+        limits = get_series_resource_limits(self.context)
+        return max(
+            1,
+            min(
+                _MEDIA_CHECKPOINT_MAX_ENTRIES,
+                int(limits.get("horizons_checkpoint_max", 4)),
+            ),
+        )
+
+    def _media_checkpoint_ttl_seconds(self) -> float:
+        if resolve_series_resource_profile(self.context) != "standard":
+            return 900.0
+        return _MEDIA_CHECKPOINT_TTL_SECONDS
+
     def prune_media_checkpoints(self, *, now: float | None = None) -> int:
         stamp = float(now if now is not None else self.clock())
+        max_entries = self._media_checkpoint_max_entries()
         removed = 0
         for key in list(self._media_checkpoints.keys()):
             entry = self._media_checkpoints.get(key)
@@ -628,7 +649,7 @@ class HorizonsEngine(EngineLifecycle):
                 popped = self._media_checkpoints.pop(key, None)
                 self._cleanup_checkpoint_entry(popped)
                 removed += 1
-        while len(self._media_checkpoints) > _MEDIA_CHECKPOINT_MAX_ENTRIES:
+        while len(self._media_checkpoints) > max_entries:
             _, oldest = self._media_checkpoints.popitem(last=False)
             self._cleanup_checkpoint_entry(oldest)
             removed += 1
@@ -694,7 +715,8 @@ class HorizonsEngine(EngineLifecycle):
             and existing.get("media_bundle") is not entry.get("media_bundle")
         ):
             self._cleanup_checkpoint_entry(existing)
-        while len(self._media_checkpoints) >= _MEDIA_CHECKPOINT_MAX_ENTRIES:
+        max_entries = self._media_checkpoint_max_entries()
+        while len(self._media_checkpoints) >= max_entries:
             _, oldest = self._media_checkpoints.popitem(last=False)
             self._cleanup_checkpoint_entry(oldest)
         self._media_checkpoints[key] = entry
@@ -1331,6 +1353,10 @@ class HorizonsEngine(EngineLifecycle):
             now=now, half_life_days=self.half_life_days
         )
         self.projection.update_snapshot(snap)
+        self._last_projection_mutation_seq = int(
+            getattr(self.store, "mutation_seq", 0) or 0
+        )
+        self._last_decay_settled_at = now
         return snap
 
     def track_ingest_task(self, task: asyncio.Task[Any]) -> None:
@@ -2808,7 +2834,7 @@ class HorizonsEngine(EngineLifecycle):
                         expires_at = (
                             float(checkpoint_hit["expires_at"])
                             if checkpoint_hit is not None
-                            else cp_now + _MEDIA_CHECKPOINT_TTL_SECONDS
+                            else cp_now + self._media_checkpoint_ttl_seconds()
                         )
                         if expires_at > cp_now:
                             self._save_media_checkpoint(

@@ -501,11 +501,23 @@ class Main(Star):
 
     async def initialize(self) -> None:
         _ensure_fresh_series_panels().register_series_panels(self, PLUGIN_ID)
-        await run_io(cleanup_stale_temp_dirs)
         data_dir = self._resolve_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            from .adapters.video_media import configure_media_runtime
+
+            configure_media_runtime(data_dir=data_dir, context=self.context)
+        except Exception:
+            pass
+        try:
+            from .adapters.ebook import configure_ebook_runtime
+
+            configure_ebook_runtime(data_dir=data_dir, context=self.context)
+        except Exception:
+            pass
+        await run_io(cleanup_stale_temp_dirs)
         db_path = data_dir / "horizons.sqlite3"
-        store = await run_io(HorizonsStore, db_path)
+        store = await run_io(HorizonsStore, db_path, context=self.context)
         self.engine = HorizonsEngine(
             store, self.config, self._model, context=self.context
         )

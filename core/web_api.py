@@ -22,6 +22,15 @@ from .io import run_io
 from .lifecycle import ReviewConflict
 
 try:
+    from ..series_panels import get_series_resource_limits
+except Exception:  # pragma: no cover - isolated import fallback
+
+    def get_series_resource_limits(
+        _ctx=None, *, profile: str | None = None
+    ) -> dict[str, Any]:
+        return {"profile": profile or "standard", "horizons_ebook_max_mb": 20}
+
+try:
     from ..adapters import (
         fetch_item_content,
         parse_local_ebook,
@@ -785,12 +794,22 @@ class HorizonsWebAPI:
                     raise ValueError("缺少电子书文件内容 (content_base64)")
                 if "," in b64 and b64.split(",", 1)[0].startswith("data:"):
                     b64 = b64.split(",", 1)[1]
+                limits = get_series_resource_limits(getattr(eng, "context", None))
+                eff_max_bytes = min(
+                    _MAX_EBOOK_BYTES,
+                    max(1, int(limits.get("horizons_ebook_max_mb", 20))) * 1024 * 1024,
+                )
+                eff_max_mb = max(1, eff_max_bytes // (1024 * 1024))
+                # Reject oversized base64 BEFORE decoding (base64 expands 3 bytes -> 4 chars)
+                max_b64_chars = ((eff_max_bytes + 2) // 3) * 4 + 64
+                if len(b64) > max_b64_chars:
+                    raise ValueError(f"电子书体积为空或超过 {eff_max_mb}MB 限制")
                 try:
-                    raw_bytes = base64.b64decode(b64, validate=False)
+                    raw_bytes = await run_io(base64.b64decode, b64, validate=False)
                 except Exception as exc:
                     raise ValueError("电子书 Base64 解码失败") from exc
-                if not raw_bytes or len(raw_bytes) > _MAX_EBOOK_BYTES:
-                    raise ValueError("电子书体积为空或超过 10MB 限制")
+                if not raw_bytes or len(raw_bytes) > eff_max_bytes:
+                    raise ValueError(f"电子书体积为空或超过 {eff_max_mb}MB 限制")
 
                 parser = (
                     parse_local_ebook

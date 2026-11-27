@@ -49,6 +49,31 @@ from .sanitize import (
     strip_raw_urls,
 )
 
+try:
+    from ..series_panels import apply_series_sqlite_pragmas
+except Exception:  # pragma: no cover - isolated import fallback
+
+    def apply_series_sqlite_pragmas(
+        conn: Any,
+        context=None,
+        *,
+        readonly: bool = False,
+        journal_limit_bytes: int | None = None,
+        profile: str | None = None,
+    ) -> dict[str, Any]:
+        jlimit = int(journal_limit_bytes) if journal_limit_bytes is not None else 2 * 1024 * 1024
+        for sql in (
+            "PRAGMA cache_size = -1024",
+            "PRAGMA temp_store = FILE",
+            "PRAGMA mmap_size = 0",
+            *([] if readonly or jlimit <= 0 else [f"PRAGMA journal_size_limit = {jlimit}"]),
+        ):
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass
+        return {"profile": profile or "standard"}
+
 _OPT_OUT_CUES = (
     "别再向我分享",
     "不要再向我分享",
@@ -141,21 +166,63 @@ def _extract_media_view(raw: Any) -> dict[str, Any]:
 class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
     """Thread-safe SQLite store separating global character reading from per-UMO consumption."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, context: Any = None):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._context = context
         self.lock = threading.RLock()
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        try:
+            self.db.execute("PRAGMA auto_vacuum=INCREMENTAL;")
+        except sqlite3.Error:
+            pass
         self.db.execute("PRAGMA journal_mode=WAL;")
         self.db.execute("PRAGMA synchronous=NORMAL;")
         self.db.execute("PRAGMA busy_timeout=5000;")
         self.db.execute("PRAGMA foreign_keys=ON;")
+        try:
+            self.db.execute("PRAGMA wal_autocheckpoint=200;")
+        except sqlite3.Error:
+            pass
+        apply_series_sqlite_pragmas(
+            self.db, context, journal_limit_bytes=2 * 1024 * 1024
+        )
         self._init_schema()
         self.migrate_lifecycle()
         from .transactions import NestedConnection
 
         self.db = NestedConnection(self.db)
+
+    @property
+    def mutation_seq(self) -> int:
+        return int(getattr(self.db, "mutation_seq", 0) or 0)
+
+    def checkpoint_and_vacuum(self, *, vacuum_pages: int = 256) -> dict[str, Any]:
+        """Truncate WAL file and incrementally reclaim freelist pages."""
+        pages = max(1, int(vacuum_pages or 256))
+        wal_ok = False
+        vacuumed = False
+        auto_vacuum_mode = 0
+        with self.lock:
+            try:
+                self.db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                wal_ok = True
+            except sqlite3.Error:
+                wal_ok = False
+            try:
+                row = self.db.execute("PRAGMA auto_vacuum;").fetchone()
+                auto_vacuum_mode = int(row[0]) if row else 0
+                if auto_vacuum_mode == 2:
+                    self.db.execute(f"PRAGMA incremental_vacuum({pages});")
+                    vacuumed = True
+            except sqlite3.Error:
+                vacuumed = False
+        return {
+            "wal_checkpointed": wal_ok,
+            "vacuumed": vacuumed,
+            "auto_vacuum": auto_vacuum_mode,
+        }
 
     def _init_schema(self) -> None:
         with self.lock, self.db:

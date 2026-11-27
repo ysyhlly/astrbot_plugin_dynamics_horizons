@@ -20,13 +20,43 @@ import time
 import weakref
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
-
 from astrbot.api import logger
+
+try:
+    from ..series_panels import (
+        get_series_resource_limits,
+        heavy_subprocess_slot,
+        resolve_series_resource_profile,
+        try_malloc_trim,
+    )
+except Exception:  # pragma: no cover - isolated import fallback
+
+    def resolve_series_resource_profile(_ctx=None) -> str:
+        return "standard"
+
+    def get_series_resource_limits(
+        _ctx=None, *, profile: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "profile": profile or "standard",
+            "horizons_ffmpeg_threads": 2,
+            "horizons_prefer_videoshot": False,
+        }
+
+    @contextlib.asynccontextmanager
+    async def heavy_subprocess_slot(
+        _ctx, purpose: str, *, plugin_id: str = "", timeout: float | None = None
+    ):
+        yield {"purpose": purpose, "plugin_id": plugin_id}
+
+    def try_malloc_trim(*_args, **_kwargs) -> bool:
+        return False
 
 from . import ssrf as ssrf_mod
 from .ssrf import (
@@ -52,6 +82,53 @@ _MEDIA_SEMAPHORE_LOCK = threading.Lock()
 _IN_MEDIA_SEMAPHORE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "horizons_in_media_semaphore", default=False
 )
+_MEDIA_TEMP_ROOT: Path | None = None
+_MEDIA_CONTEXT: Any = None
+
+
+def configure_media_runtime(
+    *,
+    data_dir: str | Path | None = None,
+    context: Any = None,
+) -> Path | None:
+    """Configure disk-backed temp root (out of /tmp tmpfs) and series context for media jobs."""
+    global _MEDIA_TEMP_ROOT, _MEDIA_CONTEXT
+    if context is not None:
+        _MEDIA_CONTEXT = context
+    if data_dir is not None:
+        clean = str(data_dir).strip()
+        if clean:
+            root = Path(clean) / "cache" / "tmp"
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            _MEDIA_TEMP_ROOT = root
+        else:
+            _MEDIA_TEMP_ROOT = None
+    return _MEDIA_TEMP_ROOT
+
+
+def get_media_temp_root() -> Path:
+    """Return configured disk temp dir (`data_dir/cache/tmp`) or system tempdir fallback."""
+    if _MEDIA_TEMP_ROOT is not None:
+        try:
+            _MEDIA_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+            return _MEDIA_TEMP_ROOT
+        except OSError:
+            pass
+    return Path(tempfile.gettempdir())
+
+
+def _ffmpeg_threads(context: Any = None) -> int:
+    ctx = context if context is not None else _MEDIA_CONTEXT
+    limits = get_series_resource_limits(ctx)
+    return max(1, int(limits.get("horizons_ffmpeg_threads", 2)))
+
+
+def _is_low_memory_profile(context: Any = None) -> bool:
+    ctx = context if context is not None else _MEDIA_CONTEXT
+    return resolve_series_resource_profile(ctx) != "standard"
 _PTS_TIME_RE = re.compile(r"pts_time:(\d+(?:\.\d+)?)")
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)", re.IGNORECASE)
 _REPEATED_CHAR_RE = re.compile(r"^(.)\1{2,}$")
@@ -249,23 +326,43 @@ def format_timestamp(seconds: float) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
-def make_temp_dir(bvid: str = "") -> Path:
+def make_temp_dir(bvid: str = "", *, base_dir: str | Path | None = None) -> Path:
     """Create a dedicated temporary directory for a single video fetch."""
     safe_tag = re.sub(r"[^0-9A-Za-z_-]+", "", str(bvid or ""))[:20]
     prefix = f"{_TEMP_PREFIX}{safe_tag}_" if safe_tag else _TEMP_PREFIX
-    return Path(tempfile.mkdtemp(prefix=prefix))
+    root = Path(base_dir) if base_dir is not None else get_media_temp_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(root)))
+
+
+def _allowed_temp_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    if _MEDIA_TEMP_ROOT is not None:
+        try:
+            roots.append(_MEDIA_TEMP_ROOT.resolve())
+        except OSError:
+            pass
+    try:
+        sys_tmp = Path(tempfile.gettempdir()).resolve()
+        if sys_tmp not in roots:
+            roots.append(sys_tmp)
+    except OSError:
+        pass
+    return tuple(roots)
 
 
 def cleanup_temp_dir(path: str | Path | None) -> None:
-    """Idempotently remove a horizons-owned temp directory inside the system temp root."""
+    """Idempotently remove a horizons-owned temp directory inside an allowed temp root."""
     if not path:
         return
     try:
         target = Path(path).resolve()
-        temp_root = Path(tempfile.gettempdir()).resolve()
-        if target == temp_root or not target.name.startswith(_TEMP_PREFIX):
+        if not target.name.startswith(_TEMP_PREFIX):
             return
-        if temp_root not in target.parents:
+        allowed_roots = _allowed_temp_roots()
+        if not any(
+            target != root and root in target.parents for root in allowed_roots
+        ):
             return
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
@@ -285,17 +382,23 @@ def get_media_pipeline_semaphore() -> asyncio.Semaphore:
 
 
 @contextlib.asynccontextmanager
-async def _media_pipeline_slot():
+async def _media_pipeline_slot(context: Any = None):
     if _IN_MEDIA_SEMAPHORE.get():
         yield
         return
     sem = get_media_pipeline_semaphore()
+    ctx = context if context is not None else _MEDIA_CONTEXT
     async with sem:
-        token = _IN_MEDIA_SEMAPHORE.set(True)
-        try:
-            yield
-        finally:
-            _IN_MEDIA_SEMAPHORE.reset(token)
+        async with heavy_subprocess_slot(
+            ctx,
+            "horizons_video_media",
+            plugin_id="astrbot_plugin_dynamics_horizons",
+        ):
+            token = _IN_MEDIA_SEMAPHORE.set(True)
+            try:
+                yield
+            finally:
+                _IN_MEDIA_SEMAPHORE.reset(token)
 
 
 def _ensure_free_disk_space(
@@ -330,13 +433,10 @@ def cleanup_stale_temp_dirs(
     protected_dirs: Iterable[str | Path] | None = None,
 ) -> int:
     """Remove expired `horizons_bili_*` temp dirs whose mtime exceeds `max_age_seconds`."""
-    root = Path(temp_root) if temp_root is not None else Path(tempfile.gettempdir())
-    try:
-        resolved_root = root.resolve()
-    except OSError:
-        return 0
-    if not resolved_root.is_dir():
-        return 0
+    if temp_root is not None:
+        roots: tuple[Path, ...] = (Path(temp_root),)
+    else:
+        roots = _allowed_temp_roots()
     protected: set[Path] = set()
     for p in protected_dirs or ():
         if not p:
@@ -349,31 +449,40 @@ def cleanup_stale_temp_dirs(
         0.0, float(max_age_seconds)
     )
     removed = 0
-    try:
-        entries = list(resolved_root.iterdir())
-    except OSError:
-        return 0
-    for entry in entries:
-        if not entry.name.startswith(_TEMP_PREFIX):
-            continue
+    for root in roots:
         try:
-            if entry.is_symlink() or not entry.is_dir():
-                continue
-            resolved = entry.resolve()
-            if resolved in protected or resolved_root not in resolved.parents:
-                continue
-            if entry.stat().st_mtime < cutoff:
-                shutil.rmtree(resolved, ignore_errors=True)
-                if not resolved.exists():
-                    removed += 1
+            resolved_root = root.resolve()
         except OSError:
             continue
-    if removed > 0:
-        logger.info(
-            "[DynamicsHorizons] Cleaned up %d stale temp directories under %s",
-            removed,
-            resolved_root,
-        )
+        if not resolved_root.is_dir():
+            continue
+        try:
+            entries = list(resolved_root.iterdir())
+        except OSError:
+            continue
+        removed_here = 0
+        for entry in entries:
+            if not entry.name.startswith(_TEMP_PREFIX):
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                resolved = entry.resolve()
+                if resolved in protected or resolved_root not in resolved.parents:
+                    continue
+                if entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(resolved, ignore_errors=True)
+                    if not resolved.exists():
+                        removed += 1
+                        removed_here += 1
+            except OSError:
+                continue
+        if removed_here > 0:
+            logger.info(
+                "[DynamicsHorizons] Cleaned up %d stale temp directories under %s",
+                removed_here,
+                resolved_root,
+            )
     return removed
 
 
@@ -1000,9 +1109,20 @@ async def mux_and_compress_native_video(
         (320, 1, max(60, int(video_kbps * 0.62)), 24, 34),
     ]
 
+    threads = str(_ffmpeg_threads())
     async with _media_pipeline_slot():
         for idx, (h, target_fps, v_kbps, a_kbps, crf) in enumerate(passes):
-            cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path)]
+            cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-threads",
+                threads,
+                "-i",
+                str(video_path),
+            ]
             has_separate_audio = audio_path is not None and audio_path.exists()
             if has_separate_audio:
                 cmd.extend(["-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0?"])
@@ -1012,6 +1132,8 @@ async def mux_and_compress_native_video(
             vf = f"fps={target_fps},scale=-2:'min({h},ih)'"
             cmd.extend(
                 [
+                    "-threads",
+                    threads,
                     "-vf",
                     vf,
                     "-c:v",
@@ -1141,11 +1263,18 @@ async def detect_scene_timestamps(
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin or not video_path.exists() or duration_sec <= 4.0:
         return []
+    if _is_low_memory_profile() and float(duration_sec) > 600.0:
+        return []
+    threads = str(_ffmpeg_threads())
     try:
         rc, _, stderr = await _run_subprocess(
             [
                 ffmpeg_bin,
                 "-hide_banner",
+                "-threads",
+                threads,
+                "-skip_frame",
+                "nokey",
                 "-i",
                 str(video_path),
                 "-vf",
@@ -1169,53 +1298,59 @@ async def detect_scene_timestamps(
         return []
 
 
+@lru_cache(maxsize=8)
+def _load_stamp_font(font_size: int) -> Any:
+    """Cache truetype font handles across timestamp stamping & videoshot composition."""
+    from PIL import ImageFont
+
+    size = max(10, int(font_size))
+    for font_path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "C:/Windows/Fonts/consolab.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ):
+        if os.path.exists(font_path):
+            try:
+                return ImageFont.truetype(font_path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
 def stamp_timestamp_on_image(image_path: Path, label: str) -> None:
     """Stamp a compact `[mm:ss]` badge onto the top-left corner without obscuring bottom subtitles."""
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
     except Exception:
         return
     try:
         with Image.open(image_path) as im:
-            base = im.convert("RGBA")
-            overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(overlay)
-            text = f"[{label}]"
-            font_size = max(14, min(28, int(base.width * 0.026)))
-            font: Any = None
-            for font_path in (
-                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "C:/Windows/Fonts/consolab.ttf",
-                "C:/Windows/Fonts/arialbd.ttf",
-            ):
-                if os.path.exists(font_path):
-                    try:
-                        font = ImageFont.truetype(font_path, font_size)
-                        break
-                    except Exception:
-                        pass
-            if font is None:
-                font = ImageFont.load_default()
-
-            bbox = draw.textbbox((0, 0), text, font=font)
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-            pad_x, pad_y = 8, 5
-            x0, y0 = 10, 10
-            draw.rounded_rectangle(
-                [x0, y0, x0 + tw + pad_x * 2, y0 + th + pad_y * 2],
-                radius=6,
-                fill=(0, 0, 0, 185),
-            )
-            draw.text(
-                (x0 + pad_x, y0 + pad_y - bbox[1]),
-                text,
-                fill=(255, 255, 255, 255),
-                font=font,
-            )
-            merged = Image.alpha_composite(base, overlay).convert("RGB")
-            merged.save(image_path, format="JPEG", quality=84)
+            rgb = im.convert("RGB")
+            try:
+                draw = ImageDraw.Draw(rgb, "RGBA")
+                text = f"[{label}]"
+                font_size = max(14, min(28, int(rgb.width * 0.026)))
+                font = _load_stamp_font(font_size)
+                bbox = draw.textbbox((0, 0), text, font=font)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+                pad_x, pad_y = 8, 5
+                x0, y0 = 10, 10
+                draw.rounded_rectangle(
+                    [x0, y0, x0 + tw + pad_x * 2, y0 + th + pad_y * 2],
+                    radius=6,
+                    fill=(0, 0, 0, 185),
+                )
+                draw.text(
+                    (x0 + pad_x, y0 + pad_y - bbox[1]),
+                    text,
+                    fill=(255, 255, 255, 255),
+                    font=font,
+                )
+                rgb.save(image_path, format="JPEG", quality=84)
+            finally:
+                rgb.close()
     except Exception:
         return
 
@@ -1237,6 +1372,7 @@ async def extract_keyframes_from_video(
     if not ffmpeg_bin or not video_path.exists():
         return []
 
+    threads = str(_ffmpeg_threads())
     async with _media_pipeline_slot():
         eff_dur = float(duration_sec or 0.0)
         if eff_dur <= 0.0:
@@ -1245,7 +1381,8 @@ async def extract_keyframes_from_video(
             eff_dur = 10.0
 
         scene_ts: list[float] = []
-        if use_scene_detect and eff_dur <= 1800:
+        scene_dur_cap = 600.0 if _is_low_memory_profile() else 1800.0
+        if use_scene_detect and eff_dur <= scene_dur_cap:
             scene_ts = await detect_scene_timestamps(
                 video_path,
                 duration_sec=eff_dur,
@@ -1262,7 +1399,7 @@ async def extract_keyframes_from_video(
         # Map JPEG quality 50..95 -> ffmpeg mjpeg q:v 10..2
         qscale = max(2, min(12, int(round((100 - max(50, min(95, jpeg_quality))) / 5.0))))
         per_frame_timeout = max(8.0, min(20.0, timeout / max(1, len(timestamps)) * 2.0))
-        sem = asyncio.Semaphore(3)
+        sem = asyncio.Semaphore(1)
 
         async def _grab_one(idx: int, ts: float) -> dict[str, Any] | None:
             label = format_timestamp(ts)
@@ -1276,6 +1413,8 @@ async def extract_keyframes_from_video(
                             "-hide_banner",
                             "-loglevel",
                             "error",
+                            "-threads",
+                            threads,
                             "-ss",
                             f"{ts:.2f}",
                             "-i",
@@ -1357,28 +1496,14 @@ def _compose_videoshot_images(
 ) -> list[dict[str, Any]]:
     """Crop selected tiles from Bilibili sprite sheets into crisp 2x2 timestamped contact sheets."""
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
     except Exception:
         return []
 
     per_sheet = max(1, x_len * y_len)
     opened_sheets: dict[int, Any] = {}
     cropped_tiles: list[tuple[float, str, Any]] = []
-
-    font: Any = None
-    for font_path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "C:/Windows/Fonts/consolab.ttf",
-    ):
-        if os.path.exists(font_path):
-            try:
-                font = ImageFont.truetype(font_path, 16)
-                break
-            except Exception:
-                pass
-    if font is None:
-        font = ImageFont.load_default()
+    font = _load_stamp_font(16)
 
     try:
         for tile_idx in selected_indices:
@@ -1387,7 +1512,8 @@ def _compose_videoshot_images(
             if not raw_sheet:
                 continue
             if sheet_idx not in opened_sheets:
-                opened_sheets[sheet_idx] = Image.open(io.BytesIO(raw_sheet)).convert("RGB")
+                with Image.open(io.BytesIO(raw_sheet)) as src_sheet:
+                    opened_sheets[sheet_idx] = src_sheet.convert("RGB")
             sheet_img = opened_sheets[sheet_idx]
             row, col = divmod(local_idx, x_len)
             left = col * x_size
@@ -1400,9 +1526,11 @@ def _compose_videoshot_images(
             # Upscale 2x so 160x90 tiles become crisp 320x180 panels
             scale = 2 if x_size <= 200 else 1
             if scale > 1:
-                tile = tile.resize(
+                resized = tile.resize(
                     (x_size * scale, y_size * scale), Image.Resampling.LANCZOS
                 )
+                tile.close()
+                tile = resized
             ts = float(index_timestamps[tile_idx]) if tile_idx < len(index_timestamps) else 0.0
             label = format_timestamp(ts)
             draw = ImageDraw.Draw(tile)
@@ -1430,26 +1558,34 @@ def _compose_videoshot_images(
                 (cols * tile_w + (cols - 1) * gap, rows * tile_h + (rows - 1) * gap),
                 (18, 18, 18),
             )
-            for pos, (_, _, t_img) in enumerate(batch):
-                r, c = divmod(pos, cols)
-                canvas.paste(t_img, (c * (tile_w + gap), r * (tile_h + gap)))
-            first_ts, first_label = batch[0][0], batch[0][1]
-            last_label = batch[-1][1]
-            grid_label = (
-                f"{first_label}-{last_label}" if len(batch) > 1 else first_label
-            )
-            out_path = output_dir / f"videoshot_{grid_idx:02d}.jpg"
-            canvas.save(out_path, format="JPEG", quality=84)
-            out_frames.append(
-                {
-                    "path": str(out_path),
-                    "timestamp_sec": round(first_ts, 2),
-                    "label": grid_label,
-                    "source": "videoshot",
-                }
-            )
+            try:
+                for pos, (_, _, t_img) in enumerate(batch):
+                    r, c = divmod(pos, cols)
+                    canvas.paste(t_img, (c * (tile_w + gap), r * (tile_h + gap)))
+                first_ts, first_label = batch[0][0], batch[0][1]
+                last_label = batch[-1][1]
+                grid_label = (
+                    f"{first_label}-{last_label}" if len(batch) > 1 else first_label
+                )
+                out_path = output_dir / f"videoshot_{grid_idx:02d}.jpg"
+                canvas.save(out_path, format="JPEG", quality=84)
+                out_frames.append(
+                    {
+                        "path": str(out_path),
+                        "timestamp_sec": round(first_ts, 2),
+                        "label": grid_label,
+                        "source": "videoshot",
+                    }
+                )
+            finally:
+                canvas.close()
         return out_frames
     finally:
+        for _, _, t_img in cropped_tiles:
+            try:
+                t_img.close()
+            except Exception:
+                pass
         for img in opened_sheets.values():
             try:
                 img.close()
@@ -1789,6 +1925,55 @@ async def _acquire_video_media_in_temp(
     raw_audio_path: Path | None = None
     transient_reason = ""
     permanent_reason = ""
+
+    # Step 0 (2GB aggressive low-memory profile): prefer official videoshot + subtitles
+    # over full DASH video download & ffmpeg decode when subtitles already exist.
+    prefer_videoshot = bool(
+        get_series_resource_limits(_MEDIA_CONTEXT).get("horizons_prefer_videoshot", False)
+    )
+    if (
+        prefer_videoshot
+        and has_subtitle
+        and opts["visual_enabled"]
+        and not need_audio_stt
+        and cid
+    ):
+        try:
+            vs_max_frames, _ = resolve_keyframe_budget(
+                opts, has_subtitle=has_subtitle, duration_sec=eff_dur
+            )
+            shot_frames = await fetch_videoshot_frames(
+                bvid,
+                cid,
+                temp_dir / "videoshot",
+                duration_sec=eff_dur,
+                max_frames=vs_max_frames,
+                danmaku_spikes_sec=danmaku_spikes,
+                cookie_header=cookie_header,
+                secrets=secrets,
+                timeout=min(20.0, timeout),
+            )
+            if shot_frames:
+                bundle["frames"] = shot_frames
+                bundle["frame_paths"] = [f["path"] for f in shot_frames]
+                bundle["videoshot_paths"] = [f["path"] for f in shot_frames]
+                bundle["frame_count"] = len(shot_frames)
+                bundle["has_visual"] = True
+                bundle["watch_mode"] = "videoshot_subtitle"
+                bundle["content_origin"] = "bilibili_videoshot_subtitle"
+                allow_dash_video = False
+                want_native = False
+        except (SSRFBlockedError, AdapterRateLimitError):
+            cleanup_temp_dir(temp_dir)
+            raise
+        except Exception as exc:
+            if classify_error is not None:
+                rc = classify_error(exc)
+                if rc is not None:
+                    cleanup_temp_dir(temp_dir)
+                    raise rc from None
+            if not transient_reason:
+                transient_reason = redact_error_text(exc, secrets)
 
     # Step 1: Fetch DASH/progressive stream metadata when within duration cap or audio STT needed
     if (allow_dash_video or need_audio_stt) and cid:

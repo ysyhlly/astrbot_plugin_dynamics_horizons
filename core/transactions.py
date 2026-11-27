@@ -6,6 +6,8 @@ class NestedConnection:
         self.connection = connection
         self.depth = 0
         self.failed = False
+        self._start_changes = 0
+        self.mutation_seq = 0
 
     def __getattr__(self, name):
         return getattr(self.connection, name)
@@ -13,6 +15,7 @@ class NestedConnection:
     def __enter__(self):
         if self.depth == 0:
             self.failed = False
+            self._start_changes = int(getattr(self.connection, "total_changes", 0) or 0)
         self.depth += 1
         return self
 
@@ -24,4 +27,7 @@ class NestedConnection:
                 self.connection.rollback()
             else:
                 self.connection.commit()
+                end_changes = int(getattr(self.connection, "total_changes", 0) or 0)
+                if end_changes > self._start_changes:
+                    self.mutation_seq += 1
         return False
