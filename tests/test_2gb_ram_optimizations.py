@@ -309,9 +309,14 @@ def test_web_api_upload_ebook_checks_b64_len_before_decode_and_uses_run_io(tmp_p
         def _forbid_decode(*_a, **_kw):
             raise AssertionError("b64decode must not be called for oversized payload")
 
+        def _status_code(resp) -> int:
+            if isinstance(resp, dict):
+                return int(resp["status_code"])
+            return int(getattr(resp, "status_code", getattr(resp, "status", 0)))
+
         monkeypatch.setattr(web_api_mod.base64, "b64decode", _forbid_decode)
         resp_big = asyncio.run(api.sources_post())
-        assert resp_big["status_code"] == 400
+        assert _status_code(resp_big) == 400
 
         # 2) Valid small upload calls b64decode via run_io
         monkeypatch.setattr(web_api_mod.base64, "b64decode", orig_b64decode)
@@ -337,7 +342,7 @@ def test_web_api_upload_ebook_checks_b64_len_before_decode_and_uses_run_io(tmp_p
             ),
         )
         resp_ok = asyncio.run(api.sources_post())
-        assert resp_ok["status_code"] == 200
+        assert _status_code(resp_ok) == 200
         assert orig_b64decode in run_io_calls
     finally:
         store.close()
