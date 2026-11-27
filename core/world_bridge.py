@@ -672,6 +672,77 @@ class WorldBridge:
                 return plugin
         return None
 
+    def find_games_plugin(self) -> Any | None:
+        for name, plugin in _iter_star_instances(self.context) or ():
+            if name == "astrbot_plugin_dynamics_games" or callable(
+                getattr(plugin, "create_activity_from_companion", None)
+            ):
+                return plugin
+        return None
+
+    async def create_group_reading_activity(
+        self,
+        *,
+        umo: str,
+        title: str,
+        description: str = "",
+        creator_name: str = "",
+        book_id: str = "",
+        chapter_cursor: int = 0,
+        total_chapters: int = 0,
+    ) -> dict[str, Any]:
+        """Zero-coupling call to `dynamics_games.create_activity_from_companion` for group co-reading."""
+        games = self.find_games_plugin()
+        if games is None:
+            return {"ok": False, "reason": "games_offline", "detail": "群间游戏插件未安装或未启用"}
+        creator = getattr(games, "create_activity_from_companion", None)
+        if not callable(creator):
+            return {"ok": False, "reason": "method_absent", "detail": "群间游戏暂不支持伴生共读创建接口"}
+        clean_umo = str(umo or "").strip()
+        clean_title = strip_raw_urls(str(title or "")).strip()[:80]
+        clean_desc = strip_raw_urls(str(description or "")).strip()[:200]
+        if not clean_umo or not clean_title:
+            return {"ok": False, "reason": "invalid_args", "detail": "缺少群聊 UMO 或共读书名"}
+        meta = {
+            "book_id": str(book_id or ""),
+            "chapter_cursor": int(chapter_cursor or 0),
+            "total_chapters": int(total_chapters or 0),
+            "source_plugin": "astrbot_plugin_dynamics_horizons",
+        }
+        try:
+            res = creator(
+                clean_umo,
+                "reading",
+                clean_title,
+                description=clean_desc,
+                creator_name=strip_raw_urls(str(creator_name or "群间见闻"))[:40],
+                source_plugin="astrbot_plugin_dynamics_horizons",
+                meta=meta,
+            )
+            if inspect.isawaitable(res):
+                res = await asyncio.wait_for(res, timeout=5.0)
+            if isinstance(res, dict):
+                ok = bool(res.get("ok", True))
+                act = res.get("activity") if isinstance(res.get("activity"), dict) else {}
+                act_id = str(
+                    res.get("activity_id") or act.get("activity_id") or act.get("id") or ""
+                ).strip()
+                return {
+                    "ok": ok,
+                    "activity_id": act_id,
+                    "title": clean_title,
+                    "duplicate": bool(res.get("duplicate", False)),
+                    "detail": str(res.get("message") or res.get("detail") or ""),
+                    "raw": res,
+                }
+            return {"ok": True, "activity_id": "", "title": clean_title, "detail": ""}
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": type(exc).__name__,
+                "detail": f"创建共读活动失败：{type(exc).__name__}",
+            }
+
     async def fetch_learning_social_hints(
         self, umos: list[str], *, member_id: str = ""
     ) -> dict[str, Any]:
@@ -793,8 +864,10 @@ class WorldBridge:
         identity: str,
         log_record: dict[str, Any],
         topic: str = "",
+        umo: str = "",
+        participants: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Lightly archive an approved reading journal note into `dynamics_memory` if supported."""
+        """Lightly archive an approved reading journal or co-reading note into `dynamics_memory` if supported."""
         memory = self.find_memory_plugin()
         if memory is None:
             return {"synced": False, "reason": "memory_offline"}
@@ -826,6 +899,8 @@ class WorldBridge:
             "fact_kind": "external_media",
             "identity": norm_id,
             "persona_id": persona_id,
+            "umo": str(umo or "").strip()[:512],
+            "participants": [str(p).strip()[:64] for p in (participants or [])[:12] if str(p or "").strip()],
             "log_id": str(log_record.get("log_id") or ""),
             "topic": strip_raw_urls(str(topic or "")).strip()[:48],
             "title": strip_raw_urls(str(cit.get("title") or "")).strip()[:120],

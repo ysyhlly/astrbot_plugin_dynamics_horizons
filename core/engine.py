@@ -509,6 +509,10 @@ class HorizonsEngine(EngineLifecycle):
         self.next_poll_at = self.clock() + 5
         self.next_digest_at = self.clock() + 12
         self._last_model_usage: dict[str, int] | None = None
+        # Wave 3: Dynamics Event Bus vibe & quiet-window state
+        self._umo_vibe_state: dict[str, dict[str, Any]] = {}
+        self._umo_quiet_windows: dict[str, dict[str, Any]] = {}
+        self._event_bus_tokens: list[tuple[Any, str]] = []
 
     def set_last_model_usage(
         self, prompt_tokens: int = 0, completion_tokens: int = 0
@@ -2723,6 +2727,27 @@ class HorizonsEngine(EngineLifecycle):
             )
             if is_video_multimodal:
                 system_prompt = system_prompt + VIDEO_STAGE2_VISUAL_ADDENDUM
+            if book_id and chapter_index is not None:
+                gp_rows = await run_io(
+                    self.store.get_group_reading_progress, identity, book_id=book_id
+                )
+                behind_cursors = [
+                    int(r["group_cursor"])
+                    for r in gp_rows
+                    if r.get("group_cursor") is not None
+                    and int(r["group_cursor"]) < int(chapter_index)
+                ]
+                if behind_cursors:
+                    min_grp = min(behind_cursors)
+                    metadata["co_reading_spoiler_guard"] = {
+                        "max_safe_chapter": min_grp,
+                        "current_chapter": int(chapter_index),
+                    }
+                    system_prompt = (
+                        system_prompt
+                        + f"\n\n【防剧透边界】本群当前共读进度仅至第 {min_grp} 章，你正在自主追读第 {int(chapter_index) + 1} 章。"
+                        f"生成的 discussion_questions 严禁剧透第 {min_grp} 章之后的情节，请仅围绕第 {min_grp} 章及以前内容或开放式阅读感受发问。"
+                    )
             system_prompt = build_persona_system_prompt(
                 system_prompt,
                 character_name=str(wake.get("character_name") or ""),
@@ -3863,6 +3888,304 @@ class HorizonsEngine(EngineLifecycle):
             "group_used": group_used + 1,
             "group_limit": per_group_cap,
             "message": f"收下啦！已把《{display_title}》放到案头待读里，之后有空细看后再来跟你聊观后感（今日还可安利 {rem} 条）。",
+        }
+
+    # ------------------------------------------------------------------
+    # Wave 3: Co-Reading Anti-Spoiler Loop & Dynamics Event Bus
+    # ------------------------------------------------------------------
+
+    _SERIOUS_VIBES = frozenset({"serious_inquiry", "deciding", "serious"})
+    _VIBE_STATE_TTL_SEC = 1800.0
+    _QUIET_WINDOW_TTL_SEC = 1200.0
+
+    def subscribe_series_event_bus(self) -> int:
+        """Dynamically subscribe to `chat_dynamics` Event Bus (`vibe_transition`, `session_quiet_window`)."""
+        if self.closed or self._event_bus_tokens:
+            return len(self._event_bus_tokens)
+        chat = None
+        for name, plugin in self.world_bridge.iter_plugins():
+            if name == "astrbot_plugin_chat_dynamics" or callable(
+                getattr(plugin, "subscribe_dynamics_event", None)
+            ):
+                chat = plugin
+                break
+        if chat is None:
+            return 0
+        sub_fn = getattr(chat, "subscribe_dynamics_event", None)
+        if not callable(sub_fn):
+            return 0
+        for ev_type, cb in (
+            ("vibe_transition", self._on_vibe_transition),
+            ("session_quiet_window", self._on_session_quiet_window),
+        ):
+            try:
+                token = sub_fn(ev_type, cb, owner=PLUGIN_ID)
+                if token:
+                    self._event_bus_tokens.append((chat, str(token)))
+            except TypeError:
+                try:
+                    token = sub_fn(ev_type, cb)
+                    if token:
+                        self._event_bus_tokens.append((chat, str(token)))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return len(self._event_bus_tokens)
+
+    def unsubscribe_series_event_bus(self) -> int:
+        """Safely unsubscribe all Dynamics Event Bus tokens on terminate."""
+        removed = 0
+        tokens = list(self._event_bus_tokens)
+        self._event_bus_tokens.clear()
+        for chat, token in tokens:
+            unsub = getattr(chat, "unsubscribe_dynamics_event", None)
+            if callable(unsub):
+                with contextlib.suppress(Exception):
+                    if unsub(token):
+                        removed += 1
+        return removed
+
+    async def _on_vibe_transition(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        umo = str(payload.get("umo") or "").strip()
+        if not umo:
+            return
+        now = self.clock()
+        new_vibe = str(payload.get("new_vibe") or "").strip().lower()
+        is_serious = bool(payload.get("serious_mode") is True) or (
+            new_vibe in self._SERIOUS_VIBES
+        )
+        self._umo_vibe_state[umo] = {
+            "vibe": new_vibe or ("serious" if is_serious else "casual"),
+            "serious_mode": is_serious,
+            "updated_at": now,
+            "expires_at": now + self._VIBE_STATE_TTL_SEC,
+        }
+
+    async def _on_session_quiet_window(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        umo = str(payload.get("umo") or "").strip()
+        if not umo:
+            return
+        now = self.clock()
+        try:
+            quiet_sec = max(0.0, float(payload.get("quiet_seconds") or 0.0))
+        except (TypeError, ValueError):
+            quiet_sec = 0.0
+        self._umo_quiet_windows[umo] = {
+            "quiet_seconds": quiet_sec,
+            "last_activity_at": float(payload.get("last_activity_at") or now),
+            "observed_at": now,
+            "expires_at": now + self._QUIET_WINDOW_TTL_SEC,
+        }
+
+    def is_umo_vibe_serious(self, umo: str, now: float | None = None) -> bool:
+        clean = str(umo or "").strip()
+        if not clean:
+            return False
+        entry = self._umo_vibe_state.get(clean)
+        if not isinstance(entry, dict):
+            return False
+        stamp = float(now if now is not None else self.clock())
+        if float(entry.get("expires_at") or 0.0) <= stamp:
+            self._umo_vibe_state.pop(clean, None)
+            return False
+        return bool(entry.get("serious_mode"))
+
+    def is_umo_in_quiet_window(self, umo: str, now: float | None = None) -> bool:
+        clean = str(umo or "").strip()
+        if not clean or self.is_umo_vibe_serious(clean, now=now):
+            return False
+        entry = self._umo_quiet_windows.get(clean)
+        if not isinstance(entry, dict):
+            return False
+        stamp = float(now if now is not None else self.clock())
+        if float(entry.get("expires_at") or 0.0) <= stamp:
+            self._umo_quiet_windows.pop(clean, None)
+            return False
+        return True
+
+    def vibe_bus_diagnostics(self) -> dict[str, Any]:
+        now = self.clock()
+        serious_umos = [
+            u for u in list(self._umo_vibe_state.keys()) if self.is_umo_vibe_serious(u, now=now)
+        ]
+        quiet_umos = [
+            u for u in list(self._umo_quiet_windows.keys()) if self.is_umo_in_quiet_window(u, now=now)
+        ]
+        return {
+            "subscribed": bool(self._event_bus_tokens),
+            "subscriptions": len(self._event_bus_tokens),
+            "serious_vibe_umos": serious_umos,
+            "quiet_window_umos": quiet_umos,
+        }
+
+    async def set_group_reading_cursor(
+        self,
+        *,
+        book_id: str,
+        umo: str,
+        group_cursor: int,
+        updated_by: str = "",
+        activity_id: str = "",
+    ) -> dict[str, Any]:
+        now = self.clock()
+        res = await run_io(
+            self.store.set_group_reading_cursor,
+            book_id,
+            umo,
+            int(group_cursor),
+            updated_by=updated_by,
+            activity_id=activity_id,
+            now=now,
+        )
+        tea_question = None
+        if res.get("milestone_hit"):
+            tea_question = await run_io(
+                self.store.create_milestone_tea_question,
+                identity=res["identity"],
+                book_id=res["book_id"],
+                title=res["title"],
+                group_cursor=res["group_cursor"],
+                question_ttl_hours=self.question_ttl_hours,
+                now=now,
+            )
+        await self.refresh_projection()
+        return {**res, "tea_question": tea_question}
+
+    async def launch_group_co_reading(
+        self,
+        *,
+        umo: str,
+        book_id: str = "",
+        title: str = "",
+        identity: str = "",
+        creator_name: str = "",
+        initial_cursor: int = 0,
+    ) -> dict[str, Any]:
+        clean_umo = str(umo or "").strip()
+        if not clean_umo:
+            raise ValueError("请先选择要发起群共读的目标群聊")
+        if not self.is_session_allowed(clean_umo):
+            raise ValueError("当前群聊未启用群间见闻")
+        book = None
+        if book_id:
+            book = await run_io(self.store.get_book, book_id)
+            if book is None:
+                raise ValueError("书架上未找到该书目")
+            if identity and book["identity"] != normalize_identity(identity):
+                raise ValueError("该书目不属于当前角色")
+        elif title:
+            candidates = await run_io(
+                self.store.get_group_reading_progress,
+                identity,
+                umo=clean_umo,
+                title_query=title,
+            )
+            if candidates:
+                book = await run_io(self.store.get_book, candidates[0]["book_id"])
+
+        target_title = strip_raw_urls(
+            str((book["title"] if book else title) or "").strip("《》 ")
+        )[:80]
+        if not target_title:
+            raise ValueError("请指定要发起共读的书名或专题标题")
+        total_ch = int(book["total_chapters"] or 0) if book else 0
+        char_cur = int(book["chapter_cursor"] or 0) if book else 0
+        desc = (
+            f"由群间见闻发起《{target_title}》群共读，支持 /共读进度 同步章节并自动防剧透。"
+            + (f"（全书约 {total_ch} 章）" if total_ch > 0 else "")
+        )
+        act_res = await self.world_bridge.create_group_reading_activity(
+            umo=clean_umo,
+            title=f"共读《{target_title}》",
+            description=desc,
+            creator_name=creator_name or "群间见闻",
+            book_id=str(book["book_id"]) if book else "",
+            chapter_cursor=int(initial_cursor or 0),
+            total_chapters=total_ch,
+        )
+        if not act_res.get("ok"):
+            return {
+                "ok": False,
+                "reason": act_res.get("reason") or "games_unavailable",
+                "message": act_res.get("detail") or "未能联动群间游戏创建共读活动，请确认已启用 dynamics_games。",
+            }
+        act_id = str(act_res.get("activity_id") or "")
+        progress = None
+        if book is not None:
+            progress = await self.set_group_reading_cursor(
+                book_id=book["book_id"],
+                umo=clean_umo,
+                group_cursor=max(0, int(initial_cursor or 0)),
+                updated_by=creator_name or "co_reading",
+                activity_id=act_id,
+            )
+        return {
+            "ok": True,
+            "activity_id": act_id,
+            "duplicate": bool(act_res.get("duplicate", False)),
+            "book_id": str(book["book_id"]) if book else "",
+            "title": target_title,
+            "umo": clean_umo,
+            "character_cursor": char_cur,
+            "progress": progress,
+            "message": (
+                f"已发起群共读活动「共读《{target_title}》」！"
+                f"群友可随时用 `/共读进度 {target_title} 第X章` 同步进度，我会自动遵守防剧透边界。"
+            ),
+        }
+
+    async def on_co_reading_completed(
+        self,
+        *,
+        umo: str = "",
+        book_id: str = "",
+        title: str = "",
+        activity_id: str = "",
+        summary: str = "",
+        participants: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Mark book co-read completed and sync the shared experience to `dynamics_memory`."""
+        now = self.clock()
+        marked = await run_io(
+            self.store.mark_book_co_read_completed,
+            book_id=book_id,
+            umo=umo,
+            title=title,
+            activity_id=activity_id,
+            now=now,
+        )
+        await self.refresh_projection()
+        if marked is None:
+            return {"ok": False, "reason": "book_not_found", "memory_synced": False}
+        mem_sync = {"synced": False, "reason": "disabled"}
+        if self.config.get("enable_memory_sync", True):
+            clean_summary = strip_raw_urls(str(summary or "")).strip()[:180]
+            part_list = [str(p).strip() for p in (participants or []) if str(p or "").strip()]
+            who_text = f"与 {'、'.join(part_list[:6])} 等群友" if part_list else "与群友们"
+            log_rec = {
+                "log_id": f"coread:{marked['book_id']}:{int(now)}",
+                "citation": {"title": marked["title"], "creator": marked.get("creator") or ""},
+                "digest": clean_summary or f"{who_text}一起完成了《{marked['title']}》的群共读活动。",
+                "reflection": f"和大家一起共读完《{marked['title']}》是很棒的共同经历。",
+                "created_at": now,
+            }
+            mem_sync = await self.world_bridge.sync_memory_reading_note(
+                identity=marked["identity"],
+                log_record=log_rec,
+                topic=f"共读·{marked['title'][:24]}",
+                umo=marked.get("umo") or umo,
+                participants=part_list,
+            )
+        return {
+            "ok": True,
+            **marked,
+            "memory_synced": bool(mem_sync.get("synced")),
+            "memory_result": mem_sync,
         }
 
     # ------------------------------------------------------------------

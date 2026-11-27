@@ -160,6 +160,7 @@ const state = {
   overview: null,
   sources: [],
   books: [],
+  managedUmos: [],
   logs: { items: [], page: 1, total: 0, page_size: PAGE_SIZE, source_kind: '', query: '' },
   reviews: {
     items: [],
@@ -646,9 +647,13 @@ function renderOutreachDiagnostics(overview) {
         const card = el('article', 'item-card');
         const head = el('div', 'item-head');
         const tg = el('div', 'item-title-group');
-        const kindLabel = it.horizon_kind === 'anli_reflection_reply' ? '安利回信' : '共聊分享';
+        const kindLabel = it.horizon_kind === 'anli_reflection_reply'
+          ? '安利回信'
+          : it.horizon_kind === 'invite_reading_activity'
+            ? '邀约共读'
+            : '共聊分享';
         tg.append(
-          el('span', `pill ${it.horizon_kind === 'anli_reflection_reply' ? 'accent' : 'info'}`, kindLabel),
+          el('span', `pill ${it.horizon_kind === 'co_discussed_topic_share' ? 'info' : 'accent'}`, kindLabel),
           el('h4', 'item-title', it.topic || '见闻分享'),
           el('span', `pill ${it.status === 'pending' ? 'warm' : it.status === 'sent' ? 'accent' : ''}`, it.status),
         );
@@ -1120,7 +1125,27 @@ function renderSourcesAndBooks() {
         if (book.creator) titleGroup.append(el('span', 'pill', book.creator));
         titleGroup.append(el('span','pill info',book.reading_label || (book.chapter_cursor ? '正在阅读' : '书架待读')));
         const bookActions = el('div', 'item-actions');
+        const targetGroupUmo = state.sharedScope
+          || (Array.isArray(book.group_progress) && book.group_progress[0]?.umo)
+          || (Array.isArray(state.managedUmos) && state.managedUmos[0])
+          || '';
         bookActions.append(
+          actionButton(msg('发起群共读'), async () => {
+            const umo = targetGroupUmo || window.prompt('请输入要发起群共读的群聊 UMO：', '');
+            if (!umo || !String(umo).trim()) return;
+            const res = await apiPost('sources', {
+              op: 'start_co_reading',
+              identity: book.identity || state.identity,
+              book_id: book.book_id,
+              umo: String(umo).trim(),
+            });
+            if (res?.ok === false) {
+              notify(res.message || '发起群共读失败。', 'warning');
+            } else {
+              notify(res?.message || `已为《${book.title}》发起群共读活动！`, 'success');
+              await Promise.all([loadSources({ silent: true }), loadOverview({ silent: true })]);
+            }
+          }, 'wb-button primary'),
           actionButton(msg('删除书籍'), async () => {
             const ok = await confirmAction(`确定要从书架删除《${book.title || '该书目'}》吗？已批准的历史阅读手账不会被删除。`);
             if (!ok) return;
@@ -1134,6 +1159,23 @@ function renderSourcesAndBooks() {
           }, 'wb-button danger'),
         );
         head.append(titleGroup, bookActions);
+        const gpList = Array.isArray(book.group_progress) ? book.group_progress : [];
+        if (book.co_read_completed || gpList.length > 0) {
+          const gpBadges = el('div', 'umo-badges');
+          if (book.co_read_completed) {
+            gpBadges.append(el('span', 'pill accent', '已共读'));
+          }
+          for (const gp of gpList.slice(0, 4)) {
+            const scopeName = formatScopeLabel(gp.umo) || gp.umo;
+            const statusTxt = gp.co_read_completed
+              ? `${scopeName} · 已共读`
+              : `${scopeName} · 共读第 ${Number(gp.group_cursor) || 0} 章`;
+            gpBadges.append(el('span', `pill ${gp.co_read_completed ? 'accent' : 'info'}`, statusTxt));
+          }
+          card.append(head, gpBadges);
+        } else {
+          card.append(head);
+        }
 
         const cursor = Math.max(0, Number(book.chapter_cursor) || 0);
         const total = Math.max(0, Number(book.total_chapters) || 0);
@@ -1192,7 +1234,7 @@ function renderSourcesAndBooks() {
           switcher.append(btn);
         }
 
-        card.append(head, progressRow, cursorRow, switcher);
+        card.append(progressRow, cursorRow, switcher);
         shelf.append(card);
       }
     }
@@ -1774,6 +1816,7 @@ async function loadSources({ silent = false } = {}) {
   await readRoleData('sources', {}, $('#panel-sources'), data => {
     state.sources = Array.isArray(data?.sources) ? data.sources : [];
     state.books = Array.isArray(data?.books) ? data.books : (state.overview?.books || []);
+    if (Array.isArray(data?.managed_umos)) state.managedUmos = data.managed_umos;
     renderSourcesAndBooks();
     if (!silent) notify('已读取信息源与角色连载书架。', 'info');
   });

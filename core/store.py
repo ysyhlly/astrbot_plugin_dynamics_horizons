@@ -989,7 +989,340 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         query += " ORDER BY CASE status WHEN 'reading' THEN 0 WHEN 'finished' THEN 1 ELSE 2 END, updated_at DESC"
         with self.lock:
             rows = self.db.execute(query, params).fetchall()
-        return [self._format_book_row(r) for r in rows]
+            books = [self._format_book_row(r) for r in rows]
+            if books:
+                bids = [b["book_id"] for b in books]
+                ph = ",".join("?" for _ in bids)
+                prog_rows = self.db.execute(
+                    f"SELECT * FROM book_group_progress WHERE book_id IN ({ph}) ORDER BY updated_at DESC",
+                    bids,
+                ).fetchall()
+                prog_by_book: dict[str, list[dict[str, Any]]] = {}
+                for pr in prog_rows:
+                    prog_by_book.setdefault(str(pr["book_id"]), []).append(
+                        {
+                            "umo": str(pr["umo"]),
+                            "group_cursor": int(pr["group_cursor"] or 0),
+                            "activity_id": str(pr["activity_id"] or ""),
+                            "co_read_completed": bool(pr["co_read_completed"]),
+                            "completed_at": float(pr["completed_at"] or 0.0),
+                            "updated_by": str(pr["updated_by"] or ""),
+                            "updated_at": float(pr["updated_at"] or 0.0),
+                        }
+                    )
+                for b in books:
+                    gp_list = prog_by_book.get(b["book_id"], [])
+                    b["group_progress"] = gp_list
+                    b["co_read_completed"] = any(
+                        bool(item.get("co_read_completed")) for item in gp_list
+                    )
+        return books
+
+    # ------------------------------------------------------------------
+    # Wave 3: Per-Group Co-Reading Cursor & Anti-Spoiler Helpers
+    # ------------------------------------------------------------------
+
+    def set_group_reading_cursor(
+        self,
+        book_id: str,
+        umo: str,
+        group_cursor: int,
+        *,
+        updated_by: str = "",
+        activity_id: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        clean_bid = str(book_id or "").strip()
+        clean_umo = str(umo or "").strip()[:512]
+        if not clean_bid or not clean_umo:
+            raise ValueError("缺少书目 ID 或群聊 UMO")
+        stamp = float(now if now is not None else time.time())
+        with self.lock, self.db:
+            book = self.db.execute(
+                "SELECT * FROM books WHERE book_id=?", (clean_bid,)
+            ).fetchone()
+            if book is None:
+                raise ValueError("书架上未找到该书目")
+            total = int(book["total_chapters"] or 0)
+            char_cursor = int(book["chapter_cursor"] or 0)
+            next_cursor = max(0, int(group_cursor))
+            if total > 0:
+                next_cursor = min(next_cursor, total)
+            existing = self.db.execute(
+                "SELECT * FROM book_group_progress WHERE book_id=? AND umo=?",
+                (clean_bid, clean_umo),
+            ).fetchone()
+            prev_cursor = int(existing["group_cursor"] or 0) if existing is not None else -1
+            eff_activity = (
+                str(activity_id or "").strip()[:128]
+                or (str(existing["activity_id"] or "") if existing is not None else "")
+            )
+            eff_completed = (
+                1
+                if (total > 0 and next_cursor >= total)
+                else (int(existing["co_read_completed"] or 0) if existing is not None else 0)
+            )
+            eff_completed_at = (
+                stamp
+                if (eff_completed and (existing is None or not existing["co_read_completed"]))
+                else (float(existing["completed_at"] or 0.0) if existing is not None else 0.0)
+            )
+            self.db.execute(
+                """
+                INSERT INTO book_group_progress(
+                    book_id, umo, group_cursor, activity_id, co_read_completed,
+                    completed_at, updated_by, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(book_id, umo) DO UPDATE SET
+                    group_cursor=excluded.group_cursor,
+                    activity_id=CASE WHEN excluded.activity_id!='' THEN excluded.activity_id ELSE book_group_progress.activity_id END,
+                    co_read_completed=MAX(book_group_progress.co_read_completed, excluded.co_read_completed),
+                    completed_at=CASE WHEN excluded.completed_at>0 THEN excluded.completed_at ELSE book_group_progress.completed_at END,
+                    updated_by=excluded.updated_by,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    clean_bid,
+                    clean_umo,
+                    next_cursor,
+                    eff_activity,
+                    eff_completed,
+                    eff_completed_at,
+                    str(updated_by or "").strip()[:80],
+                    stamp,
+                ),
+            )
+        milestone_hit = (
+            next_cursor > 0
+            and next_cursor != prev_cursor
+            and (
+                next_cursor == 1
+                or next_cursor % 3 == 0
+                or (total > 0 and next_cursor >= total)
+            )
+        )
+        return {
+            "book_id": clean_bid,
+            "identity": str(book["identity"]),
+            "title": str(book["title"]),
+            "creator": str(book["creator"]),
+            "umo": clean_umo,
+            "group_cursor": next_cursor,
+            "character_cursor": char_cursor,
+            "total_chapters": total,
+            "ahead_chapters": max(0, char_cursor - next_cursor),
+            "activity_id": eff_activity,
+            "co_read_completed": bool(eff_completed),
+            "milestone_hit": milestone_hit,
+        }
+
+    def get_group_reading_progress(
+        self,
+        identity: str = "",
+        *,
+        umo: str = "",
+        book_id: str = "",
+        title_query: str = "",
+    ) -> list[dict[str, Any]]:
+        norm = normalize_identity(identity) if str(identity or "").strip() else ""
+        clean_umo = str(umo or "").strip()
+        clean_bid = str(book_id or "").strip()
+        q_low = str(title_query or "").strip("《》\"' ").casefold()
+        where = "WHERE 1=1"
+        params: list[Any] = []
+        if norm:
+            where += " AND b.identity=?"
+            params.append(norm)
+        if clean_bid:
+            where += " AND b.book_id=?"
+            params.append(clean_bid)
+        with self.lock:
+            if clean_umo:
+                rows = self.db.execute(
+                    f"""
+                    SELECT b.*, p.umo AS gp_umo, p.group_cursor, p.activity_id,
+                           p.co_read_completed, p.completed_at, p.updated_by, p.updated_at AS gp_updated_at
+                    FROM books b
+                    LEFT JOIN book_group_progress p ON p.book_id=b.book_id AND p.umo=?
+                    {where}
+                    ORDER BY CASE WHEN p.group_cursor IS NOT NULL THEN 0 ELSE 1 END,
+                             CASE b.status WHEN 'reading' THEN 0 WHEN 'finished' THEN 1 ELSE 2 END,
+                             b.updated_at DESC
+                    """,
+                    [clean_umo, *params],
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    f"""
+                    SELECT b.*, p.umo AS gp_umo, p.group_cursor, p.activity_id,
+                           p.co_read_completed, p.completed_at, p.updated_by, p.updated_at AS gp_updated_at
+                    FROM books b
+                    JOIN book_group_progress p ON p.book_id=b.book_id
+                    {where}
+                    ORDER BY p.updated_at DESC
+                    """,
+                    params,
+                ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            title = str(r["title"] or "")
+            if q_low and q_low not in title.casefold():
+                continue
+            char_cursor = int(r["chapter_cursor"] or 0)
+            has_gp = r["group_cursor"] is not None
+            grp_cursor = int(r["group_cursor"] or 0) if has_gp else None
+            out.append(
+                {
+                    "book_id": str(r["book_id"]),
+                    "identity": str(r["identity"]),
+                    "title": title,
+                    "creator": str(r["creator"] or ""),
+                    "status": str(r["status"] or "reading"),
+                    "character_cursor": char_cursor,
+                    "total_chapters": int(r["total_chapters"] or 0),
+                    "umo": str(r["gp_umo"] or clean_umo),
+                    "group_cursor": grp_cursor,
+                    "ahead_chapters": max(0, char_cursor - grp_cursor) if grp_cursor is not None else 0,
+                    "activity_id": str(r["activity_id"] or ""),
+                    "co_read_completed": bool(r["co_read_completed"]),
+                    "completed_at": float(r["completed_at"] or 0.0),
+                    "updated_by": str(r["updated_by"] or ""),
+                }
+            )
+        return out
+
+    def mark_book_co_read_completed(
+        self,
+        *,
+        book_id: str = "",
+        umo: str = "",
+        title: str = "",
+        activity_id: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        stamp = float(now if now is not None else time.time())
+        clean_bid = str(book_id or "").strip()
+        clean_umo = str(umo or "").strip()
+        clean_title = str(title or "").strip("《》\"' ")
+        clean_act = str(activity_id or "").strip()
+        with self.lock, self.db:
+            target_book = None
+            if clean_bid:
+                target_book = self.db.execute(
+                    "SELECT * FROM books WHERE book_id=?", (clean_bid,)
+                ).fetchone()
+            if target_book is None and clean_act:
+                gp = self.db.execute(
+                    "SELECT book_id, umo FROM book_group_progress WHERE activity_id=? LIMIT 1",
+                    (clean_act,),
+                ).fetchone()
+                if gp is not None:
+                    clean_bid = str(gp["book_id"])
+                    if not clean_umo:
+                        clean_umo = str(gp["umo"])
+                    target_book = self.db.execute(
+                        "SELECT * FROM books WHERE book_id=?", (clean_bid,)
+                    ).fetchone()
+            if target_book is None and clean_title:
+                target_book = self.db.execute(
+                    "SELECT * FROM books WHERE lower(title)=lower(?) OR instr(lower(title), lower(?))>0 ORDER BY updated_at DESC LIMIT 1",
+                    (clean_title, clean_title),
+                ).fetchone()
+            if target_book is None:
+                return None
+            bid = str(target_book["book_id"])
+            total = int(target_book["total_chapters"] or 0)
+            char_cursor = int(target_book["chapter_cursor"] or 0)
+            final_cursor = total if total > 0 else max(1, char_cursor)
+            if clean_umo:
+                self.db.execute(
+                    """
+                    INSERT INTO book_group_progress(
+                        book_id, umo, group_cursor, activity_id, co_read_completed,
+                        completed_at, updated_by, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, 'co_reading_activity', ?)
+                    ON CONFLICT(book_id, umo) DO UPDATE SET
+                        group_cursor=MAX(book_group_progress.group_cursor, excluded.group_cursor),
+                        activity_id=CASE WHEN excluded.activity_id!='' THEN excluded.activity_id ELSE book_group_progress.activity_id END,
+                        co_read_completed=1,
+                        completed_at=excluded.completed_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (bid, clean_umo, final_cursor, clean_act, stamp, stamp),
+                )
+            else:
+                self.db.execute(
+                    "UPDATE book_group_progress SET co_read_completed=1, completed_at=?, updated_at=? WHERE book_id=?",
+                    (stamp, stamp, bid),
+                )
+        return {
+            "book_id": bid,
+            "identity": str(target_book["identity"]),
+            "title": str(target_book["title"]),
+            "creator": str(target_book["creator"]),
+            "umo": clean_umo,
+            "activity_id": clean_act,
+            "group_cursor": final_cursor,
+            "co_read_completed": True,
+            "completed_at": stamp,
+        }
+
+    def create_milestone_tea_question(
+        self,
+        *,
+        identity: str,
+        book_id: str,
+        title: str,
+        group_cursor: int,
+        question_ttl_hours: float = 72.0,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Create a spoiler-free '共读小茶会' milestone discussion question for a book chapter."""
+        norm_id = normalize_identity(identity)
+        clean_title = strip_raw_urls(str(title or "")).strip()[:40]
+        if not clean_title or group_cursor <= 0:
+            return None
+        if self.is_topic_blocked(clean_title, norm_id):
+            return None
+        stamp = float(now if now is not None else time.time())
+        q_topic = f"共读·{clean_title[:24]}"
+        q_text = (
+            f"《{clean_title}》咱们共读到第 {int(group_cursor)} 章啦！"
+            f"开个共读小茶会——只聊前 {int(group_cursor)} 章，大家印象最深的是哪一段？（放心不剧透后面）"
+        )[:120]
+        qid = "q_tea_" + sha256_hex([norm_id, book_id, int(group_cursor)])[:16]
+        q_ttl = max(3600.0, float(question_ttl_hours) * 3600.0)
+        with self.lock, self.db:
+            exists = self.db.execute(
+                "SELECT 1 FROM discussion_questions WHERE question_id=?", (qid,)
+            ).fetchone()
+            if exists is not None:
+                return None
+            self.db.execute(
+                """
+                INSERT INTO discussion_questions(
+                    question_id, identity, log_id, interest_id,
+                    topic, question, status, created_at, expires_at
+                ) VALUES (?, ?, ?, '', ?, ?, 'active', ?, ?)
+                """,
+                (
+                    qid,
+                    norm_id,
+                    f"book:{book_id}",
+                    q_topic,
+                    q_text,
+                    stamp,
+                    stamp + q_ttl,
+                ),
+            )
+        return {
+            "question_id": qid,
+            "identity": norm_id,
+            "book_id": book_id,
+            "topic": q_topic,
+            "question": q_text,
+            "group_cursor": int(group_cursor),
+        }
 
     def get_book(self, book_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -2100,6 +2433,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
             si = json.loads(row["staged_interest_json"] or "{}")
             topic = str(si.get("topic") or "").strip()[:48]
             interest_id = ""
+            interest_heat = 0.0
             if topic and not self.is_topic_blocked(topic, identity):
                 summary = str(si.get("summary") or row["reflection"] or row["digest"])[
                     :140
@@ -2118,6 +2452,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                         half_life_days,
                     )
                     next_heat = min(2.0, round(max(0.7, decayed) + 0.55, 4))
+                    interest_heat = next_heat
                     ev_ids = json.loads(existing_si["evidence_log_ids_json"] or "[]")
                     ev_ids = list(dict.fromkeys([*ev_ids[-9:], log_id]))
                     self.db.execute(
@@ -2139,6 +2474,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     )
                 else:
                     interest_id = "int_" + uuid.uuid4().hex[:16]
+                    interest_heat = 1.0
                     self.db.execute(
                         """
                         INSERT INTO staged_interests(
@@ -2302,6 +2638,10 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 member_taboos=member_taboos,
                 recommended_by=recommended_by,
                 anli_reply_delay_hours=anli_reply_delay_hours,
+                book_id=str(row["book_id"] or ""),
+                source_kind=str(row["source_kind"] or ""),
+                digest=str(row["digest"] or ""),
+                interest_heat=interest_heat,
                 now=stamp,
             )
 
@@ -2331,6 +2671,10 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
         member_taboos: dict[tuple[str, str], set[str] | frozenset[str] | list[str]] | None = None,
         recommended_by: dict[str, Any] | None = None,
         anli_reply_delay_hours: float = 0.0,
+        book_id: str = "",
+        source_kind: str = "",
+        digest: str = "",
+        interest_heat: float = 0.0,
         now: float,
     ) -> list[dict[str, Any]]:
         allowed_umos = [
@@ -2475,6 +2819,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 """
                 SELECT 1 FROM horizon_intents
                 WHERE umo=? AND topic=?
+                  AND COALESCE(json_extract(payload_json, '$.horizon_kind'), '') != 'invite_reading_activity'
                   AND (status IN ('pending', 'claimed') OR (status='sent' AND updated_at>?))
                 LIMIT 1
                 """,
@@ -2587,6 +2932,118 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                 )
                 created.append(payload)
                 break  # At most 1 candidate per UMO per approved reading
+
+        # Wave 3: High-interest book or long feature -> lightweight `invite_reading_activity` intent
+        clean_title = strip_raw_urls(title).strip()[:64]
+        digest_len = len(str(digest or "").strip())
+        refl_len = len(str(reflection or "").strip())
+        is_high_interest_book = bool(
+            book_id and (digest_len >= 26 or refl_len >= 20 or float(interest_heat or 0.0) >= 1.25)
+        )
+        is_long_feature = bool(
+            topic
+            and digest_len >= 26
+            and str(source_kind or "") in {"ebook", "feed", "bilibili"}
+        )
+        is_invite_worthy = bool(
+            clean_title
+            and (is_high_interest_book or is_long_feature)
+            and not self.is_topic_blocked(f"{topic} {clean_title}", identity)
+        )
+        if is_invite_worthy and allowed_umos:
+            used_umos = {str(item.get("target_umo") or "") for item in created}
+            invite_topic = strip_raw_urls(topic or clean_title)[:48]
+            for umo in dict.fromkeys(allowed_umos):
+                if umo in used_umos:
+                    continue
+                if not self.outreach_binding_valid(umo, identity):
+                    continue
+                # Only invite groups (not private chats) and respect 7-day per-title cooldown
+                parts = umo.rsplit(":", 2)
+                if len(parts) != 3 or parts[1].lower() != "groupmessage":
+                    continue
+                umo_daily_used = self.db.execute(
+                    "SELECT COUNT(*) FROM horizon_intents WHERE umo=? AND status IN ('pending', 'claimed', 'sent') AND created_at>?",
+                    (umo, now - 86400.0),
+                ).fetchone()[0]
+                if int(umo_daily_used or 0) >= 3:
+                    continue
+                already_invited = self.db.execute(
+                    """
+                    SELECT 1 FROM horizon_intents
+                    WHERE umo=? AND json_extract(payload_json, '$.horizon_kind')='invite_reading_activity'
+                      AND (topic=? OR json_extract(payload_json, '$.book_title')=?)
+                      AND created_at>?
+                    LIMIT 1
+                    """,
+                    (umo, invite_topic, clean_title, now - 7 * 86400.0),
+                ).fetchone()
+                if already_invited is not None:
+                    continue
+                # Skip if already co-read completed in this group
+                if book_id:
+                    done_gp = self.db.execute(
+                        "SELECT co_read_completed FROM book_group_progress WHERE book_id=? AND umo=?",
+                        (book_id, umo),
+                    ).fetchone()
+                    if done_gp and bool(done_gp["co_read_completed"]):
+                        continue
+                platform = umo.split(":", 2)[0]
+                anchor = compact_json([identity, umo, "invite_reading_activity", book_id or clean_title, log_id])
+                intent_id = "horizon:" + sha256_hex(anchor)[:32]
+                reason_text = (
+                    f"刚读到《{clean_title}》觉得特别有意思，若当下气氛轻松合适，可以轻邀大家一起开个群共读活动（群友回应确认后可自动创建共读，不发裸链接）。"
+                )
+                payload = {
+                    "schema_version": 1,
+                    "intent_id": intent_id,
+                    "provider": "dynamics_horizons",
+                    "kind": "invite_reading_activity",
+                    "horizon_kind": "invite_reading_activity",
+                    "activity_category": "reading",
+                    "status": "pending",
+                    "scope": {
+                        "platform": platform,
+                        "umo": umo,
+                        "persona_id": persona_id,
+                        "instance_id": instance_id,
+                    },
+                    "target_umo": umo,
+                    "recipient_user_id": "*",
+                    "topic": invite_topic,
+                    "book_id": book_id,
+                    "book_title": clean_title,
+                    "log_id": log_id,
+                    "reason": strip_raw_urls(reason_text)[:240],
+                    "evidence_quote": strip_raw_urls(reflection or digest)[:160],
+                    "source_event_id": f"horizon_invite:{log_id}",
+                    "source_ids": [f"horizon_invite:{log_id}"],
+                    "source_occurred_at": now,
+                    "not_before": now,
+                    "expires_at": now + 72 * 3600.0,
+                    "created_at": now,
+                }
+                self.db.execute(
+                    """
+                    INSERT OR IGNORE INTO horizon_intents(
+                        intent_id, identity, umo, recipient_user_id, topic, log_id,
+                        status, payload_json, not_before, expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, '*', ?, ?, 'pending', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        identity,
+                        umo,
+                        invite_topic,
+                        log_id,
+                        encode_json(payload),
+                        now,
+                        now + 72 * 3600.0,
+                        now,
+                        now,
+                    ),
+                )
+                created.append(payload)
         return created
 
     # ------------------------------------------------------------------
@@ -3327,14 +3784,17 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                       WHERE bt.topic=hi.topic
                         AND (bt.identity='' OR bt.identity=hi.identity)
                   )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM horizon_intents o
-                      WHERE o.umo=hi.umo
-                        AND o.recipient_user_id=hi.recipient_user_id
-                        AND (
-                            o.status IN ('claimed', 'uncertain')
-                            OR (o.status='sent' AND o.updated_at>?)
-                        )
+                  AND (
+                      hi.recipient_user_id='*'
+                      OR NOT EXISTS (
+                          SELECT 1 FROM horizon_intents o
+                          WHERE o.umo=hi.umo
+                            AND o.recipient_user_id=hi.recipient_user_id
+                            AND (
+                                o.status IN ('claimed', 'uncertain')
+                                OR (o.status='sent' AND o.updated_at>?)
+                            )
+                      )
                   )
                   AND (
                       SELECT COUNT(*) FROM horizon_intents u
@@ -3808,6 +4268,24 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     }
                     for br in book_rows
                 ]
+                gp_rows = self.db.execute(
+                    """
+                    SELECT p.book_id, p.umo, p.group_cursor, p.co_read_completed, b.title, b.chapter_cursor
+                    FROM book_group_progress p
+                    JOIN books b ON b.book_id=p.book_id
+                    WHERE b.identity=?
+                    """,
+                    (ident,),
+                ).fetchall()
+                group_reading_cursors: dict[str, dict[str, dict[str, Any]]] = {}
+                for gpr in gp_rows:
+                    group_reading_cursors.setdefault(str(gpr["umo"]), {})[str(gpr["book_id"])] = {
+                        "book_id": str(gpr["book_id"]),
+                        "title": strip_raw_urls(str(gpr["title"] or "")),
+                        "group_cursor": int(gpr["group_cursor"] or 0),
+                        "character_cursor": int(gpr["chapter_cursor"] or 0),
+                        "co_read_completed": bool(gpr["co_read_completed"]),
+                    }
 
                 q_rows = self.db.execute(
                     "SELECT * FROM discussion_questions WHERE identity=? AND status='active' AND expires_at>? ORDER BY created_at DESC LIMIT 30",
@@ -3872,6 +4350,7 @@ class HorizonsStore(DiscussionStoreMixin, LifecycleStore):
                     "logs": logs,
                     "discussion_reflections": discussion_reflections,
                     "books": books,
+                    "group_reading_cursors": group_reading_cursors,
                     "questions": questions,
                 }
 

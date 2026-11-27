@@ -384,7 +384,14 @@ window.AstrBotPluginPage = {
     }
     if (route === 'sources') {
       const ov = st.overviews[params.identity] || Object.values(st.overviews)[0];
-      return { status: 'ok', data: { sources: st.sources, books: ov.books } };
+      return {
+        status: 'ok',
+        data: {
+          sources: st.sources,
+          books: ov.books,
+          managed_umos: st.managed_umos || ['napcat:GroupMessage:10001'],
+        },
+      };
     }
     if (route === 'logs') {
       let filtered = params.source_kind
@@ -496,6 +503,13 @@ window.AstrBotPluginPage = {
       if (body.op === 'delete_book') {
         ov.books = ov.books.filter(b => b.book_id !== body.book_id);
         return { status: 'ok', data: { deleted: true } };
+      }
+      if (body.op === 'start_co_reading') {
+        const bk = ov.books.find(b => b.book_id === body.book_id);
+        if (bk) {
+          bk.group_progress = [{ umo: body.umo, group_cursor: 0, co_read_completed: false }];
+        }
+        return { status: 'ok', data: { ok: true, activity_id: 'act-read-1', message: '已发起群共读活动！' } };
       }
       if (body.op === 'test_source') {
         if (st.test_source_response) return { status: 'ok', data: st.test_source_response };
@@ -1302,6 +1316,10 @@ def test_wave2_workbench_parity_presets_decay_batch_edit_and_diagnostics(server,
         page.locator("#btn-close-source-drawer").click()
 
         first_book = page.locator("#bookshelf-list .book-card").first
+        first_book.get_by_role("button", name="发起群共读").click()
+        page.wait_for_function(
+            "window.__calls.some(c => c.route === 'sources' && c.body?.op === 'start_co_reading')"
+        )
         first_book.locator(".book-cursor-input").fill("5")
         first_book.get_by_role("button", name="调整进度").click()
         page.wait_for_function(

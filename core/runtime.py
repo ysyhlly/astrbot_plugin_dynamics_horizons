@@ -215,6 +215,12 @@ class EngineLifecycle:
         )
         if not self.config.get("enabled", True) or self.closed:
             return
+        sub_fn = getattr(self, "subscribe_series_event_bus", None)
+        if callable(sub_fn) and not getattr(self, "_event_bus_tokens", None):
+            try:
+                sub_fn()
+            except Exception:
+                pass
         review_mode = getattr(self, "review_mode", self.config.get("review_mode", "llm"))
         review_pid = self._provider_id("review_provider")
         review_circuit_rem = (
@@ -418,6 +424,11 @@ class EngineLifecycle:
             "storage_warning_mb": self.config.get("storage_warning_mb", 512),
             "proactive_enabled": proactive_scope != "disabled",
             "proactive_scope": proactive_scope,
+            "event_bus": (
+                self.vibe_bus_diagnostics()
+                if callable(getattr(self, "vibe_bus_diagnostics", None))
+                else {}
+            ),
             "diagnostics": diagnostics,
             "next_poll_at": self.next_poll_at,
             "next_digest_at": self.next_digest_at,

@@ -510,6 +510,7 @@ class Main(Star):
             store, self.config, self._model, context=self.context
         )
         await self.engine.refresh_projection()
+        self.engine.subscribe_series_event_bus()
         self.web_api.register()
         self.tasks = [
             asyncio.create_task(self.engine.poll_loop()),
@@ -528,6 +529,7 @@ class Main(Star):
         self.closed = True
         if self.engine is not None:
             self.engine.closed = True
+            self.engine.unsubscribe_series_event_bus()
         for t in self.tasks:
             t.cancel()
         await self.web_api.drain()
@@ -1617,6 +1619,162 @@ class Main(Star):
         ack = await self.apply_member_feedback_text(event, directive, umo=umo, member_id=member_id)
         yield event.plain_result(ack or "已经帮你恢复见闻分享偏好啦。")
 
+    @filter.command("共读进度", alias={"共读", "reading_progress"})
+    async def cmd_co_reading_progress(self, event: AstrMessageEvent):
+        """查询或更新本群连载书架共读进度（防剧透对齐）。用法：/共读进度 [书名] [第X章]"""
+        if (
+            self.closed
+            or not self.ready
+            or self.engine is None
+            or not bool(self.config.get("enabled", True))
+        ):
+            yield event.plain_result("群间见闻当前尚未就绪或已停用。")
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not umo or is_series_group_excluded(self.context, umo=umo) or not self.engine.is_session_allowed(umo):
+            yield event.plain_result("当前群聊未开启群间见闻。")
+            return
+        import re as _re
+
+        raw_msg = str(getattr(event, "message_str", "") or "").strip()
+        args = _re.sub(
+            r"^(?:[/!！.．]?)(?:共读进度|共读|reading_progress)(?:\s+|$)",
+            "",
+            raw_msg,
+            count=1,
+            flags=_re.IGNORECASE,
+        ).strip()
+        _, ident = await self._resolve_event_character_scope(event, umo)
+        if not ident:
+            known_ids = await run_io(self.engine.store.known_identities)
+            personas = self.engine.world_bridge.discover_personas(
+                self.engine.store, self.engine.sessions, known_identities=known_ids
+            )
+            ident = personas[0]["identity"] if personas else normalize_identity("default")
+
+        # Check if user supplied a chapter number at the end: `<书名> 第3章` or `<书名> 3`
+        ch_match = _re.search(r"(?:^|\s)第?\s*(\d{1,5})\s*(?:章|节|回)?$", args)
+        if ch_match and args[: ch_match.start()].strip():
+            book_query = args[: ch_match.start()].strip("《》\"' ")
+            target_ch = int(ch_match.group(1))
+            matches = await run_io(
+                self.engine.store.get_group_reading_progress,
+                ident,
+                umo=umo,
+                title_query=book_query,
+            )
+            if not matches:
+                yield event.plain_result(f"书架上还没找到《{book_query}》，请先核对书名或到见闻书架添加。")
+                return
+            sender_name_fn = getattr(event, "get_sender_name", None)
+            actor_name = str(sender_name_fn() or "").strip() if callable(sender_name_fn) else ""
+            updated = await self.engine.set_group_reading_cursor(
+                book_id=matches[0]["book_id"],
+                umo=umo,
+                group_cursor=target_ch,
+                updated_by=actor_name or "群友",
+            )
+            lines = [
+                f"已将本群《{updated['title']}》的共读进度更新为第 {updated['group_cursor']} 章"
+                + (f" / 共 {updated['total_chapters']} 章。" if updated["total_chapters"] > 0 else "。")
+            ]
+            if updated["ahead_chapters"] > 0:
+                lines.append(
+                    f"防剧透护栏已开启：我目前已读到第 {updated['character_cursor']} 章，聊起这本书时会严守第 {updated['group_cursor']} 章及以前的情节，绝不剧透！"
+                )
+            if updated.get("tea_question"):
+                lines.append("已顺手在待聊清单里记下一场「共读小茶会」讨论题，大家随时可以来聊感想。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # Otherwise query progress
+        rows = await run_io(
+            self.engine.store.get_group_reading_progress,
+            ident,
+            umo=umo,
+            title_query=args.strip("《》\"' "),
+        )
+        if not rows:
+            yield event.plain_result("当前角色书架还没有连载书目，可以用 `/安利 《书名》` 或在控制台书架添加。")
+            return
+        out_lines = ["📚 本群连载书架共读进度："]
+        for r in rows[:8]:
+            tot = f"/{r['total_chapters']}" if r["total_chapters"] > 0 else ""
+            if r["co_read_completed"]:
+                tag = "已共读完成"
+            elif r["group_cursor"] is not None:
+                tag = f"本群第 {r['group_cursor']}{tot} 章"
+                if r["ahead_chapters"] > 0:
+                    tag += "（已开启防剧透）"
+            else:
+                tag = f"尚未对齐共读进度（角色读至第 {r['character_cursor']}{tot} 章）"
+            out_lines.append(f"- 《{r['title']}》：{tag}")
+        out_lines.append("提示：发送 `/共读进度 书名 第X章` 即可对齐本群防剧透进度。")
+        yield event.plain_result("\n".join(out_lines))
+
+    @filter.command("发起共读", alias={"开共读", "确认共读", "start_co_reading"})
+    async def cmd_start_co_reading(self, event: AstrMessageEvent):
+        """联动群间游戏发起群共读活动并自动开启防剧透进度。用法：/发起共读 <书名>"""
+        if (
+            self.closed
+            or not self.ready
+            or self.engine is None
+            or not bool(self.config.get("enabled", True))
+        ):
+            yield event.plain_result("群间见闻当前尚未就绪或已停用。")
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not umo or is_series_group_excluded(self.context, umo=umo) or not self.engine.is_session_allowed(umo):
+            yield event.plain_result("当前群聊未开启群间见闻。")
+            return
+        import re as _re
+
+        raw_msg = str(getattr(event, "message_str", "") or "").strip()
+        title = _re.sub(
+            r"^(?:[/!！.．]?)(?:发起共读|开共读|确认共读|start_co_reading)(?:\s+|$)",
+            "",
+            raw_msg,
+            count=1,
+            flags=_re.IGNORECASE,
+        ).strip("《》\"' ")
+        _, ident = await self._resolve_event_character_scope(event, umo)
+        sender_name_fn = getattr(event, "get_sender_name", None)
+        creator_name = str(sender_name_fn() or "").strip() if callable(sender_name_fn) else ""
+        try:
+            res = await self.engine.launch_group_co_reading(
+                umo=umo,
+                title=title,
+                identity=ident,
+                creator_name=creator_name or "群友",
+            )
+            yield event.plain_result(str(res.get("message") or "已处理共读发起请求。"))
+        except Exception as exc:
+            yield event.plain_result(f"发起共读失败：{str(exc)[:120]}")
+
+    async def mark_co_reading_completed(
+        self,
+        *,
+        umo: str = "",
+        book_id: str = "",
+        title: str = "",
+        activity_id: str = "",
+        summary: str = "",
+        participants: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Cross-plugin callback for `dynamics_games` when a co-reading activity finishes."""
+        if self.closed or not self.ready or self.engine is None:
+            return {"ok": False, "reason": "not_ready"}
+        return await self.engine.on_co_reading_completed(
+            umo=umo,
+            book_id=book_id,
+            title=title,
+            activity_id=activity_id,
+            summary=summary,
+            participants=participants,
+        )
+
+    on_reading_activity_completed = mark_co_reading_completed
+
     async def apply_member_feedback_text(
         self,
         event: AstrMessageEvent | None,
@@ -1812,21 +1970,39 @@ class Main(Star):
         ):
             return []
         stamp = float(now) if isinstance(now, (int, float)) else self.engine.clock()
-        return self.engine.store.list_due_intents(
+        allowed_sessions = [
+            u
+            for u in self.engine.effective_proactive_sessions()
+            if not self.engine.is_umo_vibe_serious(u, now=stamp)
+        ]
+        items = self.engine.store.list_due_intents(
             stamp,
-            proactive_sessions=self.engine.effective_proactive_sessions(),
+            proactive_sessions=allowed_sessions,
             quiet_hours=self.engine.quiet_hours,
             tz=self.engine.timezone,
         )
+        for item in items:
+            u = str(item.get("target_umo") or (item.get("scope") or {}).get("umo") or "")
+            item["quiet_window_ready"] = self.engine.is_umo_in_quiet_window(u, now=stamp)
+        items.sort(key=lambda it: (0 if it.get("quiet_window_ready") else 1, float(it.get("not_before") or 0.0)))
+        return items
 
     def get_intent(self, intent_id: str) -> dict[str, Any]:
         if self.closed or not self.ready or self.engine is None:
             return {"schema_version": SCHEMA_VERSION, "available": False, "item": None}
-        return self.engine.store.get_intent(
+        stamp = self.engine.clock()
+        res = self.engine.store.get_intent(
             str(intent_id or ""),
-            now=self.engine.clock(),
+            now=stamp,
             proactive_sessions=self.engine.effective_proactive_sessions(),
         )
+        item = res.get("item") if isinstance(res, dict) else None
+        if isinstance(item, dict):
+            u = str(item.get("target_umo") or (item.get("scope") or {}).get("umo") or "")
+            if self.engine.is_umo_vibe_serious(u, now=stamp):
+                item["vibe_suppressed"] = True
+                item["outreach_paused"] = True
+        return res
 
     def update_intent(
         self,
@@ -1840,11 +2016,27 @@ class Main(Star):
                 "status": "unavailable",
                 "changed": False,
             }
+        stamp = self.engine.clock()
+        if str(status or "") == "claimed":
+            preview = self.engine.store.get_intent(
+                str(intent_id or ""),
+                now=stamp,
+                proactive_sessions=self.engine.effective_proactive_sessions(),
+            )
+            item = preview.get("item") if isinstance(preview, dict) else None
+            if isinstance(item, dict):
+                u = str(item.get("target_umo") or (item.get("scope") or {}).get("umo") or "")
+                if self.engine.is_umo_vibe_serious(u, now=stamp):
+                    return {
+                        "schema_version": SCHEMA_VERSION,
+                        "status": "vibe_suppressed",
+                        "changed": False,
+                    }
         return self.engine.store.update_intent(
             str(intent_id or ""),
             str(status or ""),
             receipt=receipt,
-            now=self.engine.clock(),
+            now=stamp,
             proactive_sessions=self.engine.effective_proactive_sessions(),
         )
 

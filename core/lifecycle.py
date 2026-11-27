@@ -158,6 +158,19 @@ class LifecycleStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_call_metrics_day
                     ON model_call_metrics(identity, created_at DESC);
+                CREATE TABLE IF NOT EXISTS book_group_progress(
+                    book_id TEXT NOT NULL,
+                    umo TEXT NOT NULL,
+                    group_cursor INTEGER NOT NULL DEFAULT 0,
+                    activity_id TEXT NOT NULL DEFAULT '',
+                    co_read_completed INTEGER NOT NULL DEFAULT 0,
+                    completed_at REAL NOT NULL DEFAULT 0,
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(book_id, umo)
+                );
+                CREATE INDEX IF NOT EXISTS idx_book_group_umo
+                    ON book_group_progress(umo, updated_at DESC);
             """)
             additions = {
                 "candidate_items": {
@@ -1305,26 +1318,28 @@ class LifecycleStore:
             (row["log_id"], row["identity"]),
         ).fetchone():
             return False
-        pref = self.db.execute(
-            "SELECT opted_out FROM member_outreach_prefs WHERE identity=? AND umo=? AND member_id=?",
-            (row["identity"], row["umo"], row["recipient_user_id"]),
-        ).fetchone()
-        if pref and pref[0]:
-            return False
         if self.is_topic_blocked(row["topic"], row["identity"]):
-            return False
-        if self.db.execute(
-            "SELECT 1 FROM member_topic_prefs WHERE identity=? AND umo=? AND member_id=? AND topic=? AND blocked=1",
-            (row["identity"], row["umo"], row["recipient_user_id"], row["topic"]),
-        ).fetchone():
             return False
         if not self.outreach_binding_valid(row["umo"], row["identity"]):
             return False
-        if self.db.execute(
-            "SELECT 1 FROM corrections WHERE identity=? AND umo=? AND member_id=? AND log_id=? AND status='pending'",
-            (row["identity"], row["umo"], row["recipient_user_id"], row["log_id"]),
-        ).fetchone():
-            return False
+        recipient = str(row["recipient_user_id"] or "").strip()
+        if recipient and recipient != "*":
+            pref = self.db.execute(
+                "SELECT opted_out FROM member_outreach_prefs WHERE identity=? AND umo=? AND member_id=?",
+                (row["identity"], row["umo"], recipient),
+            ).fetchone()
+            if pref and pref[0]:
+                return False
+            if self.db.execute(
+                "SELECT 1 FROM member_topic_prefs WHERE identity=? AND umo=? AND member_id=? AND topic=? AND blocked=1",
+                (row["identity"], row["umo"], recipient, row["topic"]),
+            ).fetchone():
+                return False
+            if self.db.execute(
+                "SELECT 1 FROM corrections WHERE identity=? AND umo=? AND member_id=? AND log_id=? AND status='pending'",
+                (row["identity"], row["umo"], recipient, row["log_id"]),
+            ).fetchone():
+                return False
         return True
 
     def check_poll_source(self, source):

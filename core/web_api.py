@@ -446,8 +446,21 @@ class HorizonsWebAPI:
             filter_id = "" if req_id == "all" else active_identity
             sources = await run_io(eng.store.list_sources, filter_id, mask=True)
             books = await run_io(eng.store.list_books, filter_id)
+            managed_umos = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            [r["umo"] for r in await run_io(eng.store.known_managed_scopes, filter_id)]
+                            if hasattr(eng.store, "known_managed_scopes")
+                            else []
+                        ),
+                        *list(getattr(eng, "sessions", []) or []),
+                    ]
+                )
+            )
             return {
                 "identity": active_identity,
+                "managed_umos": managed_umos,
                 "sources": [
                     {
                         "source_id": s["source_id"],
@@ -829,6 +842,31 @@ class HorizonsWebAPI:
                     body.get("config") if isinstance(body.get("config"), dict) else {}
                 )
                 return await eng.test_source_connection(kind, raw_cfg)
+
+            if action == "start_co_reading":
+                book_id = str(body.get("book_id") or "").strip()[:80]
+                title_val = str(body.get("title") or "").strip()[:120]
+                target_umo = clean_text(body.get("umo"), "umo", 240)
+                initial_cursor = _coerce_int(body.get("initial_cursor"), 0, 0, 10000)
+                return await eng.launch_group_co_reading(
+                    umo=target_umo,
+                    book_id=book_id,
+                    title=title_val,
+                    identity=identity,
+                    creator_name=str(_actor or "管理员"),
+                    initial_cursor=initial_cursor,
+                )
+
+            if action == "set_group_cursor":
+                book_id = clean_text(body.get("book_id"), "book_id", 80)
+                target_umo = clean_text(body.get("umo"), "umo", 240)
+                g_cursor = _coerce_int(body.get("group_cursor"), 0, 0, 10000)
+                return await eng.set_group_reading_cursor(
+                    book_id=book_id,
+                    umo=target_umo,
+                    group_cursor=g_cursor,
+                    updated_by=str(_actor or "管理员"),
+                )
 
             if action == "delete_book":
                 book_id = clean_text(body.get("book_id"), "book_id", 80)

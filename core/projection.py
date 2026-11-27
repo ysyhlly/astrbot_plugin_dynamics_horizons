@@ -539,12 +539,17 @@ class ProjectionCache:
             chosen_interests = interests[:2]
             chosen_logs = logs[:2]
             chosen_qs = self._select_diverse_questions(eligible_questions, limit=3)
+            chosen_books = books[:1]
+            spoiler_guards = self._collect_spoiler_guards(
+                bucket, umo, chosen_books, chosen_logs, chosen_qs, query_text=q_str
+            )
             return self._pack_projection(
                 match_reason="status_inquiry",
                 interests=chosen_interests,
                 logs=chosen_logs,
-                books=books[:1],
+                books=chosen_books,
                 questions=chosen_qs,
+                spoiler_guards=spoiler_guards,
             )
 
         # 2. Topic / Keyword Matching (with alias/synonym cluster expansion & smooth threshold)
@@ -697,13 +702,79 @@ class ProjectionCache:
             if related is not None:
                 chosen_logs = [related]
 
+        spoiler_guards = self._collect_spoiler_guards(
+            bucket,
+            umo,
+            chosen_books,
+            chosen_logs,
+            [chosen_q] if chosen_q else [],
+            query_text=f"{q_str} {near_str}",
+        )
         return self._pack_projection(
             match_reason="topic_match",
             interests=chosen_interests,
             logs=chosen_logs,
             books=chosen_books,
             question=chosen_q,
+            spoiler_guards=spoiler_guards,
         )
+
+    @staticmethod
+    def _collect_spoiler_guards(
+        bucket: dict[str, Any],
+        umo: str,
+        chosen_books: list[dict[str, Any]],
+        chosen_logs: list[dict[str, Any]],
+        chosen_questions: list[dict[str, Any]],
+        *,
+        query_text: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return anti-spoiler guards for books where character read ahead of this group's cursor."""
+        gp_map = (bucket.get("group_reading_cursors") or {}).get(umo)
+        if not isinstance(gp_map, dict) or not gp_map:
+            return []
+        matched_book_ids = {
+            str(b.get("book_id") or "") for b in (chosen_books or []) if b.get("book_id")
+        }
+        text_haystack = " ".join(
+            [
+                str(query_text or ""),
+                *[str(b.get("title") or "") for b in (chosen_books or [])],
+                *[
+                    f"{(r.get('citation') or {}).get('title', '')} {r.get('digest', '')}"
+                    for r in (chosen_logs or [])
+                ],
+                *[
+                    f"{q.get('topic', '')} {q.get('question', '')}"
+                    for q in (chosen_questions or [])
+                    if isinstance(q, dict)
+                ],
+            ]
+        ).casefold()
+        guards: list[dict[str, Any]] = []
+        for bid, entry in gp_map.items():
+            if not isinstance(entry, dict):
+                continue
+            g_cur = int(entry.get("group_cursor") or 0)
+            c_cur = int(entry.get("character_cursor") or 0)
+            if c_cur <= g_cur:
+                continue
+            b_title = strip_raw_urls(str(entry.get("title") or "")).strip()[:48]
+            if (
+                bid in matched_book_ids
+                or (b_title and b_title.casefold() in text_haystack)
+            ):
+                guards.append(
+                    {
+                        "book_id": bid,
+                        "title": b_title,
+                        "group_cursor": g_cur,
+                        "character_cursor": c_cur,
+                        "max_safe_chapter": g_cur,
+                        "boundary": f"《{b_title}》本群共读进度为第 {g_cur} 章，仅可讨论第 {g_cur} 章及以前情节，严禁剧透后续内容。",
+                    }
+                )
+        return guards[:2]
 
     @staticmethod
     def _select_diverse_questions(
@@ -998,6 +1069,9 @@ class ProjectionCache:
                 if title and title not in offer_topics:
                     offer_topics.append(title)
 
+        tool_spoiler_guards = self._collect_spoiler_guards(
+            bucket, umo, [], sel_logs, sel_questions, query_text=q_str
+        )
         payload: dict[str, Any] = {
             "available": True,
             "fact_kind": "external_media",
@@ -1017,6 +1091,10 @@ class ProjectionCache:
                 "topics": offer_topics[:12],
             },
         }
+        if tool_spoiler_guards:
+            payload["spoiler_guards"] = tool_spoiler_guards
+            guard_lines = " ".join(g["boundary"] for g in tool_spoiler_guards)
+            payload["policy"] = f"【防剧透边界】{guard_lines} " + payload["policy"]
         if contains_raw_url(payload):
             return {"available": False, "reason": "url_guard_blocked"}
         return payload
@@ -1030,6 +1108,7 @@ class ProjectionCache:
         books: list[dict[str, Any]],
         question: dict[str, Any] | None = None,
         questions: list[dict[str, Any]] | None = None,
+        spoiler_guards: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         versions: list[str] = []
         topics: list[str] = []
@@ -1153,23 +1232,39 @@ class ProjectionCache:
         decision_slot = _fit_decision_slot(decision_slot)
 
         # Build bounded reply_projection (<= 1800 serialized chars, ZERO raw URLs)
+        base_policy = (
+            "见闻感悟供参考。契合时可用角色自己的话融入一个想法，平时无需汇报看过什么或强行追问；"
+            "若对方主动问最近有什么有趣或有意思的话题，可直接从 questions 或见闻里自然挑一个展开。"
+            "转述作品内容时交代其来自作品。摘要和感悟不能作原句引用，笔记里的想象不算亲历。"
+            "群友回应与交流后记是特定会话中的参考，不能当作事实或自动变成固定人设。"
+            "有人问阅读或出处时按记录答，不发裸链接。"
+        )
+        clean_guards = [g for g in (spoiler_guards or []) if isinstance(g, dict) and g.get("boundary")][:2]
+        if clean_guards:
+            guard_prefix = "【防剧透边界】" + " ".join(str(g["boundary"])[:120] for g in clean_guards) + " "
+            base_policy = guard_prefix + base_policy
         reply_projection: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "fact_kind": "external_media",
             "match_reason": match_reason,
-            "policy": (
-                "见闻感悟供参考。契合时可用角色自己的话融入一个想法，平时无需汇报看过什么或强行追问；"
-                "若对方主动问最近有什么有趣或有意思的话题，可直接从 questions 或见闻里自然挑一个展开。"
-                "转述作品内容时交代其来自作品。摘要和感悟不能作原句引用，笔记里的想象不算亲历。"
-                "群友回应与交流后记是特定会话中的参考，不能当作事实或自动变成固定人设。"
-                "有人问阅读或出处时按记录答，不发裸链接。"
-            ),
+            "policy": base_policy,
             "topics": topics[:3],
             "interests": proj_interests,
             "readings": proj_readings,
             "questions": proj_questions,
             "question_ids": [q["question_id"] for q in proj_questions],
         }
+        if clean_guards:
+            reply_projection["spoiler_guards"] = [
+                {
+                    "book_id": str(g.get("book_id") or ""),
+                    "title": str(g.get("title") or "")[:48],
+                    "group_cursor": int(g.get("group_cursor") or 0),
+                    "character_cursor": int(g.get("character_cursor") or 0),
+                    "max_safe_chapter": int(g.get("max_safe_chapter") or 0),
+                }
+                for g in clean_guards
+            ]
         reply_projection = _fit_reply_projection(reply_projection)
 
         # Defense-in-depth invariant check
